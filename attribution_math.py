@@ -25,9 +25,20 @@ class BaseInfluenceMethod(ABC):
 # ─────────────────────────────────────────────────────────────────────────────
 class TracInInfluence(BaseInfluenceMethod):
     """
-    First-order influence via learning-rate-weighted gradient dot product:
+    First-order influence via learning-rate-weighted gradient dot product.
+
+    When normalize=True (default), gradients are L2-normalized before the
+    dot product, giving cosine similarity scaled by lr:
+
+        score = lr * (g_test / ||g_test||) . (g_train / ||g_train||)
+
+    When normalize=False, uses the raw dot product:
 
         score = lr * g_test^T @ g_train
+
+    Normalization is recommended when g_test and g_train come from different
+    loss functions (e.g. SFT vs GRPO) whose gradient magnitudes are not
+    directly comparable.
 
     To aggregate over K checkpoints, call compute_score once per checkpoint
     and sum the results.  The caller controls the loop so we can lazily load
@@ -36,12 +47,18 @@ class TracInInfluence(BaseInfluenceMethod):
     Required keys: test_info["grad"], train_info["grad"]
     """
 
-    def __init__(self, learning_rate: float = 1e-4):
+    def __init__(self, learning_rate: float = 1e-4, normalize: bool = True):
         self.learning_rate = learning_rate
+        self.normalize = normalize
 
     def compute_score(self, test_info: dict, train_info: dict) -> float:
         g_test = test_info["grad"]
         g_train = train_info["grad"]
+        if self.normalize:
+            norm_test = g_test.norm() + 1e-12
+            norm_train = g_train.norm() + 1e-12
+            g_test = g_test / norm_test
+            g_train = g_train / norm_train
         return (self.learning_rate * torch.dot(g_test, g_train)).item()
 
 
