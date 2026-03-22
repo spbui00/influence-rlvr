@@ -1,63 +1,14 @@
 import torch
 import torch.nn.functional as F
 
-
-def _clear_cache(device):
-    dtype = device.type if isinstance(device, torch.device) else device
-    if dtype == "cuda":
-        torch.cuda.empty_cache()
-    elif dtype == "mps":
-        torch.mps.empty_cache()
-
-
-def _render_prompt(tokenizer, prompt):
-    if isinstance(prompt, str):
-        return prompt
-    if isinstance(prompt, list):
-        return tokenizer.apply_chat_template(
-            prompt,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-    raise TypeError("prompt must be a string or a chat-style list of messages")
-
-
-def _tokenize_prompt(tokenizer, prompt, device):
-    prompt_text = _render_prompt(tokenizer, prompt)
-    encoded = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)
-    input_ids = encoded["input_ids"].to(device)
-    attention_mask = encoded.get("attention_mask")
-    if attention_mask is None:
-        attention_mask = torch.ones_like(input_ids)
-    else:
-        attention_mask = attention_mask.to(device)
-    return prompt_text, input_ids, attention_mask
-
-
-def _get_reward_name(reward_fn):
-    if hasattr(reward_fn, "__name__"):
-        return reward_fn.__name__
-    if hasattr(reward_fn, "func"):
-        return getattr(reward_fn.func, "__name__", reward_fn.func.__class__.__name__)
-    return reward_fn.__class__.__name__
-
-
-def _extract_lora_gradients(peft_model):
-    grads = []
-    for _, param in peft_model.named_parameters():
-        if param.requires_grad and param.grad is not None:
-            grads.append(param.grad.detach().float().view(-1).cpu().clone())
-    peft_model.zero_grad()
-    if not grads:
-        raise RuntimeError("No LoRA gradients were found after backward().")
-    return torch.cat(grads)
+from .utils import clear_cache, tokenize_prompt, extract_lora_gradients, get_reward_name
 
 
 def compute_sft_gradient(peft_model, tokenizer, prompt, target, device):
     peft_model.eval()
     peft_model.zero_grad()
 
-    _, prompt_ids, prompt_attention_mask = _tokenize_prompt(tokenizer, prompt, device)
+    _, prompt_ids, prompt_attention_mask = tokenize_prompt(tokenizer, prompt, device)
     target_ids = tokenizer(
         target + tokenizer.eos_token,
         return_tensors="pt",
@@ -74,8 +25,8 @@ def compute_sft_gradient(peft_model, tokenizer, prompt, target, device):
     outputs = peft_model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
     outputs.loss.backward()
 
-    grad_vector = _extract_lora_gradients(peft_model)
-    _clear_cache(device)
+    grad_vector = extract_lora_gradients(peft_model)
+    clear_cache(device)
     return grad_vector
 
 
@@ -88,7 +39,7 @@ def compute_rlvr_gradient(
     peft_model.eval()
     peft_model.zero_grad()
 
-    prompt_text, prompt_ids, prompt_attention_mask = _tokenize_prompt(tokenizer, prompt, device)
+    prompt_text, prompt_ids, prompt_attention_mask = tokenize_prompt(tokenizer, prompt, device)
     prompt_len = prompt_ids.shape[1]
 
     if enable_vllm:
@@ -120,7 +71,7 @@ def compute_rlvr_gradient(
     reward_breakdown = {}
     for reward_fn in reward_funcs:
         scores = reward_fn(completions_trl)
-        reward_breakdown[_get_reward_name(reward_fn)] = [float(score) for score in scores]
+        reward_breakdown[get_reward_name(reward_fn)] = [float(s) for s in scores]
         total_rewards += torch.tensor(scores, device=device, dtype=torch.float32)
 
     advantages = (total_rewards - total_rewards.mean()) / (total_rewards.std() + 1e-8)
@@ -152,7 +103,7 @@ def compute_rlvr_gradient(
     policy_loss = -(1.0 / G) * (advantages.detach() * log_probs).sum()
     policy_loss.backward()
 
-    grad_vector = _extract_lora_gradients(peft_model)
+    grad_vector = extract_lora_gradients(peft_model)
 
     debug_info = {
         "prompt_text": prompt_text,
@@ -165,7 +116,7 @@ def compute_rlvr_gradient(
     }
 
     del generated, log_probs, log_probs_per_response, policy_loss
-    _clear_cache(device)
+    clear_cache(device)
 
     if return_debug:
         return grad_vector, debug_info

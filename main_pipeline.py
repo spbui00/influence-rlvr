@@ -2,31 +2,22 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig, get_peft_model
 
-from grpo_gradients import compute_sft_gradient, compute_rlvr_gradient
-from attribution_math import TracInInfluence, InfluenceCalculator
-from rewards import format_reward_func
+from influence_rlvr import (
+    compute_sft_gradient,
+    compute_rlvr_gradient,
+    TracInInfluence,
+    InfluenceCalculator,
+    format_reward_func,
+    detect_device,
+    clear_cache,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Hardware Detection Block
 # ─────────────────────────────────────────────────────────────────────────────
-if torch.cuda.is_available():
-    DEVICE = torch.device("cuda")
-    ENABLE_VLLM = True
-elif torch.backends.mps.is_available():
-    DEVICE = torch.device("mps")
-    ENABLE_VLLM = False
-else:
-    DEVICE = torch.device("cpu")
-    ENABLE_VLLM = False
-
+DEVICE = detect_device()
+ENABLE_VLLM = DEVICE.type == "cuda"
 print(f"Device: {DEVICE} | vLLM enabled: {ENABLE_VLLM}")
-
-
-def clear_cache():
-    if DEVICE.type == "cuda":
-        torch.cuda.empty_cache()
-    elif DEVICE.type == "mps":
-        torch.mps.empty_cache()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -96,7 +87,7 @@ for idx, sample in enumerate(Z_test):
     print(f"  g_test[{idx}] ...", end=" ", flush=True)
     g = compute_sft_gradient(model, tokenizer, sample["prompt"], sample["solution"], DEVICE)
     test_infos.append({"grad": g})
-    clear_cache()
+    clear_cache(DEVICE)
     print(f"norm={g.norm().item():.6f}")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -111,7 +102,7 @@ for idx, sample in enumerate(Z_train):
         G=4, device=DEVICE, enable_vllm=ENABLE_VLLM,
     )
     train_infos.append({"grad": g})
-    clear_cache()
+    clear_cache(DEVICE)
     print(f"norm={g.norm().item():.6f}")
 
 # ─────────────────────────────────────────────────────────────────────────────
