@@ -67,36 +67,69 @@ class TracInInfluence(BaseInfluenceMethod):
 # ─────────────────────────────────────────────────────────────────────────────
 class DataInfInfluence(BaseInfluenceMethod):
     """
-    Second-order parameter-space influence via the Woodbury Matrix Identity
-    approximation of the inverse Hessian:
+    Second-order influence via the Woodbury Matrix Identity, avoiding
+    the D×D Hessian entirely.
 
-        score = g_test^T  H^{-1}  g_train
+    Given the Empirical Fisher / Gauss-Newton Hessian:
+        H = λI_D + (1/n) J^T J
+    the Woodbury identity yields:
+        H^{-1} = (1/λ)I_D - (1/λ²) J^T (nλI_n + JJ^T)^{-1} J
 
-    where H^{-1} is approximated from the outer products of all training
-    gradients using the Woodbury identity.
+    For a single test gradient g_test, ALL n training scores are:
+        v       = J @ g_test          — (n,) first-order dot products
+        scores  = -(1/λ) v + (1/λ²) v @ M @ K
+    where K = JJ^T (n×n) and M = (nλI_n + K)^{-1} (n×n).
 
-    Either pass a pre-computed inverse_hessian tensor or the full list of
-    training gradient vectors (all_train_grads) so H^{-1} can be built
-    on the fly.
+    The largest matrix ever inverted is n×n (number of training examples),
+    which is instant even on Apple MPS.
 
-    Required keys: test_info["grad"], train_info["grad"]
+    When normalize=True, each training gradient row in J and each g_test
+    are L2-normalized before scoring, isolating directional alignment.
+
+    Required keys: test_info["grad"]
     """
 
-    def __init__(self, inverse_hessian=None, all_train_grads=None, damping=1e-3):
-        self.inverse_hessian = inverse_hessian
-        self.all_train_grads = all_train_grads
-        self.damping = damping
+    def __init__(self, g_train_list: list, lambda_damp: float = 0.1,
+                 normalize: bool = True):
+        self.lambda_damp = lambda_damp
+        self.normalize = normalize
+        self.n = len(g_train_list)
+
+        J = torch.stack(g_train_list).float()
+        if normalize:
+            norms = J.norm(dim=1, keepdim=True).clamp(min=1e-12)
+            J = J / norms
+
+        self.J = J
+        K = J @ J.T
+        self.K = K
+        I_n = torch.eye(self.n, dtype=torch.float32)
+        self.M = torch.linalg.inv(self.n * lambda_damp * I_n + K)
+
+        del I_n
+
+    def _normalize_test(self, g_test: torch.Tensor) -> torch.Tensor:
+        g = g_test.float()
+        if self.normalize:
+            g = g / (g.norm() + 1e-12)
+        return g
+
+    def compute_all_scores(self, test_info: dict) -> np.ndarray:
+        g_test = self._normalize_test(test_info["grad"])
+        lam = self.lambda_damp
+        v = self.J @ g_test
+        scores = -(1.0 / lam) * v + (1.0 / lam**2) * (v @ self.M @ self.K)
+        return scores.numpy()
 
     def compute_score(self, test_info: dict, train_info: dict) -> float:
-        # TODO: Implement Woodbury identity approximation
-        #   1. If self.inverse_hessian is None, build it from self.all_train_grads:
-        #      H ≈ (1/N) * sum_i(g_i g_i^T) + damping * I
-        #      H^{-1} via Woodbury: (A + UCV)^{-1}
-        #   2. score = g_test^T @ H^{-1} @ g_train
-        raise NotImplementedError(
-            "DataInf (Woodbury inverse-Hessian approximation) is not yet implemented. "
-            "Provide inverse_hessian or all_train_grads and implement the Woodbury update."
-        )
+        g_test = self._normalize_test(test_info["grad"])
+        g_train = train_info["grad"].float()
+        if self.normalize:
+            g_train = g_train / (g_train.norm() + 1e-12)
+        lam = self.lambda_damp
+        Jg = self.J @ g_test
+        h_inv_g = (1.0 / lam) * g_test - (1.0 / lam**2) * (self.J.T @ self.M @ Jg)
+        return -(torch.dot(h_inv_g, g_train)).item()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
