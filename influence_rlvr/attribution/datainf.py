@@ -57,3 +57,49 @@ class DataInfInfluence(BaseInfluenceMethod):
         Jg = self.J @ g_test
         h_inv_g = (1.0 / lam) * g_test - (1.0 / lam**2) * (self.J.T @ self.M @ Jg)
         return -(torch.dot(h_inv_g, g_train)).item()
+
+
+class TrajectoryDataInfInfluence:
+    def __init__(self, lambda_damp: float = 0.1, normalize: bool = False):
+        self.lambda_damp = lambda_damp
+        self.normalize = normalize
+
+    def compute_matrix(self, checkpoint_infos: list, return_breakdown: bool = False):
+        if not checkpoint_infos:
+            empty = np.zeros((0, 0), dtype=np.float32)
+            return (empty, []) if return_breakdown else empty
+
+        total_matrix = None
+        breakdown = []
+
+        for checkpoint in checkpoint_infos:
+            g_train_list = [info["grad"] for info in checkpoint["train_infos"]]
+            datainf = DataInfInfluence(
+                g_train_list,
+                lambda_damp=self.lambda_damp,
+                normalize=self.normalize,
+            )
+
+            n_test = len(checkpoint["test_infos"])
+            n_train = len(checkpoint["train_infos"])
+            matrix = np.zeros((n_test, n_train), dtype=np.float32)
+            for idx, test_info in enumerate(checkpoint["test_infos"]):
+                matrix[idx] = datainf.compute_all_scores(test_info)
+
+            learning_rate = float(checkpoint.get("learning_rate", 1.0))
+            weighted_matrix = learning_rate * matrix
+
+            if total_matrix is None:
+                total_matrix = weighted_matrix
+            else:
+                total_matrix = total_matrix + weighted_matrix
+
+            if return_breakdown:
+                breakdown.append({
+                    "step": checkpoint["step"],
+                    "learning_rate": learning_rate,
+                    "matrix": matrix,
+                    "weighted_matrix": weighted_matrix,
+                })
+
+        return (total_matrix, breakdown) if return_breakdown else total_matrix

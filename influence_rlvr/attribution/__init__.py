@@ -1,6 +1,6 @@
 from .base import BaseInfluenceMethod, InfluenceCalculator
-from .tracin import TracInInfluence
-from .datainf import DataInfInfluence
+from .tracin import TracInInfluence, TrajectoryTracInInfluence
+from .datainf import DataInfInfluence, TrajectoryDataInfInfluence
 from .pbrf import PBRFInfluence
 from .repsim import RepSimInfluence
 
@@ -9,6 +9,8 @@ __all__ = [
     "InfluenceCalculator",
     "TracInInfluence",
     "DataInfInfluence",
+    "TrajectoryTracInInfluence",
+    "TrajectoryDataInfInfluence",
     "PBRFInfluence",
     "RepSimInfluence",
 ]

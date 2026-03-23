@@ -4,6 +4,14 @@ import torch.nn.functional as F
 from .utils import clear_cache, tokenize_prompt, extract_lora_gradients, get_reward_name
 
 
+def _set_generation_seed(seed):
+    if seed is None:
+        return
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def compute_sft_gradient(peft_model, tokenizer, prompt, target, device):
     peft_model.eval()
     peft_model.zero_grad()
@@ -35,6 +43,7 @@ def compute_rlvr_gradient(
     G=4, device="cpu", enable_vllm=False,
     max_new_tokens=256, temperature=0.7, top_p=0.9,
     return_debug=False,
+    seed=None,
 ):
     peft_model.eval()
     peft_model.zero_grad()
@@ -47,6 +56,8 @@ def compute_rlvr_gradient(
             "vLLM generation backend is not yet implemented. "
             "Set enable_vllm=False to use standard HF generate()."
         )
+
+    _set_generation_seed(seed)
 
     with torch.no_grad():
         generated = peft_model.generate(
@@ -113,6 +124,7 @@ def compute_rlvr_gradient(
         "advantages": advantages.detach().cpu().tolist(),
         "log_probs": log_probs.detach().float().cpu().tolist(),
         "policy_loss": float(policy_loss.detach().float().cpu()),
+        "seed": seed,
     }
 
     del generated, log_probs, log_probs_per_response, policy_loss
