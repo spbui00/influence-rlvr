@@ -1,0 +1,14 @@
+[project]
+name = "influence-rlvr"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.4",
+    "transformers>=4.50",
+    "peft>=0.14",
+    "trl>=0.17",
+    "datasets>=3.0",
+    "accelerate>=1.0",
+    "numpy>=1.26",
+    "matplotlib>=3.9",
+]
