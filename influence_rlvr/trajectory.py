@@ -10,6 +10,7 @@ from .utils import clear_cache
 
 _CHECKPOINT_RE = re.compile(r"checkpoint-(\d+)$")
 _CHECKPOINT_SEED_STRIDE = 100000
+_TEST_SEED_OFFSET = 10000
 
 
 def checkpoint_step(checkpoint_dir):
@@ -81,6 +82,22 @@ def load_adapter_checkpoint(peft_model, checkpoint_dir, adapter_name="default"):
     return peft_model
 
 
+def ensure_reference_adapter(peft_model, source_adapter="default", ref_adapter="ref"):
+    if not hasattr(peft_model, "peft_config"):
+        return peft_model
+    if ref_adapter in peft_model.peft_config:
+        return peft_model
+
+    peft_model.add_adapter(ref_adapter, peft_model.peft_config[source_adapter])
+    for name, param in peft_model.named_parameters():
+        if f".{source_adapter}." not in name:
+            continue
+        ref_name = name.replace(f".{source_adapter}.", f".{ref_adapter}.")
+        ref_param = peft_model.get_parameter(ref_name)
+        ref_param.data.copy_(param.data)
+    return peft_model
+
+
 def collect_test_infos(peft_model, tokenizer, dataset, device, limit=None):
     count = len(dataset) if limit is None else min(limit, len(dataset))
     test_infos = []
@@ -104,7 +121,7 @@ def collect_test_infos(peft_model, tokenizer, dataset, device, limit=None):
     return test_infos
 
 
-def collect_train_infos(
+def collect_reward_infos(
     peft_model,
     tokenizer,
     dataset,
@@ -115,10 +132,13 @@ def collect_train_infos(
     limit=None,
     include_debug=False,
     seed_base=None,
+    epsilon=0.2,
+    beta=0.0,
+    ref_model=None,
 ):
     count = len(dataset) if limit is None else min(limit, len(dataset))
-    train_infos = []
-    zero_train_cases = []
+    reward_infos = []
+    zero_cases = []
 
     for idx in range(count):
         sample = dataset[idx]
@@ -134,6 +154,9 @@ def collect_train_infos(
             enable_vllm=enable_vllm,
             return_debug=include_debug,
             seed=seed,
+            epsilon=epsilon,
+            beta=beta,
+            ref_model=ref_model,
         )
 
         if include_debug:
@@ -149,13 +172,45 @@ def collect_train_infos(
         }
         if debug is not None:
             info["debug"] = debug
-        train_infos.append(info)
+        reward_infos.append(info)
 
         if grad.norm().item() <= 1e-12:
-            zero_train_cases.append(idx)
+            zero_cases.append(idx)
         clear_cache(device)
 
-    return train_infos, zero_train_cases
+    return reward_infos, zero_cases
+
+
+def collect_train_infos(
+    peft_model,
+    tokenizer,
+    dataset,
+    device,
+    reward_fn_builder,
+    G=4,
+    enable_vllm=False,
+    limit=None,
+    include_debug=False,
+    seed_base=None,
+    epsilon=0.2,
+    beta=0.0,
+    ref_model=None,
+):
+    return collect_reward_infos(
+        peft_model,
+        tokenizer,
+        dataset,
+        device,
+        reward_fn_builder,
+        G=G,
+        enable_vllm=enable_vllm,
+        limit=limit,
+        include_debug=include_debug,
+        seed_base=seed_base,
+        epsilon=epsilon,
+        beta=beta,
+        ref_model=ref_model,
+    )
 
 
 def collect_checkpoint_infos(
@@ -172,23 +227,48 @@ def collect_checkpoint_infos(
     train_limit=None,
     include_debug=False,
     base_seed=None,
+    test_reward_fn_builder=None,
+    test_G=None,
+    epsilon=0.2,
+    beta=0.0,
+    ref_model=None,
 ):
     checkpoint_infos = []
 
     for checkpoint in checkpoint_schedule:
         load_adapter_checkpoint(peft_model, checkpoint["path"])
 
-        test_infos = collect_test_infos(
-            peft_model,
-            tokenizer,
-            test_dataset,
-            device,
-            limit=test_limit,
-        )
-
         train_seed_base = None
+        test_seed_base = None
         if base_seed is not None:
             train_seed_base = base_seed + checkpoint["step"] * _CHECKPOINT_SEED_STRIDE
+            test_seed_base = train_seed_base + _TEST_SEED_OFFSET
+
+        if test_reward_fn_builder is None:
+            test_infos = collect_test_infos(
+                peft_model,
+                tokenizer,
+                test_dataset,
+                device,
+                limit=test_limit,
+            )
+            zero_test_cases = []
+        else:
+            test_infos, zero_test_cases = collect_reward_infos(
+                peft_model,
+                tokenizer,
+                test_dataset,
+                device,
+                test_reward_fn_builder,
+                G=G if test_G is None else test_G,
+                enable_vllm=enable_vllm,
+                limit=test_limit,
+                include_debug=False,
+                seed_base=test_seed_base,
+                epsilon=epsilon,
+                beta=beta,
+                ref_model=ref_model,
+            )
 
         train_infos, zero_train_cases = collect_train_infos(
             peft_model,
@@ -201,6 +281,9 @@ def collect_checkpoint_infos(
             limit=train_limit,
             include_debug=include_debug,
             seed_base=train_seed_base,
+            epsilon=epsilon,
+            beta=beta,
+            ref_model=ref_model,
         )
 
         checkpoint_infos.append({
@@ -208,6 +291,7 @@ def collect_checkpoint_infos(
             "path": checkpoint["path"],
             "learning_rate": checkpoint["learning_rate"],
             "test_infos": test_infos,
+            "zero_test_cases": zero_test_cases,
             "train_infos": train_infos,
             "zero_train_cases": zero_train_cases,
         })

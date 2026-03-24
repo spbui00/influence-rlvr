@@ -12,6 +12,7 @@ from .gradients import compute_sft_gradient, compute_rlvr_gradient
 from .rewards import (
     format_reward_func,
     accuracy_reward_func,
+    mbpp_execution_reward_func,
     soft_format_reward_func,
     soft_accuracy_reward_func,
 )
@@ -20,7 +21,9 @@ from .trajectory import (
     list_checkpoint_dirs,
     build_checkpoint_schedule,
     load_adapter_checkpoint,
+    ensure_reference_adapter,
     collect_test_infos,
+    collect_reward_infos,
     collect_train_infos,
     collect_checkpoint_infos,
 )
@@ -41,13 +44,16 @@ __all__ = [
     "list_checkpoint_dirs",
     "build_checkpoint_schedule",
     "load_adapter_checkpoint",
+    "ensure_reference_adapter",
     "collect_test_infos",
     "collect_train_infos",
     "collect_checkpoint_infos",
     "format_reward_func",
     "accuracy_reward_func",
+    "mbpp_execution_reward_func",
     "soft_format_reward_func",
     "soft_accuracy_reward_func",
+    "collect_reward_infos",
     "detect_device",
     "clear_cache",
 ]
