@@ -208,3 +208,6 @@ __marimo__/
 
 # Ignore local RLVR sandbox checkpoints and artifacts
 rlvr-mac-sandbox/
+
+# Ignore local RLVR output artifacts
+rlvr-output/
