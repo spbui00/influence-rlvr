@@ -1,4 +1,7 @@
+import json
 import re
+import subprocess
+import sys
 
 _THINK_ANSWER_PATTERN = re.compile(
     r"^<think>.*?</think><answer>.*?</answer>$",
@@ -16,6 +19,64 @@ _CODE_BLOCK_PATTERN = re.compile(
 _PYTHON_START_PATTERN = re.compile(
     r"(?m)^(?:from\s+\S+\s+import\s+\S+|import\s+\S+|def\s+\w+\s*\(|class\s+\w+\s*[:(])"
 )
+_MBPP_RESULT_PREFIX = "__MBPP_RESULT__"
+_DEFAULT_MBPP_TIMEOUT_SECONDS = 5.0
+_MBPP_EXEC_RUNNER = f"""
+import builtins
+import contextlib
+import io
+import json
+import sys
+
+payload = json.loads(sys.stdin.read())
+
+class _BlockedInput:
+    def __call__(self, *args, **kwargs):
+        raise RuntimeError("Interactive input is disabled during MBPP reward evaluation.")
+
+class _BlockedStdin(io.TextIOBase):
+    def read(self, *args, **kwargs):
+        raise RuntimeError("Interactive stdin is disabled during MBPP reward evaluation.")
+
+    def readline(self, *args, **kwargs):
+        raise RuntimeError("Interactive stdin is disabled during MBPP reward evaluation.")
+
+    def readlines(self, *args, **kwargs):
+        raise RuntimeError("Interactive stdin is disabled during MBPP reward evaluation.")
+
+class _DiscardIO(io.TextIOBase):
+    def write(self, text):
+        return len(text)
+
+builtins.input = _BlockedInput()
+sys.stdin = _BlockedStdin()
+
+namespace = {{"__builtins__": builtins.__dict__, "__name__": "__main__"}}
+passed = 0
+
+try:
+    with contextlib.redirect_stdout(_DiscardIO()), contextlib.redirect_stderr(_DiscardIO()):
+        if payload["test_setup_code"]:
+            exec(payload["test_setup_code"], namespace, namespace)
+        exec(payload["code"], namespace, namespace)
+        for test in payload["tests"]:
+            exec(test, namespace, namespace)
+            passed += 1
+except Exception as exc:
+    result = {{
+        "passed": passed,
+        "error_type": type(exc).__name__,
+        "error": str(exc),
+    }}
+else:
+    result = {{
+        "passed": passed,
+        "error_type": None,
+        "error": None,
+    }}
+
+print({json.dumps(_MBPP_RESULT_PREFIX)} + json.dumps(result))
+"""
 
 
 def _extract_responses(completions):
@@ -39,17 +100,46 @@ def _extract_python_code(text):
     return text.strip()
 
 
-def _run_code_tests(code, test_setup_code, tests):
-    namespace = {"__builtins__": __builtins__}
-    if test_setup_code:
-        exec(test_setup_code, namespace, namespace)
-    exec(code, namespace, namespace)
+def _run_code_tests(code, test_setup_code, tests, timeout_seconds):
+    payload = json.dumps({
+        "code": code,
+        "test_setup_code": test_setup_code or "",
+        "tests": list(tests),
+    })
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", _MBPP_EXEC_RUNNER],
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(
+            f"MBPP execution timed out after {timeout_seconds:.1f}s."
+        ) from exc
 
-    passed = 0
-    for test in tests:
-        exec(test, namespace, namespace)
-        passed += 1
-    return passed
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip()
+        if not message:
+            message = f"MBPP subprocess exited with code {result.returncode}."
+        raise RuntimeError(message)
+
+    result_line = None
+    for line in reversed(result.stdout.splitlines()):
+        if line.startswith(_MBPP_RESULT_PREFIX):
+            result_line = line[len(_MBPP_RESULT_PREFIX):]
+            break
+    if result_line is None:
+        raise RuntimeError("MBPP subprocess did not return a result payload.")
+
+    execution_result = json.loads(result_line)
+    if execution_result["error_type"] is not None:
+        raise RuntimeError(
+            f'{execution_result["error_type"]}: {execution_result["error"]}'
+        )
+    return execution_result["passed"]
 
 
 # ── Strict reward functions (binary) ─────────────────────────────────────────
@@ -77,6 +167,7 @@ def mbpp_execution_reward_func(
     test_list,
     test_setup_code="",
     challenge_test_list=None,
+    timeout_seconds=_DEFAULT_MBPP_TIMEOUT_SECONDS,
     **kwargs,
 ):
     rewards = []
@@ -90,7 +181,12 @@ def mbpp_execution_reward_func(
             continue
 
         try:
-            passed = _run_code_tests(code, test_setup_code, tests)
+            passed = _run_code_tests(
+                code,
+                test_setup_code,
+                tests,
+                timeout_seconds=timeout_seconds,
+            )
             rewards.append(passed / len(tests))
         except Exception:
             rewards.append(0.0)
