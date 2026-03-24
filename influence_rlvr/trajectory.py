@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import time
 
 from peft import load_peft_weights, set_peft_model_state_dict
 
@@ -11,6 +12,17 @@ from .utils import clear_cache
 _CHECKPOINT_RE = re.compile(r"checkpoint-(\d+)$")
 _CHECKPOINT_SEED_STRIDE = 100000
 _TEST_SEED_OFFSET = 10000
+
+
+def _progress_print(message, enabled):
+    if enabled:
+        print(message, flush=True)
+
+
+def _checkpoint_prefix(checkpoint_index, checkpoint_count, checkpoint_step):
+    if checkpoint_index is None or checkpoint_count is None:
+        return f"[checkpoint step {checkpoint_step}]"
+    return f"[checkpoint {checkpoint_index}/{checkpoint_count} | step {checkpoint_step}]"
 
 
 def checkpoint_step(checkpoint_dir):
@@ -98,11 +110,20 @@ def ensure_reference_adapter(peft_model, source_adapter="default", ref_adapter="
     return peft_model
 
 
-def collect_test_infos(peft_model, tokenizer, dataset, device, limit=None):
+def collect_test_infos(
+    peft_model,
+    tokenizer,
+    dataset,
+    device,
+    limit=None,
+    progress=False,
+    progress_prefix="",
+):
     count = len(dataset) if limit is None else min(limit, len(dataset))
     test_infos = []
 
     for idx in range(count):
+        sample_start = time.time()
         sample = dataset[idx]
         grad = compute_sft_gradient(
             peft_model,
@@ -116,6 +137,15 @@ def collect_test_infos(peft_model, tokenizer, dataset, device, limit=None):
             "prompt": sample["prompt"],
             "solution": sample["solution"],
         })
+        grad_norm = grad.norm().item()
+        elapsed = time.time() - sample_start
+        _progress_print(
+            (
+                f"{progress_prefix} test sample {idx + 1}/{count} done "
+                f"in {elapsed:.1f}s | ||g||={grad_norm:.6f}"
+            ).strip(),
+            progress,
+        )
         clear_cache(device)
 
     return test_infos
@@ -135,12 +165,15 @@ def collect_reward_infos(
     epsilon=0.2,
     beta=0.0,
     ref_model=None,
+    progress=False,
+    progress_prefix="",
 ):
     count = len(dataset) if limit is None else min(limit, len(dataset))
     reward_infos = []
     zero_cases = []
 
     for idx in range(count):
+        sample_start = time.time()
         sample = dataset[idx]
         reward_funcs = reward_fn_builder(sample, G)
         seed = None if seed_base is None else seed_base + idx
@@ -174,8 +207,17 @@ def collect_reward_infos(
             info["debug"] = debug
         reward_infos.append(info)
 
-        if grad.norm().item() <= 1e-12:
+        grad_norm = grad.norm().item()
+        if grad_norm <= 1e-12:
             zero_cases.append(idx)
+        elapsed = time.time() - sample_start
+        _progress_print(
+            (
+                f"{progress_prefix} sample {idx + 1}/{count} done "
+                f"in {elapsed:.1f}s | ||g||={grad_norm:.6f}"
+            ).strip(),
+            progress,
+        )
         clear_cache(device)
 
     return reward_infos, zero_cases
@@ -195,6 +237,8 @@ def collect_train_infos(
     epsilon=0.2,
     beta=0.0,
     ref_model=None,
+    progress=False,
+    progress_prefix="",
 ):
     return collect_reward_infos(
         peft_model,
@@ -210,6 +254,8 @@ def collect_train_infos(
         epsilon=epsilon,
         beta=beta,
         ref_model=ref_model,
+        progress=progress,
+        progress_prefix=progress_prefix,
     )
 
 
@@ -232,10 +278,20 @@ def collect_checkpoint_infos(
     epsilon=0.2,
     beta=0.0,
     ref_model=None,
+    progress=True,
 ):
     checkpoint_infos = []
+    checkpoint_count = len(checkpoint_schedule)
 
-    for checkpoint in checkpoint_schedule:
+    for checkpoint_index, checkpoint in enumerate(checkpoint_schedule, start=1):
+        checkpoint_start = time.time()
+        prefix = _checkpoint_prefix(
+            checkpoint_index, checkpoint_count, checkpoint["step"]
+        )
+        _progress_print(
+            f"{prefix} loading adapter from {checkpoint['path']}",
+            progress,
+        )
         load_adapter_checkpoint(peft_model, checkpoint["path"])
 
         train_seed_base = None
@@ -251,9 +307,12 @@ def collect_checkpoint_infos(
                 test_dataset,
                 device,
                 limit=test_limit,
+                progress=progress,
+                progress_prefix=f"{prefix} [test]",
             )
             zero_test_cases = []
         else:
+            _progress_print(f"{prefix} collecting reward-based test gradients", progress)
             test_infos, zero_test_cases = collect_reward_infos(
                 peft_model,
                 tokenizer,
@@ -268,8 +327,11 @@ def collect_checkpoint_infos(
                 epsilon=epsilon,
                 beta=beta,
                 ref_model=ref_model,
+                progress=progress,
+                progress_prefix=f"{prefix} [test]",
             )
 
+        _progress_print(f"{prefix} collecting train gradients", progress)
         train_infos, zero_train_cases = collect_train_infos(
             peft_model,
             tokenizer,
@@ -284,6 +346,8 @@ def collect_checkpoint_infos(
             epsilon=epsilon,
             beta=beta,
             ref_model=ref_model,
+            progress=progress,
+            progress_prefix=f"{prefix} [train]",
         )
 
         checkpoint_infos.append({
@@ -295,6 +359,14 @@ def collect_checkpoint_infos(
             "train_infos": train_infos,
             "zero_train_cases": zero_train_cases,
         })
+        checkpoint_elapsed = time.time() - checkpoint_start
+        _progress_print(
+            (
+                f"{prefix} completed in {checkpoint_elapsed:.1f}s | "
+                f"zero-test={len(zero_test_cases)} zero-train={len(zero_train_cases)}"
+            ),
+            progress,
+        )
         clear_cache(device)
 
     return checkpoint_infos
