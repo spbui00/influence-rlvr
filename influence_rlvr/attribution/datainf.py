@@ -15,6 +15,12 @@ class DataInfInfluence(BaseInfluenceMethod):
     The largest matrix ever inverted is n x n (number of training examples).
 
     Required keys: test_info["grad"]
+
+    Sign convention:
+    Returns helpful-positive scores, aligned with the lr-weighted TracIn
+    convention used elsewhere in this project. Positive values mean the
+    train gradient points in a direction that should decrease the test
+    loss under the local second-order approximation.
     """
 
     def __init__(self, g_train_list: list, lambda_damp: float = 0.1,
@@ -45,7 +51,7 @@ class DataInfInfluence(BaseInfluenceMethod):
         g_test = self._normalize_test(test_info["grad"])
         lam = self.lambda_damp
         v = self.J @ g_test
-        scores = -(1.0 / lam) * v + (1.0 / lam**2) * (v @ self.M @ self.K)
+        scores = (1.0 / lam) * v - (1.0 / lam**2) * (v @ self.M @ self.K)
         return scores.numpy()
 
     def compute_score(self, test_info: dict, train_info: dict) -> float:
@@ -56,7 +62,7 @@ class DataInfInfluence(BaseInfluenceMethod):
         lam = self.lambda_damp
         Jg = self.J @ g_test
         h_inv_g = (1.0 / lam) * g_test - (1.0 / lam**2) * (self.J.T @ self.M @ Jg)
-        return -(torch.dot(h_inv_g, g_train)).item()
+        return (torch.dot(h_inv_g, g_train)).item()
 
 
 class TrajectoryDataInfInfluence:
