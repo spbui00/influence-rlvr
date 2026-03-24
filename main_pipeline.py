@@ -35,7 +35,7 @@ LEARNING_RATE = 1e-4
 MAX_STEPS = 10
 PER_DEVICE_BATCH = 1
 GRAD_ACCUM_STEPS = 2
-GRPO_BETA = 0.0
+GRPO_BETA = 0.04
 GRPO_EPSILON = 0.2
 G_TRAIN = 8
 G_TEST = 8
@@ -46,6 +46,7 @@ N_CODE = 5
 N_TRAIN_REPLAY = 10
 
 SKIP_TRAINING = False
+GRAD_CACHE_DIR = "./results/grad_cache"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Device
@@ -209,28 +210,145 @@ def build_code_reward_fns(sample, num_generations):
     ]
 
 
-t0 = time.time()
-checkpoint_infos = collect_checkpoint_infos(
-    model,
-    tokenizer,
-    checkpoint_schedule,
-    test_dataset,
-    train_dataset,
-    DEVICE,
-    reward_fn_builder=build_math_reward_fns,
-    G=G_TRAIN,
-    enable_vllm=False,
-    test_limit=len(test_dataset),
-    train_limit=min(N_TRAIN_REPLAY, len(train_dataset)),
-    include_debug=False,
-    base_seed=TRAIN_GRAD_SEED,
-    test_reward_fn_builder=build_code_reward_fns,
-    test_G=G_TEST,
-    epsilon=GRPO_EPSILON,
-    beta=GRPO_BETA,
-)
-elapsed = time.time() - t0
-print(f"\nTrajectory replay completed in {elapsed:.1f}s")
+def _cache_config_fingerprint():
+    import hashlib
+    config = json.dumps({
+        "model_id": MODEL_ID,
+        "output_dir": os.path.abspath(OUTPUT_DIR),
+        "learning_rate": LEARNING_RATE,
+        "max_steps": MAX_STEPS,
+        "grpo_beta": GRPO_BETA,
+        "grpo_epsilon": GRPO_EPSILON,
+        "g_train": G_TRAIN,
+        "g_test": G_TEST,
+        "n_math": N_MATH,
+        "n_code": N_CODE,
+        "n_train_replay": N_TRAIN_REPLAY,
+        "train_grad_seed": TRAIN_GRAD_SEED,
+    }, sort_keys=True)
+    return hashlib.sha256(config.encode()).hexdigest()[:16]
+
+
+def _save_grad_cache(checkpoint_infos, cache_dir):
+    cache_path = Path(cache_dir)
+    cache_path.mkdir(parents=True, exist_ok=True)
+    meta = {"fingerprint": _cache_config_fingerprint(), "checkpoints": []}
+    for cp in checkpoint_infos:
+        step = cp["step"]
+        entry = {
+            "step": step,
+            "learning_rate": cp["learning_rate"],
+            "zero_test_cases": cp["zero_test_cases"],
+            "zero_train_cases": cp["zero_train_cases"],
+            "test_infos": [],
+            "train_infos": [],
+        }
+        for i, info in enumerate(cp["test_infos"]):
+            fname = f"step{step}_test_{i}.npy"
+            np.save(cache_path / fname, info["grad"].numpy())
+            entry["test_infos"].append({
+                "grad_file": fname,
+                "prompt": info["prompt"],
+                "solution": info.get("solution"),
+            })
+        for i, info in enumerate(cp["train_infos"]):
+            fname = f"step{step}_train_{i}.npy"
+            np.save(cache_path / fname, info["grad"].numpy())
+            entry["train_infos"].append({
+                "grad_file": fname,
+                "prompt": info["prompt"],
+                "solution": info.get("solution"),
+            })
+        meta["checkpoints"].append(entry)
+    with open(cache_path / "cache_meta.json", "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"Gradient cache saved to {cache_path.resolve()}/")
+    print(f"  config fingerprint: {meta['fingerprint']}")
+
+
+def _load_grad_cache(cache_dir):
+    cache_path = Path(cache_dir)
+    with open(cache_path / "cache_meta.json", "r") as f:
+        meta = json.load(f)
+
+    stored_fp = meta.get("fingerprint")
+    current_fp = _cache_config_fingerprint()
+    if stored_fp != current_fp:
+        print(
+            f"  Cache fingerprint mismatch!\n"
+            f"    cached:  {stored_fp}\n"
+            f"    current: {current_fp}\n"
+            f"  Config has changed — cache will be invalidated."
+        )
+        return None
+
+    checkpoint_infos = []
+    for entry in meta["checkpoints"]:
+        test_infos = []
+        for ti in entry["test_infos"]:
+            grad = torch.from_numpy(np.load(cache_path / ti["grad_file"]))
+            test_infos.append({
+                "grad": grad,
+                "prompt": ti["prompt"],
+                "solution": ti.get("solution"),
+            })
+        train_infos = []
+        for ti in entry["train_infos"]:
+            grad = torch.from_numpy(np.load(cache_path / ti["grad_file"]))
+            train_infos.append({
+                "grad": grad,
+                "prompt": ti["prompt"],
+                "solution": ti.get("solution"),
+            })
+        checkpoint_infos.append({
+            "step": entry["step"],
+            "learning_rate": entry["learning_rate"],
+            "zero_test_cases": entry["zero_test_cases"],
+            "zero_train_cases": entry["zero_train_cases"],
+            "test_infos": test_infos,
+            "train_infos": train_infos,
+        })
+    print(f"  config fingerprint: {current_fp} (matches cache)")
+    return checkpoint_infos
+
+
+def _run_replay():
+    t0 = time.time()
+    infos = collect_checkpoint_infos(
+        model,
+        tokenizer,
+        checkpoint_schedule,
+        test_dataset,
+        train_dataset,
+        DEVICE,
+        reward_fn_builder=build_math_reward_fns,
+        G=G_TRAIN,
+        enable_vllm=False,
+        test_limit=len(test_dataset),
+        train_limit=min(N_TRAIN_REPLAY, len(train_dataset)),
+        include_debug=False,
+        base_seed=TRAIN_GRAD_SEED,
+        test_reward_fn_builder=build_code_reward_fns,
+        test_G=G_TEST,
+        epsilon=GRPO_EPSILON,
+        beta=GRPO_BETA,
+    )
+    elapsed = time.time() - t0
+    print(f"\nTrajectory replay completed in {elapsed:.1f}s")
+    _save_grad_cache(infos, GRAD_CACHE_DIR)
+    return infos
+
+
+grad_cache_path = Path(GRAD_CACHE_DIR) / "cache_meta.json"
+checkpoint_infos = None
+if grad_cache_path.exists():
+    print("\nGradient cache found — checking config fingerprint...")
+    checkpoint_infos = _load_grad_cache(GRAD_CACHE_DIR)
+    if checkpoint_infos is not None:
+        print(f"Loaded {len(checkpoint_infos)} checkpoints from cache.")
+
+if checkpoint_infos is None:
+    checkpoint_infos = _run_replay()
 
 print("\nCheckpoint gradient summary:")
 for cp in checkpoint_infos:
