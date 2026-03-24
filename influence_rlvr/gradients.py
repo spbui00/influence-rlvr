@@ -1,3 +1,4 @@
+import warnings
 from contextlib import contextmanager
 
 import torch
@@ -256,6 +257,8 @@ def compute_rlvr_gradient(
     )
 
     log_ratio = per_token_logps - old_per_token_logps
+    log_ratio = torch.nan_to_num(log_ratio, nan=0.0)
+    log_ratio = torch.clamp(log_ratio, -20.0, 20.0)
     ratios = torch.exp(log_ratio)
     clipped_ratios = torch.clamp(ratios, 1 - epsilon, 1 + epsilon)
 
@@ -289,6 +292,15 @@ def compute_rlvr_gradient(
     policy_loss.backward()
 
     grad_vector = extract_lora_gradients(peft_model)
+
+    if not torch.isfinite(grad_vector).all():
+        n_bad = int((~torch.isfinite(grad_vector)).sum().item())
+        warnings.warn(
+            f"compute_rlvr_gradient: {n_bad}/{grad_vector.numel()} non-finite "
+            f"gradient entries detected (seed={seed}). Replacing with zeros.",
+            stacklevel=2,
+        )
+        grad_vector = torch.nan_to_num(grad_vector, nan=0.0, posinf=0.0, neginf=0.0)
 
     debug_info = {
         "prompt_text": prompt_text,
