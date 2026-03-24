@@ -211,3 +211,6 @@ rlvr-mac-sandbox/
 
 # Ignore local RLVR output artifacts
 rlvr-output/
+
+# Ignore local pipeline results
+results/
