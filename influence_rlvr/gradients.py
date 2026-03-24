@@ -247,14 +247,17 @@ def compute_rlvr_gradient(
         response_ids,
         response_mask,
     )
-    old_per_token_logps = _compute_old_per_token_logps(
-        peft_model,
-        old_peft_model,
-        prompt_ids,
-        prompt_attention_mask,
-        response_ids,
-        response_mask,
-    )
+    if old_peft_model is None:
+        old_per_token_logps = per_token_logps.detach()
+    else:
+        old_per_token_logps = _compute_old_per_token_logps(
+            peft_model,
+            old_peft_model,
+            prompt_ids,
+            prompt_attention_mask,
+            response_ids,
+            response_mask,
+        )
 
     log_ratio = per_token_logps - old_per_token_logps
     log_ratio = torch.nan_to_num(log_ratio, nan=0.0)
