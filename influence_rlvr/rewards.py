@@ -21,6 +21,7 @@ _PYTHON_START_PATTERN = re.compile(
 )
 _MBPP_RESULT_PREFIX = "__MBPP_RESULT__"
 _DEFAULT_MBPP_TIMEOUT_SECONDS = 5.0
+_MBPP_COMPILES_BONUS = 0.1
 _MBPP_EXEC_RUNNER = f"""
 import builtins
 import contextlib
@@ -53,24 +54,28 @@ sys.stdin = _BlockedStdin()
 
 namespace = {{"__builtins__": builtins.__dict__, "__name__": "__main__"}}
 passed = 0
+code_loaded = False
 
 try:
     with contextlib.redirect_stdout(_DiscardIO()), contextlib.redirect_stderr(_DiscardIO()):
         if payload["test_setup_code"]:
             exec(payload["test_setup_code"], namespace, namespace)
         exec(payload["code"], namespace, namespace)
+        code_loaded = True
         for test in payload["tests"]:
             exec(test, namespace, namespace)
             passed += 1
 except Exception as exc:
     result = {{
         "passed": passed,
+        "code_loaded": code_loaded,
         "error_type": type(exc).__name__,
         "error": str(exc),
     }}
 else:
     result = {{
         "passed": passed,
+        "code_loaded": True,
         "error_type": None,
         "error": None,
     }}
@@ -136,10 +141,12 @@ def _run_code_tests(code, test_setup_code, tests, timeout_seconds):
 
     execution_result = json.loads(result_line)
     if execution_result["error_type"] is not None:
+        if execution_result.get("code_loaded", False):
+            return execution_result["passed"], True
         raise RuntimeError(
             f'{execution_result["error_type"]}: {execution_result["error"]}'
         )
-    return execution_result["passed"]
+    return execution_result["passed"], True
 
 
 # ── Strict reward functions (binary) ─────────────────────────────────────────
@@ -181,13 +188,21 @@ def mbpp_execution_reward_func(
             continue
 
         try:
-            passed = _run_code_tests(
+            passed, code_loaded = _run_code_tests(
                 code,
                 test_setup_code,
                 tests,
                 timeout_seconds=timeout_seconds,
             )
-            rewards.append(passed / len(tests))
+            if passed > 0:
+                rewards.append(
+                    _MBPP_COMPILES_BONUS
+                    + (1.0 - _MBPP_COMPILES_BONUS) * (passed / len(tests))
+                )
+            elif code_loaded:
+                rewards.append(_MBPP_COMPILES_BONUS)
+            else:
+                rewards.append(0.0)
         except Exception:
             rewards.append(0.0)
 
