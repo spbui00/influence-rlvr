@@ -15,7 +15,6 @@ from influence_rlvr import (
     detect_device,
     ensure_reference_adapter,
     format_reward_func,
-    mbpp_execution_reward_func,
 )
 
 DEVICE = detect_device()
@@ -29,7 +28,6 @@ LAMBDA_DAMP = 0.1
 GRPO_BETA = 0.0
 GRPO_EPSILON = 0.2
 G_TRAIN = 8
-G_TEST = 8
 TRAIN_GRAD_SEED = 1234
 N_MATH = 100
 N_CODE = 5
@@ -76,9 +74,6 @@ def format_code(example):
             {"role": "user", "content": example["text"]},
         ],
         "solution": example["code"],
-        "test_list": example["test_list"],
-        "test_setup_code": example["test_setup_code"],
-        "challenge_test_list": example["challenge_test_list"],
     }
 
 
@@ -96,27 +91,12 @@ def build_math_reward_fns(sample, num_generations):
     ]
 
 
-def build_code_reward_fns(sample, num_generations):
-    return [
-        partial(
-            mbpp_execution_reward_func,
-            test_list=sample["test_list"],
-            test_setup_code=sample["test_setup_code"],
-            challenge_test_list=sample["challenge_test_list"],
-        ),
-    ]
-
-
 checkpoint_schedule = build_checkpoint_schedule(OUTPUT_DIR, default_learning_rate=LEARNING_RATE)
 if not checkpoint_schedule:
     raise RuntimeError(
         f"No checkpoints were found under {OUTPUT_DIR}. "
         "Run the training notebook first with save_steps=1."
     )
-
-print("\n=== Checkpoint Schedule ===")
-for checkpoint in checkpoint_schedule:
-    print(f"  checkpoint-{checkpoint['step']}: lr={checkpoint['learning_rate']:.6e}")
 
 checkpoint_infos = collect_checkpoint_infos(
     model,
@@ -132,37 +112,16 @@ checkpoint_infos = collect_checkpoint_infos(
     train_limit=min(N_TRAIN, len(train_dataset)),
     include_debug=False,
     base_seed=TRAIN_GRAD_SEED,
-    test_reward_fn_builder=build_code_reward_fns,
-    test_G=G_TEST,
     epsilon=GRPO_EPSILON,
     beta=GRPO_BETA,
 )
 
-test_infos = checkpoint_infos[-1]["test_infos"]
-train_infos = checkpoint_infos[-1]["train_infos"]
-N_TEST = len(test_infos)
-N_TRAIN = len(train_infos)
-
-print("\n=== Checkpoint Gradient Summary ===")
-for checkpoint in checkpoint_infos:
-    test_norms = [info["grad"].norm().item() for info in checkpoint["test_infos"]]
-    train_norms = [info["grad"].norm().item() for info in checkpoint["train_infos"]]
-    print(
-        f"  checkpoint-{checkpoint['step']}: "
-        f"mean ||g_test||={np.mean(test_norms):.6f}, "
-        f"mean ||g_train||={np.mean(train_norms):.6f}, "
-        f"zero-test={checkpoint['zero_test_cases']}, "
-        f"zero-train={checkpoint['zero_train_cases']}"
-    )
-
-print("\n=== Building Trajectory TracIn Matrix ===")
+print("\n=== SFT Test / GRPO Train Trajectory TracIn Matrix ===")
 trajectory_tracin = TrajectoryTracInInfluence(normalize=False)
 influence_matrix = trajectory_tracin.compute_matrix(checkpoint_infos)
-print(f"Trajectory TracIn shape: {influence_matrix.shape}")
 print(influence_matrix)
 
-print("\n=== Building Trajectory DataInf Matrix ===")
+print("\n=== SFT Test / GRPO Train Trajectory DataInf Matrix ===")
 trajectory_datainf = TrajectoryDataInfInfluence(lambda_damp=LAMBDA_DAMP, normalize=False)
 influence_matrix_2nd = trajectory_datainf.compute_matrix(checkpoint_infos)
-print(f"Trajectory DataInf shape: {influence_matrix_2nd.shape}")
 print(influence_matrix_2nd)
