@@ -214,3 +214,5 @@ rlvr-output/
 
 # Ignore local pipeline results
 results/
+
+.DS_Store
