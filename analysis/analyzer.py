@@ -245,6 +245,20 @@ class InfluenceAnalyzer:
             "lambda_damp",
         ]:
             lines.append(f"  {key}: {self.manifest.config.get(key)}")
+
+        m = self.manifest
+        if m.training_elapsed_s is not None or m.replay_elapsed_s is not None or m.total_elapsed_s is not None:
+            lines.append("")
+            lines.append("=" * 60)
+            lines.append("Timing")
+            lines.append("=" * 60)
+            if m.training_elapsed_s is not None:
+                lines.append(f"  training:  {m.training_elapsed_s:.1f}s")
+            if m.replay_elapsed_s is not None:
+                lines.append(f"  replay:    {m.replay_elapsed_s:.1f}s")
+            if m.total_elapsed_s is not None:
+                lines.append(f"  total:     {m.total_elapsed_s:.1f}s")
+
         return "\n".join(lines)
 
     def write_report(
