@@ -2,6 +2,7 @@ import torch
 import numpy as np
 
 from .base import BaseInfluenceMethod
+from .tracin import _stack_train_weights
 
 
 class DataInfInfluence(BaseInfluenceMethod):
@@ -62,7 +63,8 @@ class DataInfInfluence(BaseInfluenceMethod):
         lam = self.lambda_damp
         Jg = self.J @ g_test
         h_inv_g = (1.0 / lam) * g_test - (1.0 / lam**2) * (self.J.T @ self.M @ Jg)
-        return (torch.dot(h_inv_g, g_train)).item()
+        weight = float(train_info.get("historical_weight", 1.0))
+        return (weight * torch.dot(h_inv_g, g_train)).item()
 
 
 class TrajectoryDataInfInfluence:
@@ -92,8 +94,9 @@ class TrajectoryDataInfInfluence:
             for idx, test_info in enumerate(checkpoint["test_infos"]):
                 matrix[idx] = datainf.compute_all_scores(test_info)
 
+            train_weights = _stack_train_weights(checkpoint["train_infos"]).numpy()
             learning_rate = float(checkpoint.get("learning_rate", 1.0))
-            weighted_matrix = learning_rate * matrix
+            weighted_matrix = learning_rate * matrix * train_weights[None, :]
 
             if total_matrix is None:
                 total_matrix = weighted_matrix
@@ -106,6 +109,7 @@ class TrajectoryDataInfInfluence:
                     "learning_rate": learning_rate,
                     "matrix": matrix,
                     "weighted_matrix": weighted_matrix,
+                    "train_weights": train_weights,
                 })
 
         return (total_matrix, breakdown) if return_breakdown else total_matrix

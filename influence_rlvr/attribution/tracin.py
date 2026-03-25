@@ -12,6 +12,13 @@ def _stack_grads(infos, normalize):
     return grads
 
 
+def _stack_train_weights(infos):
+    return torch.tensor(
+        [float(info.get("historical_weight", 1.0)) for info in infos],
+        dtype=torch.float32,
+    )
+
+
 class TracInInfluence(BaseInfluenceMethod):
     """
     First-order influence via learning-rate-weighted gradient dot product.
@@ -34,7 +41,8 @@ class TracInInfluence(BaseInfluenceMethod):
         if self.normalize:
             g_test = g_test / (g_test.norm() + 1e-12)
             g_train = g_train / (g_train.norm() + 1e-12)
-        return (self.learning_rate * torch.dot(g_test, g_train)).item()
+        weight = float(train_info.get("historical_weight", 1.0))
+        return (self.learning_rate * weight * torch.dot(g_test, g_train)).item()
 
 
 class TrajectoryTracInInfluence:
@@ -52,9 +60,10 @@ class TrajectoryTracInInfluence:
         for checkpoint in checkpoint_infos:
             test_grads = _stack_grads(checkpoint["test_infos"], self.normalize)
             train_grads = _stack_grads(checkpoint["train_infos"], self.normalize)
+            train_weights = _stack_train_weights(checkpoint["train_infos"])
             matrix = (test_grads @ train_grads.T).cpu().numpy()
             learning_rate = float(checkpoint.get("learning_rate", 1.0))
-            weighted_matrix = learning_rate * matrix
+            weighted_matrix = learning_rate * matrix * train_weights.numpy()[None, :]
 
             if total_matrix is None:
                 total_matrix = weighted_matrix
@@ -67,6 +76,7 @@ class TrajectoryTracInInfluence:
                     "learning_rate": learning_rate,
                     "matrix": matrix,
                     "weighted_matrix": weighted_matrix,
+                    "train_weights": train_weights.numpy(),
                 })
 
         return (total_matrix, breakdown) if return_breakdown else total_matrix

@@ -165,6 +165,8 @@ def collect_reward_infos(
     epsilon=0.2,
     beta=0.0,
     ref_model=None,
+    sample_weight_lookup=None,
+    sample_index_key=None,
     progress=False,
     progress_prefix="",
 ):
@@ -203,6 +205,13 @@ def collect_reward_infos(
             "prompt": sample["prompt"],
             "solution": sample.get("solution"),
         }
+        if sample_index_key is not None:
+            sample_index = int(sample.get(sample_index_key, idx))
+            info["train_index"] = sample_index
+            if sample_weight_lookup is not None:
+                info["historical_weight"] = float(
+                    sample_weight_lookup.get(sample_index, 0.0)
+                )
         if debug is not None:
             info["debug"] = debug
         reward_infos.append(info)
@@ -237,6 +246,7 @@ def collect_train_infos(
     epsilon=0.2,
     beta=0.0,
     ref_model=None,
+    sample_weight_lookup=None,
     progress=False,
     progress_prefix="",
 ):
@@ -254,6 +264,8 @@ def collect_train_infos(
         epsilon=epsilon,
         beta=beta,
         ref_model=ref_model,
+        sample_weight_lookup=sample_weight_lookup,
+        sample_index_key="train_index",
         progress=progress,
         progress_prefix=progress_prefix,
     )
@@ -278,6 +290,8 @@ def collect_checkpoint_infos(
     epsilon=0.2,
     beta=0.0,
     ref_model=None,
+    influence_mode="dense",
+    train_step_weight_lookup=None,
     progress=True,
 ):
     checkpoint_infos = []
@@ -332,6 +346,13 @@ def collect_checkpoint_infos(
             )
 
         _progress_print(f"{prefix} collecting train gradients", progress)
+        step_weight_info = None
+        if train_step_weight_lookup is not None:
+            step_weight_info = train_step_weight_lookup.get(int(checkpoint["step"]))
+            if influence_mode == "historical" and step_weight_info is None:
+                raise RuntimeError(
+                    f"Missing historical batch metadata for checkpoint step {checkpoint['step']}."
+                )
         train_infos, zero_train_cases = collect_train_infos(
             peft_model,
             tokenizer,
@@ -346,6 +367,11 @@ def collect_checkpoint_infos(
             epsilon=epsilon,
             beta=beta,
             ref_model=ref_model,
+            sample_weight_lookup=(
+                step_weight_info.get("weights")
+                if influence_mode == "historical" and step_weight_info is not None
+                else None
+            ),
             progress=progress,
             progress_prefix=f"{prefix} [train]",
         )
@@ -358,6 +384,11 @@ def collect_checkpoint_infos(
             "zero_test_cases": zero_test_cases,
             "train_infos": train_infos,
             "zero_train_cases": zero_train_cases,
+            "historical_total_rows": (
+                None
+                if step_weight_info is None
+                else step_weight_info.get("total_rows")
+            ),
         })
         checkpoint_elapsed = time.time() - checkpoint_start
         _progress_print(

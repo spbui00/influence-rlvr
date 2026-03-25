@@ -233,6 +233,7 @@ class InfluenceAnalyzer:
         lines.append("=" * 60)
         for key in [
             "model_id",
+            "influence_mode",
             "learning_rate",
             "max_steps",
             "grpo_beta",
@@ -243,6 +244,7 @@ class InfluenceAnalyzer:
             "n_code",
             "n_train_replay",
             "lambda_damp",
+            "batch_history_fingerprint",
         ]:
             lines.append(f"  {key}: {self.manifest.config.get(key)}")
 
