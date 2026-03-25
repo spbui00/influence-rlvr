@@ -1,4 +1,3 @@
-import json
 import os
 import time
 from functools import partial
@@ -11,6 +10,12 @@ from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import GRPOConfig, GRPOTrainer
 
+from analysis import (
+    build_cache_fingerprint,
+    load_grad_cache,
+    save_grad_cache,
+    save_results_bundle,
+)
 from influence_rlvr import (
     TrajectoryDataInfInfluence,
     TrajectoryTracInInfluence,
@@ -210,106 +215,40 @@ def build_code_reward_fns(sample, num_generations):
     ]
 
 
-def _cache_config_fingerprint():
-    import hashlib
-    config = json.dumps({
-        "model_id": MODEL_ID,
-        "output_dir": os.path.abspath(OUTPUT_DIR),
-        "learning_rate": LEARNING_RATE,
-        "max_steps": MAX_STEPS,
-        "grpo_beta": GRPO_BETA,
-        "grpo_epsilon": GRPO_EPSILON,
-        "g_train": G_TRAIN,
-        "g_test": G_TEST,
-        "n_math": N_MATH,
-        "n_code": N_CODE,
-        "n_train_replay": N_TRAIN_REPLAY,
-        "train_grad_seed": TRAIN_GRAD_SEED,
-    }, sort_keys=True)
-    return hashlib.sha256(config.encode()).hexdigest()[:16]
+RESULTS_CONFIG = {
+    "model_id": MODEL_ID,
+    "output_dir": OUTPUT_DIR,
+    "results_dir": RESULTS_DIR,
+    "learning_rate": LEARNING_RATE,
+    "max_steps": MAX_STEPS,
+    "grpo_beta": GRPO_BETA,
+    "grpo_epsilon": GRPO_EPSILON,
+    "g_train": G_TRAIN,
+    "g_test": G_TEST,
+    "n_math": N_MATH,
+    "n_code": N_CODE,
+    "n_train_replay": N_TRAIN_REPLAY,
+    "lambda_damp": LAMBDA_DAMP,
+    "train_grad_seed": TRAIN_GRAD_SEED,
+    "device": str(DEVICE),
+}
 
+CACHE_CONFIG = {
+    "model_id": MODEL_ID,
+    "output_dir": os.path.abspath(OUTPUT_DIR),
+    "learning_rate": LEARNING_RATE,
+    "max_steps": MAX_STEPS,
+    "grpo_beta": GRPO_BETA,
+    "grpo_epsilon": GRPO_EPSILON,
+    "g_train": G_TRAIN,
+    "g_test": G_TEST,
+    "n_math": N_MATH,
+    "n_code": N_CODE,
+    "n_train_replay": N_TRAIN_REPLAY,
+    "train_grad_seed": TRAIN_GRAD_SEED,
+}
 
-def _save_grad_cache(checkpoint_infos, cache_dir):
-    cache_path = Path(cache_dir)
-    cache_path.mkdir(parents=True, exist_ok=True)
-    meta = {"fingerprint": _cache_config_fingerprint(), "checkpoints": []}
-    for cp in checkpoint_infos:
-        step = cp["step"]
-        entry = {
-            "step": step,
-            "learning_rate": cp["learning_rate"],
-            "zero_test_cases": cp["zero_test_cases"],
-            "zero_train_cases": cp["zero_train_cases"],
-            "test_infos": [],
-            "train_infos": [],
-        }
-        for i, info in enumerate(cp["test_infos"]):
-            fname = f"step{step}_test_{i}.npy"
-            np.save(cache_path / fname, info["grad"].numpy())
-            entry["test_infos"].append({
-                "grad_file": fname,
-                "prompt": info["prompt"],
-                "solution": info.get("solution"),
-            })
-        for i, info in enumerate(cp["train_infos"]):
-            fname = f"step{step}_train_{i}.npy"
-            np.save(cache_path / fname, info["grad"].numpy())
-            entry["train_infos"].append({
-                "grad_file": fname,
-                "prompt": info["prompt"],
-                "solution": info.get("solution"),
-            })
-        meta["checkpoints"].append(entry)
-    with open(cache_path / "cache_meta.json", "w") as f:
-        json.dump(meta, f, indent=2)
-    print(f"Gradient cache saved to {cache_path.resolve()}/")
-    print(f"  config fingerprint: {meta['fingerprint']}")
-
-
-def _load_grad_cache(cache_dir):
-    cache_path = Path(cache_dir)
-    with open(cache_path / "cache_meta.json", "r") as f:
-        meta = json.load(f)
-
-    stored_fp = meta.get("fingerprint")
-    current_fp = _cache_config_fingerprint()
-    if stored_fp != current_fp:
-        print(
-            f"  Cache fingerprint mismatch!\n"
-            f"    cached:  {stored_fp}\n"
-            f"    current: {current_fp}\n"
-            f"  Config has changed — cache will be invalidated."
-        )
-        return None
-
-    checkpoint_infos = []
-    for entry in meta["checkpoints"]:
-        test_infos = []
-        for ti in entry["test_infos"]:
-            grad = torch.from_numpy(np.load(cache_path / ti["grad_file"]))
-            test_infos.append({
-                "grad": grad,
-                "prompt": ti["prompt"],
-                "solution": ti.get("solution"),
-            })
-        train_infos = []
-        for ti in entry["train_infos"]:
-            grad = torch.from_numpy(np.load(cache_path / ti["grad_file"]))
-            train_infos.append({
-                "grad": grad,
-                "prompt": ti["prompt"],
-                "solution": ti.get("solution"),
-            })
-        checkpoint_infos.append({
-            "step": entry["step"],
-            "learning_rate": entry["learning_rate"],
-            "zero_test_cases": entry["zero_test_cases"],
-            "zero_train_cases": entry["zero_train_cases"],
-            "test_infos": test_infos,
-            "train_infos": train_infos,
-        })
-    print(f"  config fingerprint: {current_fp} (matches cache)")
-    return checkpoint_infos
+CACHE_FINGERPRINT = build_cache_fingerprint(CACHE_CONFIG)
 
 
 def _run_replay():
@@ -335,7 +274,9 @@ def _run_replay():
     )
     elapsed = time.time() - t0
     print(f"\nTrajectory replay completed in {elapsed:.1f}s")
-    _save_grad_cache(infos, GRAD_CACHE_DIR)
+    save_grad_cache(infos, GRAD_CACHE_DIR, CACHE_FINGERPRINT, CACHE_CONFIG)
+    print(f"Gradient cache saved to {Path(GRAD_CACHE_DIR).resolve()}/")
+    print(f"  config fingerprint: {CACHE_FINGERPRINT}")
     return infos
 
 
@@ -343,9 +284,20 @@ grad_cache_path = Path(GRAD_CACHE_DIR) / "cache_meta.json"
 checkpoint_infos = None
 if grad_cache_path.exists():
     print("\nGradient cache found — checking config fingerprint...")
-    checkpoint_infos = _load_grad_cache(GRAD_CACHE_DIR)
+    checkpoint_infos, stored_fingerprint = load_grad_cache(
+        GRAD_CACHE_DIR,
+        CACHE_FINGERPRINT,
+    )
     if checkpoint_infos is not None:
+        print(f"  config fingerprint: {CACHE_FINGERPRINT} (matches cache)")
         print(f"Loaded {len(checkpoint_infos)} checkpoints from cache.")
+    else:
+        print(
+            f"  Cache fingerprint mismatch!\n"
+            f"    cached:  {stored_fingerprint}\n"
+            f"    current: {CACHE_FINGERPRINT}\n"
+            f"  Config has changed — cache will be invalidated."
+        )
 
 if checkpoint_infos is None:
     checkpoint_infos = _run_replay()
@@ -362,9 +314,6 @@ for cp in checkpoint_infos:
         f"zero-test={cp['zero_test_cases']}, "
         f"zero-train={cp['zero_train_cases']}"
     )
-
-N_TEST_ACTUAL = len(checkpoint_infos[-1]["test_infos"])
-N_TRAIN_ACTUAL = len(checkpoint_infos[-1]["train_infos"])
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Phase 3 — Influence Computation
@@ -402,70 +351,15 @@ print("PHASE 4: Saving Results")
 print("=" * 80)
 
 results_path = Path(RESULTS_DIR)
-results_path.mkdir(parents=True, exist_ok=True)
-
-np.save(results_path / "tracin_matrix.npy", tracin_matrix)
-np.save(results_path / "datainf_matrix.npy", datainf_matrix)
-
-for entry in tracin_breakdown:
-    np.save(results_path / f"tracin_step_{entry['step']}.npy", entry["weighted_matrix"])
-for entry in datainf_breakdown:
-    np.save(results_path / f"datainf_step_{entry['step']}.npy", entry["weighted_matrix"])
-
-test_prompts = []
-for info in checkpoint_infos[-1]["test_infos"]:
-    prompt = info["prompt"]
-    if isinstance(prompt, list):
-        prompt = prompt[-1]["content"] if prompt else ""
-    test_prompts.append(str(prompt)[:200])
-
-train_prompts = []
-train_solutions = []
-for info in checkpoint_infos[-1]["train_infos"]:
-    prompt = info["prompt"]
-    if isinstance(prompt, list):
-        prompt = prompt[-1]["content"] if prompt else ""
-    train_prompts.append(str(prompt)[:200])
-    train_solutions.append(str(info.get("solution", ""))[:100])
-
-checkpoint_summary = []
-for cp in checkpoint_infos:
-    test_norms = [info["grad"].norm().item() for info in cp["test_infos"]]
-    train_norms = [info["grad"].norm().item() for info in cp["train_infos"]]
-    checkpoint_summary.append({
-        "step": cp["step"],
-        "learning_rate": cp["learning_rate"],
-        "mean_test_grad_norm": float(np.mean(test_norms)),
-        "mean_train_grad_norm": float(np.mean(train_norms)),
-        "zero_test_cases": cp["zero_test_cases"],
-        "zero_train_cases": cp["zero_train_cases"],
-    })
-
-metadata = {
-    "model_id": MODEL_ID,
-    "output_dir": OUTPUT_DIR,
-    "learning_rate": LEARNING_RATE,
-    "max_steps": MAX_STEPS,
-    "grpo_beta": GRPO_BETA,
-    "grpo_epsilon": GRPO_EPSILON,
-    "g_train": G_TRAIN,
-    "g_test": G_TEST,
-    "n_math": N_MATH,
-    "n_code": N_CODE,
-    "n_train_replay": N_TRAIN_REPLAY,
-    "n_test_actual": N_TEST_ACTUAL,
-    "n_train_actual": N_TRAIN_ACTUAL,
-    "lambda_damp": LAMBDA_DAMP,
-    "train_grad_seed": TRAIN_GRAD_SEED,
-    "device": str(DEVICE),
-    "checkpoints": checkpoint_summary,
-    "test_prompts": test_prompts,
-    "train_prompts": train_prompts,
-    "train_solutions": train_solutions,
-}
-
-with open(results_path / "metadata.json", "w") as f:
-    json.dump(metadata, f, indent=2)
+save_results_bundle(
+    results_path,
+    tracin_matrix,
+    datainf_matrix,
+    tracin_breakdown,
+    datainf_breakdown,
+    checkpoint_infos,
+    RESULTS_CONFIG,
+)
 
 saved_files = sorted(os.listdir(results_path))
 print(f"Results saved to {results_path.resolve()}/")
@@ -474,4 +368,4 @@ for fname in saved_files:
     size_kb = fpath.stat().st_size / 1024
     print(f"  {fname}  ({size_kb:.1f} KB)")
 
-print("\nDone. Load the .npy matrices and metadata.json locally to plot/interpret.")
+print("\nDone. Load the .npy matrices and results_manifest.json (or metadata.json) locally to plot/interpret.")
