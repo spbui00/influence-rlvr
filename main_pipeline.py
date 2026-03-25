@@ -167,10 +167,15 @@ def run_training():
     clear_cache(DEVICE)
 
 
+pipeline_t0 = time.time()
+training_elapsed_s = None
+
 if SKIP_TRAINING:
     print("\nSKIP_TRAINING=True — skipping Phase 1")
 else:
+    t_train_start = time.time()
     run_training()
+    training_elapsed_s = time.time() - t_train_start
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Phase 2 — Trajectory Replay
@@ -277,11 +282,12 @@ def _run_replay():
     save_grad_cache(infos, GRAD_CACHE_DIR, CACHE_FINGERPRINT, CACHE_CONFIG)
     print(f"Gradient cache saved to {Path(GRAD_CACHE_DIR).resolve()}/")
     print(f"  config fingerprint: {CACHE_FINGERPRINT}")
-    return infos
+    return infos, elapsed
 
 
 grad_cache_path = Path(GRAD_CACHE_DIR) / "cache_meta.json"
 checkpoint_infos = None
+replay_elapsed_s = None
 if grad_cache_path.exists():
     print("\nGradient cache found — checking config fingerprint...")
     checkpoint_infos, stored_fingerprint = load_grad_cache(
@@ -300,7 +306,7 @@ if grad_cache_path.exists():
         )
 
 if checkpoint_infos is None:
-    checkpoint_infos = _run_replay()
+    checkpoint_infos, replay_elapsed_s = _run_replay()
 
 print("\nCheckpoint gradient summary:")
 for cp in checkpoint_infos:
@@ -350,6 +356,8 @@ print("\n" + "=" * 80)
 print("PHASE 4: Saving Results")
 print("=" * 80)
 
+total_elapsed_s = time.time() - pipeline_t0
+
 results_path = Path(RESULTS_DIR)
 save_results_bundle(
     results_path,
@@ -359,6 +367,9 @@ save_results_bundle(
     datainf_breakdown,
     checkpoint_infos,
     RESULTS_CONFIG,
+    training_elapsed_s=training_elapsed_s,
+    replay_elapsed_s=replay_elapsed_s,
+    total_elapsed_s=total_elapsed_s,
 )
 
 saved_files = sorted(os.listdir(results_path))
@@ -368,4 +379,11 @@ for fname in saved_files:
     size_kb = fpath.stat().st_size / 1024
     print(f"  {fname}  ({size_kb:.1f} KB)")
 
-print("\nDone. Load the .npy matrices and results_manifest.json (or metadata.json) locally to plot/interpret.")
+timing_parts = []
+if training_elapsed_s is not None:
+    timing_parts.append(f"training={training_elapsed_s:.1f}s")
+if replay_elapsed_s is not None:
+    timing_parts.append(f"replay={replay_elapsed_s:.1f}s")
+timing_parts.append(f"total={total_elapsed_s:.1f}s")
+print(f"\nTiming: {', '.join(timing_parts)}")
+print("Done. Load the .npy matrices and results_manifest.json (or metadata.json) locally to plot/interpret.")
