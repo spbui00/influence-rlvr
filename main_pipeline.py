@@ -8,15 +8,19 @@ import torch
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from trl import GRPOConfig, GRPOTrainer
+from trl import GRPOConfig
 
 from analysis import (
+    build_batch_history_fingerprint,
+    build_batch_weight_lookup,
     build_cache_fingerprint,
+    load_batch_history,
     load_grad_cache,
     save_grad_cache,
     save_results_bundle,
 )
 from influence_rlvr import (
+    HistoricalBatchGRPOTrainer,
     TrajectoryDataInfInfluence,
     TrajectoryTracInInfluence,
     accuracy_reward_func,
@@ -49,9 +53,24 @@ LAMBDA_DAMP = 0.1
 N_MATH = 100
 N_CODE = 5
 N_TRAIN_REPLAY = 10
+INFLUENCE_MODE = "historical"
 
 SKIP_TRAINING = False
 GRAD_CACHE_DIR = "./results/grad_cache"
+
+
+def normalize_influence_mode(mode):
+    value = str(mode).strip().lower()
+    if value == "counterfactual":
+        value = "dense"
+    if value not in {"historical", "dense"}:
+        raise ValueError(
+            f"Unsupported INFLUENCE_MODE={mode!r}. Use 'historical' or 'dense'."
+        )
+    return value
+
+
+INFLUENCE_MODE = normalize_influence_mode(INFLUENCE_MODE)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Device
@@ -85,7 +104,7 @@ model.print_trainable_parameters()
 # ═══════════════════════════════════════════════════════════════════════════════
 # Datasets
 # ═══════════════════════════════════════════════════════════════════════════════
-def format_math(example):
+def format_math(example, idx):
     return {
         "prompt": [
             {
@@ -98,6 +117,7 @@ def format_math(example):
             {"role": "user", "content": example["question"]},
         ],
         "solution": example["answer"].split("#### ")[-1],
+        "train_index": idx,
     }
 
 
@@ -116,7 +136,7 @@ def format_code(example):
 
 print("\nLoading datasets...")
 math_data = load_dataset("openai/gsm8k", "main", split=f"train[:{N_MATH}]")
-train_dataset = math_data.map(format_math)
+train_dataset = math_data.map(format_math, with_indices=True)
 code_data = load_dataset("mbpp", split=f"test[:{N_CODE}]")
 test_dataset = code_data.map(format_code)
 print(f"  Z_train (Math): {len(train_dataset)} samples")
@@ -152,12 +172,13 @@ def run_training():
         scale_rewards="group",
     )
 
-    trainer = GRPOTrainer(
+    trainer = HistoricalBatchGRPOTrainer(
         model=model,
         reward_funcs=[format_reward_func, accuracy_reward_func],
         args=training_args,
         train_dataset=train_dataset,
         processing_class=tokenizer,
+        history_output_dir=OUTPUT_DIR,
     )
 
     t0 = time.time()
@@ -200,6 +221,27 @@ for cp in checkpoint_schedule:
 if GRPO_BETA != 0.0:
     ensure_reference_adapter(model)
 
+batch_history_manifest = None
+batch_weight_lookup = None
+batch_history_fingerprint = None
+if INFLUENCE_MODE == "historical":
+    batch_history_manifest = load_batch_history(OUTPUT_DIR)
+    if batch_history_manifest is None:
+        raise RuntimeError(
+            "Historical influence mode requires historical batch metadata, "
+            f"but {OUTPUT_DIR}/historical_batch_history.json was not found. "
+            "Use a new run that logged batch history, or switch INFLUENCE_MODE='dense'."
+        )
+    batch_weight_lookup = build_batch_weight_lookup(batch_history_manifest)
+    batch_history_fingerprint = build_batch_history_fingerprint(batch_history_manifest)
+    print(
+        "Loaded historical batch history: "
+        f"{len(batch_history_manifest.steps)} optimizer steps "
+        f"(fingerprint={batch_history_fingerprint})"
+    )
+else:
+    print("Using dense counterfactual influence mode.")
+
 
 def build_math_reward_fns(sample, num_generations):
     solution = sample["solution"]
@@ -224,6 +266,7 @@ RESULTS_CONFIG = {
     "model_id": MODEL_ID,
     "output_dir": OUTPUT_DIR,
     "results_dir": RESULTS_DIR,
+    "influence_mode": INFLUENCE_MODE,
     "learning_rate": LEARNING_RATE,
     "max_steps": MAX_STEPS,
     "grpo_beta": GRPO_BETA,
@@ -236,11 +279,13 @@ RESULTS_CONFIG = {
     "lambda_damp": LAMBDA_DAMP,
     "train_grad_seed": TRAIN_GRAD_SEED,
     "device": str(DEVICE),
+    "batch_history_fingerprint": batch_history_fingerprint,
 }
 
 CACHE_CONFIG = {
     "model_id": MODEL_ID,
     "output_dir": os.path.abspath(OUTPUT_DIR),
+    "influence_mode": INFLUENCE_MODE,
     "learning_rate": LEARNING_RATE,
     "max_steps": MAX_STEPS,
     "grpo_beta": GRPO_BETA,
@@ -251,6 +296,7 @@ CACHE_CONFIG = {
     "n_code": N_CODE,
     "n_train_replay": N_TRAIN_REPLAY,
     "train_grad_seed": TRAIN_GRAD_SEED,
+    "batch_history_fingerprint": batch_history_fingerprint,
 }
 
 CACHE_FINGERPRINT = build_cache_fingerprint(CACHE_CONFIG)
@@ -276,6 +322,8 @@ def _run_replay():
         test_G=G_TEST,
         epsilon=GRPO_EPSILON,
         beta=GRPO_BETA,
+        influence_mode=INFLUENCE_MODE,
+        train_step_weight_lookup=batch_weight_lookup,
     )
     elapsed = time.time() - t0
     print(f"\nTrajectory replay completed in {elapsed:.1f}s")
@@ -312,6 +360,13 @@ print("\nCheckpoint gradient summary:")
 for cp in checkpoint_infos:
     test_norms = [info["grad"].norm().item() for info in cp["test_infos"]]
     train_norms = [info["grad"].norm().item() for info in cp["train_infos"]]
+    nonzero_train_weights = None
+    if any("historical_weight" in info for info in cp["train_infos"]):
+        nonzero_train_weights = sum(
+            1
+            for info in cp["train_infos"]
+            if float(info.get("historical_weight", 1.0)) > 0.0
+        )
     print(
         f"  step {cp['step']:>3d}: "
         f"lr={cp['learning_rate']:.6e}, "
@@ -319,6 +374,14 @@ for cp in checkpoint_infos:
         f"mean ||g_train||={np.mean(train_norms):.6f}, "
         f"zero-test={cp['zero_test_cases']}, "
         f"zero-train={cp['zero_train_cases']}"
+        + (
+            ""
+            if cp.get("historical_total_rows") is None
+            else (
+                f", batch-rows={cp['historical_total_rows']}"
+                f", active-train={nonzero_train_weights}"
+            )
+        )
     )
 
 # ═══════════════════════════════════════════════════════════════════════════════

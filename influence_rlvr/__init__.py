@@ -27,6 +27,7 @@ from .trajectory import (
     collect_train_infos,
     collect_checkpoint_infos,
 )
+from .training import HistoricalBatchGRPOTrainer
 from .utils import detect_device, clear_cache
 
 __all__ = [
@@ -54,6 +55,7 @@ __all__ = [
     "soft_format_reward_func",
     "soft_accuracy_reward_func",
     "collect_reward_infos",
+    "HistoricalBatchGRPOTrainer",
     "detect_device",
     "clear_cache",
 ]
