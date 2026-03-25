@@ -4,11 +4,13 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-RESULTS_SCHEMA_VERSION = 1
-GRAD_CACHE_SCHEMA_VERSION = 1
+RESULTS_SCHEMA_VERSION = 2
+GRAD_CACHE_SCHEMA_VERSION = 2
+TRAIN_BATCH_HISTORY_SCHEMA_VERSION = 1
 RESULTS_MANIFEST_FILE = "results_manifest.json"
 LEGACY_RESULTS_METADATA_FILE = "metadata.json"
 GRAD_CACHE_MANIFEST_FILE = "cache_meta.json"
+TRAIN_BATCH_HISTORY_FILE = "historical_batch_history.json"
 TRACIN_MATRIX_FILE = "tracin_matrix.npy"
 DATAINF_MATRIX_FILE = "datainf_matrix.npy"
 
@@ -66,6 +68,8 @@ class CheckpointSummary:
     mean_train_grad_norm: float
     zero_test_cases: list[int]
     zero_train_cases: list[int]
+    historical_total_rows: int | None = None
+    historical_nonzero_train: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -79,6 +83,8 @@ class CheckpointSummary:
             mean_train_grad_norm=float(data["mean_train_grad_norm"]),
             zero_test_cases=list(data.get("zero_test_cases", [])),
             zero_train_cases=list(data.get("zero_train_cases", [])),
+            historical_total_rows=data.get("historical_total_rows"),
+            historical_nonzero_train=data.get("historical_nonzero_train"),
         )
 
 
@@ -167,10 +173,70 @@ class InfluenceResultsManifest:
 
 
 @dataclass
+class HistoricalBatchStep:
+    step: int
+    total_rows: int
+    train_index_counts: dict[int, int]
+    microbatch_count: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "step": self.step,
+            "total_rows": self.total_rows,
+            "train_index_counts": {
+                str(key): int(value)
+                for key, value in self.train_index_counts.items()
+            },
+        }
+        if self.microbatch_count is not None:
+            payload["microbatch_count"] = self.microbatch_count
+        return payload
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "HistoricalBatchStep":
+        return cls(
+            step=int(data["step"]),
+            total_rows=int(data.get("total_rows", 0)),
+            train_index_counts={
+                int(key): int(value)
+                for key, value in data.get("train_index_counts", {}).items()
+            },
+            microbatch_count=data.get("microbatch_count"),
+        )
+
+
+@dataclass
+class HistoricalBatchManifest:
+    schema_version: int
+    kind: str
+    steps: list[HistoricalBatchStep]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "kind": self.kind,
+            "steps": [item.to_dict() for item in self.steps],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "HistoricalBatchManifest":
+        return cls(
+            schema_version=int(data.get("schema_version", 0)),
+            kind=data.get("kind", "historical_batch_history"),
+            steps=[
+                HistoricalBatchStep.from_dict(item)
+                for item in data.get("steps", [])
+            ],
+        )
+
+
+@dataclass
 class GradCacheSample:
     grad_file: str
     prompt: Any
     solution: Any = None
+    train_index: int | None = None
+    historical_weight: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -181,6 +247,8 @@ class GradCacheSample:
             grad_file=data["grad_file"],
             prompt=data.get("prompt"),
             solution=data.get("solution"),
+            train_index=data.get("train_index"),
+            historical_weight=data.get("historical_weight"),
         )
 
 
@@ -192,9 +260,10 @@ class GradCacheCheckpoint:
     zero_train_cases: list[int]
     test_infos: list[GradCacheSample]
     train_infos: list[GradCacheSample]
+    historical_total_rows: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "step": self.step,
             "learning_rate": self.learning_rate,
             "zero_test_cases": self.zero_test_cases,
@@ -202,6 +271,9 @@ class GradCacheCheckpoint:
             "test_infos": [item.to_dict() for item in self.test_infos],
             "train_infos": [item.to_dict() for item in self.train_infos],
         }
+        if self.historical_total_rows is not None:
+            payload["historical_total_rows"] = self.historical_total_rows
+        return payload
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "GradCacheCheckpoint":
@@ -218,6 +290,7 @@ class GradCacheCheckpoint:
                 GradCacheSample.from_dict(item)
                 for item in data.get("train_infos", [])
             ],
+            historical_total_rows=data.get("historical_total_rows"),
         )
 
 

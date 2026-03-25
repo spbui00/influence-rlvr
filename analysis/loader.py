@@ -15,11 +15,15 @@ from .schema import (
     LEGACY_RESULTS_METADATA_FILE,
     RESULTS_MANIFEST_FILE,
     RESULTS_SCHEMA_VERSION,
+    TRAIN_BATCH_HISTORY_FILE,
+    TRAIN_BATCH_HISTORY_SCHEMA_VERSION,
     TRACIN_MATRIX_FILE,
     CheckpointSummary,
     GradCacheCheckpoint,
     GradCacheManifest,
     GradCacheSample,
+    HistoricalBatchManifest,
+    HistoricalBatchStep,
     InfluenceResultsManifest,
     LoadedResults,
     MatrixManifest,
@@ -44,11 +48,67 @@ def build_cache_fingerprint(config: dict[str, Any]) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
+def build_batch_history_fingerprint(manifest: HistoricalBatchManifest) -> str:
+    payload = json.dumps(manifest.to_dict()["steps"], sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+def save_batch_history(
+    step_records: list[dict[str, Any]],
+    output_dir: str | Path,
+) -> HistoricalBatchManifest:
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    manifest = HistoricalBatchManifest(
+        schema_version=TRAIN_BATCH_HISTORY_SCHEMA_VERSION,
+        kind="historical_batch_history",
+        steps=[
+            HistoricalBatchStep.from_dict(step)
+            if not isinstance(step, HistoricalBatchStep)
+            else step
+            for step in step_records
+        ],
+    )
+    _write_json(output_path / TRAIN_BATCH_HISTORY_FILE, manifest.to_dict())
+    return manifest
+
+
+def load_batch_history(output_dir: str | Path) -> HistoricalBatchManifest | None:
+    path = Path(output_dir) / TRAIN_BATCH_HISTORY_FILE
+    if not path.exists():
+        return None
+    return HistoricalBatchManifest.from_dict(_read_json(path))
+
+
+def build_batch_weight_lookup(
+    manifest: HistoricalBatchManifest,
+) -> dict[int, dict[str, Any]]:
+    lookup = {}
+    for step in manifest.steps:
+        total_rows = max(step.total_rows, 1)
+        lookup[step.step] = {
+            "total_rows": step.total_rows,
+            "microbatch_count": step.microbatch_count,
+            "weights": {
+                idx: count / total_rows
+                for idx, count in step.train_index_counts.items()
+            },
+        }
+    return lookup
+
+
 def build_checkpoint_summaries(checkpoint_infos: list[dict[str, Any]]) -> list[CheckpointSummary]:
     summaries = []
     for checkpoint in checkpoint_infos:
         test_norms = [info["grad"].norm().item() for info in checkpoint["test_infos"]]
         train_norms = [info["grad"].norm().item() for info in checkpoint["train_infos"]]
+        historical_nonzero_train = None
+        if any("historical_weight" in info for info in checkpoint["train_infos"]):
+            historical_nonzero_train = sum(
+                1
+                for info in checkpoint["train_infos"]
+                if float(info.get("historical_weight", 1.0)) > 0.0
+            )
         summaries.append(
             CheckpointSummary(
                 step=int(checkpoint["step"]),
@@ -57,6 +117,8 @@ def build_checkpoint_summaries(checkpoint_infos: list[dict[str, Any]]) -> list[C
                 mean_train_grad_norm=float(np.mean(train_norms)) if train_norms else 0.0,
                 zero_test_cases=list(checkpoint.get("zero_test_cases", [])),
                 zero_train_cases=list(checkpoint.get("zero_train_cases", [])),
+                historical_total_rows=checkpoint.get("historical_total_rows"),
+                historical_nonzero_train=historical_nonzero_train,
             )
         )
     return summaries
@@ -149,6 +211,8 @@ def build_legacy_metadata(manifest: InfluenceResultsManifest) -> dict[str, Any]:
         "lambda_damp": config.get("lambda_damp"),
         "train_grad_seed": config.get("train_grad_seed"),
         "device": config.get("device"),
+        "influence_mode": config.get("influence_mode"),
+        "batch_history_fingerprint": config.get("batch_history_fingerprint"),
         "checkpoints": [item.to_dict() for item in manifest.checkpoints],
         "test_prompts": [item.prompt_preview for item in manifest.test_samples],
         "train_prompts": [item.prompt_preview for item in manifest.train_samples],
@@ -268,6 +332,8 @@ def _manifest_from_legacy_metadata(results_path: Path) -> InfluenceResultsManife
         "lambda_damp": metadata.get("lambda_damp"),
         "train_grad_seed": metadata.get("train_grad_seed"),
         "device": metadata.get("device"),
+        "influence_mode": metadata.get("influence_mode"),
+        "batch_history_fingerprint": metadata.get("batch_history_fingerprint"),
     }
     dimensions = {
         "n_test_actual": int(metadata.get("n_test_actual", len(test_samples))),
@@ -351,6 +417,8 @@ def save_grad_cache(
                     grad_file=grad_file,
                     prompt=info.get("prompt"),
                     solution=info.get("solution"),
+                    train_index=info.get("train_index"),
+                    historical_weight=info.get("historical_weight"),
                 )
             )
         train_infos = []
@@ -362,6 +430,8 @@ def save_grad_cache(
                     grad_file=grad_file,
                     prompt=info.get("prompt"),
                     solution=info.get("solution"),
+                    train_index=info.get("train_index"),
+                    historical_weight=info.get("historical_weight"),
                 )
             )
         checkpoints.append(
@@ -372,6 +442,7 @@ def save_grad_cache(
                 zero_train_cases=list(checkpoint.get("zero_train_cases", [])),
                 test_infos=test_infos,
                 train_infos=train_infos,
+                historical_total_rows=checkpoint.get("historical_total_rows"),
             )
         )
 
@@ -417,19 +488,29 @@ def load_grad_cache(
         test_infos = []
         for sample in checkpoint.test_infos:
             grad = torch.from_numpy(np.load(cache_path / sample.grad_file))
-            test_infos.append({
+            info = {
                 "grad": grad,
                 "prompt": sample.prompt,
                 "solution": sample.solution,
-            })
+            }
+            if sample.train_index is not None:
+                info["train_index"] = sample.train_index
+            if sample.historical_weight is not None:
+                info["historical_weight"] = sample.historical_weight
+            test_infos.append(info)
         train_infos = []
         for sample in checkpoint.train_infos:
             grad = torch.from_numpy(np.load(cache_path / sample.grad_file))
-            train_infos.append({
+            info = {
                 "grad": grad,
                 "prompt": sample.prompt,
                 "solution": sample.solution,
-            })
+            }
+            if sample.train_index is not None:
+                info["train_index"] = sample.train_index
+            if sample.historical_weight is not None:
+                info["historical_weight"] = sample.historical_weight
+            train_infos.append(info)
         checkpoint_infos.append({
             "step": checkpoint.step,
             "learning_rate": checkpoint.learning_rate,
@@ -437,5 +518,6 @@ def load_grad_cache(
             "zero_train_cases": checkpoint.zero_train_cases,
             "test_infos": test_infos,
             "train_infos": train_infos,
+            "historical_total_rows": checkpoint.historical_total_rows,
         })
     return checkpoint_infos, manifest.fingerprint
