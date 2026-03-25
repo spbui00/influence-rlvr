@@ -99,6 +99,10 @@ def build_results_manifest(
     tracin_breakdown: list[dict[str, Any]],
     datainf_breakdown: list[dict[str, Any]],
     config: dict[str, Any],
+    *,
+    training_elapsed_s: float | None = None,
+    replay_elapsed_s: float | None = None,
+    total_elapsed_s: float | None = None,
 ) -> InfluenceResultsManifest:
     last_checkpoint = checkpoint_infos[-1] if checkpoint_infos else {"test_infos": [], "train_infos": []}
     test_samples = _build_sample_descriptors(last_checkpoint["test_infos"])
@@ -118,12 +122,15 @@ def build_results_manifest(
         test_samples=test_samples,
         train_samples=train_samples,
         matrices=_build_matrix_manifest(tracin_breakdown, datainf_breakdown),
+        training_elapsed_s=training_elapsed_s,
+        replay_elapsed_s=replay_elapsed_s,
+        total_elapsed_s=total_elapsed_s,
     )
 
 
 def build_legacy_metadata(manifest: InfluenceResultsManifest) -> dict[str, Any]:
     config = dict(manifest.config)
-    return {
+    meta: dict[str, Any] = {
         "schema_version": manifest.schema_version,
         "results_manifest_file": RESULTS_MANIFEST_FILE,
         "model_id": config.get("model_id"),
@@ -147,6 +154,13 @@ def build_legacy_metadata(manifest: InfluenceResultsManifest) -> dict[str, Any]:
         "train_prompts": [item.prompt_preview for item in manifest.train_samples],
         "train_solutions": [item.solution for item in manifest.train_samples],
     }
+    if manifest.training_elapsed_s is not None:
+        meta["training_elapsed_s"] = round(manifest.training_elapsed_s, 2)
+    if manifest.replay_elapsed_s is not None:
+        meta["replay_elapsed_s"] = round(manifest.replay_elapsed_s, 2)
+    if manifest.total_elapsed_s is not None:
+        meta["total_elapsed_s"] = round(manifest.total_elapsed_s, 2)
+    return meta
 
 
 def save_results_bundle(
@@ -157,6 +171,10 @@ def save_results_bundle(
     datainf_breakdown: list[dict[str, Any]],
     checkpoint_infos: list[dict[str, Any]],
     config: dict[str, Any],
+    *,
+    training_elapsed_s: float | None = None,
+    replay_elapsed_s: float | None = None,
+    total_elapsed_s: float | None = None,
 ) -> InfluenceResultsManifest:
     results_path = Path(results_dir)
     results_path.mkdir(parents=True, exist_ok=True)
@@ -180,6 +198,9 @@ def save_results_bundle(
         tracin_breakdown,
         datainf_breakdown,
         config,
+        training_elapsed_s=training_elapsed_s,
+        replay_elapsed_s=replay_elapsed_s,
+        total_elapsed_s=total_elapsed_s,
     )
     _write_json(results_path / RESULTS_MANIFEST_FILE, manifest.to_dict())
     _write_json(results_path / LEGACY_RESULTS_METADATA_FILE, build_legacy_metadata(manifest))

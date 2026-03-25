@@ -112,10 +112,13 @@ class InfluenceResultsManifest:
     test_samples: list[SampleDescriptor]
     train_samples: list[SampleDescriptor]
     matrices: MatrixManifest
+    training_elapsed_s: float | None = None
+    replay_elapsed_s: float | None = None
+    total_elapsed_s: float | None = None
     legacy_metadata_file: str = LEGACY_RESULTS_METADATA_FILE
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d = {
             "schema_version": self.schema_version,
             "kind": self.kind,
             "config": to_dict(self.config),
@@ -126,6 +129,13 @@ class InfluenceResultsManifest:
             "matrices": self.matrices.to_dict(),
             "legacy_metadata_file": self.legacy_metadata_file,
         }
+        if self.training_elapsed_s is not None:
+            d["training_elapsed_s"] = round(self.training_elapsed_s, 2)
+        if self.replay_elapsed_s is not None:
+            d["replay_elapsed_s"] = round(self.replay_elapsed_s, 2)
+        if self.total_elapsed_s is not None:
+            d["total_elapsed_s"] = round(self.total_elapsed_s, 2)
+        return d
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "InfluenceResultsManifest":
@@ -147,6 +157,9 @@ class InfluenceResultsManifest:
                 for item in data.get("train_samples", [])
             ],
             matrices=MatrixManifest.from_dict(data.get("matrices", {})),
+            training_elapsed_s=data.get("training_elapsed_s"),
+            replay_elapsed_s=data.get("replay_elapsed_s"),
+            total_elapsed_s=data.get("total_elapsed_s"),
             legacy_metadata_file=data.get(
                 "legacy_metadata_file", LEGACY_RESULTS_METADATA_FILE
             ),
