@@ -1,46 +1,39 @@
 # influence-rlvr
 
-A training data attribution study for RLVR trained using [GRPO](https://arxiv.org/abs/2402.03300](https://arxiv.org/abs/2402.03300). We do TDA using the [influence function](https://arxiv.org/abs/2308.03296). Since IFs have been mostly studied on SFT, we needed to derive a formula for RLVR, read in `docs/derivation.pdf`.
+Training data attribution for RLVR (GRPO). Uses influence functions adapted from SFT to RL; see `docs/derivation.pdf`.
 
 ## Setup
 
-Requires Python 3.10+ and a CUDA GPU.
-
 ```bash
-uv sync
+uv sync          # Python 3.10+, CUDA GPU recommended
 ```
 
 ## Run
 
 ```bash
-PYTHONUNBUFFERED=1 uv run python -u main_pipeline.py 2>&1 | tee run.log
+# Edit RUN_NAME and config at the top of main_pipeline.py first
+PYTHONUNBUFFERED=1 uv run python -u main_pipeline.py 2>&1 | tee outputs/run1/run.log
 ```
 
-Edit the configuration block at the top of `main_pipeline.py` before launching. Key settings:
+All artifacts land in a single folder: `outputs/<RUN_NAME>/` containing `rlvr-output/` (checkpoints) and `results/` (influence matrices, figures).
 
+Key settings in `main_pipeline.py`:
+
+- `RUN_NAME` — folder name under `outputs/`
 - `MAX_STEPS` — GRPO training steps
 - `N_MATH` / `N_CODE` — train/test dataset sizes
-- `N_TRAIN_REPLAY` — how many train samples to replay per checkpoint (set to `N_MATH` for full coverage)
-- `INFLUENCE_MODE` — `"historical"` (batch-aware, default) or `"dense"` (counterfactual)
-- `SKIP_TRAINING` — set `True` to reuse existing checkpoints
+- `INFLUENCE_MODE` — `"historical"` (default) or `"dense"`
+- `SKIP_TRAINING` — reuse existing checkpoints
 
-## Analyze results
+## Analyze
 
 ```bash
-uv run python -m analysis results/
+uv run python -m analysis outputs/run1/results/
 ```
 
-Or use `analysis.InfluenceAnalyzer` directly:
-
-```python
-from analysis import InfluenceAnalyzer
-analyzer = InfluenceAnalyzer.from_directory("results/")
-analyzer.write_default_artifacts()
-```
-
-## Project structure
+## Structure
 
 - `main_pipeline.py` — end-to-end script (train, replay, influence, save)
-- `influence_rlvr/` — gradient computation, trajectory replay, attribution methods
+- `influence_rlvr/` — gradients, trajectory replay, attribution methods
 - `analysis/` — schema, loader, analyzer, plots, CLI
 
