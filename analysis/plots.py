@@ -95,3 +95,48 @@ def gradient_norms_figure(checkpoints: list[dict[str, float]]):
     axis_train.set_title("Train gradient norms across checkpoints")
     fig.tight_layout()
     return fig
+
+
+def eval_performance_figure(checkpoints: list[dict[str, object]]):
+    steps = [checkpoint["step"] for checkpoint in checkpoints]
+    fig, (axis_math, axis_code) = plt.subplots(1, 2, figsize=(12, 4), sharex=True)
+
+    math_accuracy = [
+        checkpoint.get("math_eval", {}).get("accuracy_rate", np.nan)
+        if checkpoint.get("math_eval") is not None else np.nan
+        for checkpoint in checkpoints
+    ]
+    math_format = [
+        checkpoint.get("math_eval", {}).get("format_rate", np.nan)
+        if checkpoint.get("math_eval") is not None else np.nan
+        for checkpoint in checkpoints
+    ]
+    code_pass = [
+        checkpoint.get("code_eval", {}).get("pass_rate", np.nan)
+        if checkpoint.get("code_eval") is not None else np.nan
+        for checkpoint in checkpoints
+    ]
+    code_compile = [
+        checkpoint.get("code_eval", {}).get("compile_rate", np.nan)
+        if checkpoint.get("code_eval") is not None else np.nan
+        for checkpoint in checkpoints
+    ]
+
+    axis_math.plot(steps, math_accuracy, marker="o", linewidth=1.5, label="Math exact")
+    axis_math.plot(steps, math_format, marker="s", linewidth=1.5, label="Math format")
+    axis_math.set_ylim(-0.02, 1.02)
+    axis_math.set_xlabel("Checkpoint step")
+    axis_math.set_ylabel("Rate")
+    axis_math.set_title("Held-out math performance")
+    axis_math.legend(fontsize=8)
+
+    axis_code.plot(steps, code_pass, marker="o", linewidth=1.5, label="Code pass")
+    axis_code.plot(steps, code_compile, marker="s", linewidth=1.5, label="Code compile")
+    axis_code.set_ylim(-0.02, 1.02)
+    axis_code.set_xlabel("Checkpoint step")
+    axis_code.set_ylabel("Rate")
+    axis_code.set_title("Held-out code performance")
+    axis_code.legend(fontsize=8)
+
+    fig.tight_layout()
+    return fig

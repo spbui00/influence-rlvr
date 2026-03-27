@@ -9,6 +9,7 @@ import numpy as np
 from .loader import load_results_bundle
 from .plots import (
     agreement_scatter_figure,
+    eval_performance_figure,
     gradient_norms_figure,
     heatmap_figure,
     trajectory_pairs_figure,
@@ -50,6 +51,13 @@ class InfluenceAnalyzer:
     @property
     def train_solutions(self) -> list[str]:
         return [item.solution for item in self.manifest.train_samples]
+
+    @property
+    def has_eval_metrics(self) -> bool:
+        return any(
+            item.math_eval is not None or item.code_eval is not None
+            for item in self.manifest.checkpoints
+        )
 
     def matrix(self, method: str) -> np.ndarray:
         key = method.lower()
@@ -204,6 +212,16 @@ class InfluenceAnalyzer:
         fig.clf()
         return output
 
+    def plot_eval_performance(self, output_path: str | Path):
+        fig = eval_performance_figure(
+            [item.to_dict() for item in self.manifest.checkpoints]
+        )
+        output = Path(output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output, dpi=200)
+        fig.clf()
+        return output
+
     def build_report(self, top_k: int = 3, bottom_k: int = 0) -> str:
         lines = []
         for method in ("TracIn", "DataInf"):
@@ -236,17 +254,48 @@ class InfluenceAnalyzer:
             "influence_mode",
             "learning_rate",
             "max_steps",
+            "save_steps",
+            "per_device_batch",
+            "grad_accum_steps",
             "grpo_beta",
             "grpo_epsilon",
             "g_train",
             "g_test",
+            "generation_batch_size",
             "n_math",
             "n_code",
             "n_train_replay",
             "lambda_damp",
             "batch_history_fingerprint",
+            "math_eval_split",
+            "math_eval_percent",
+            "code_eval_split",
+            "code_eval_percent",
         ]:
             lines.append(f"  {key}: {self.manifest.config.get(key)}")
+
+        if self.has_eval_metrics and self.manifest.checkpoints:
+            latest = self.manifest.checkpoints[-1]
+            lines.append("")
+            lines.append("=" * 60)
+            lines.append("Held-out evaluation")
+            lines.append("=" * 60)
+            if latest.math_eval is not None:
+                lines.append(
+                    "  math: "
+                    f"exact={latest.math_eval.get('accuracy_rate', 0.0):.3f}, "
+                    f"format={latest.math_eval.get('format_rate', 0.0):.3f}, "
+                    f"reward={latest.math_eval.get('mean_reward', 0.0):.3f}, "
+                    f"count={latest.math_eval.get('count', 0)}"
+                )
+            if latest.code_eval is not None:
+                lines.append(
+                    "  code: "
+                    f"pass={latest.code_eval.get('pass_rate', 0.0):.3f}, "
+                    f"compile={latest.code_eval.get('compile_rate', 0.0):.3f}, "
+                    f"reward={latest.code_eval.get('mean_reward', 0.0):.3f}, "
+                    f"count={latest.code_eval.get('count', 0)}"
+                )
 
         m = self.manifest
         if m.training_elapsed_s is not None or m.replay_elapsed_s is not None or m.total_elapsed_s is not None:
@@ -295,4 +344,6 @@ class InfluenceAnalyzer:
             self.plot_gradient_norms(output / "gradient_norms.png"),
             self.write_report(output, top_k=top_k, bottom_k=bottom_k),
         ]
+        if self.has_eval_metrics:
+            saved.insert(-1, self.plot_eval_performance(output / "performance_curves.png"))
         return saved
