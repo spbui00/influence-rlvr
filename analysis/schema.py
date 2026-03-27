@@ -4,8 +4,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-RESULTS_SCHEMA_VERSION = 2
-GRAD_CACHE_SCHEMA_VERSION = 2
+RESULTS_SCHEMA_VERSION = 3
+GRAD_CACHE_SCHEMA_VERSION = 3
 TRAIN_BATCH_HISTORY_SCHEMA_VERSION = 1
 RESULTS_MANIFEST_FILE = "results_manifest.json"
 LEGACY_RESULTS_METADATA_FILE = "metadata.json"
@@ -68,6 +68,8 @@ class CheckpointSummary:
     mean_train_grad_norm: float
     zero_test_cases: list[int]
     zero_train_cases: list[int]
+    math_eval: dict[str, Any] | None = None
+    code_eval: dict[str, Any] | None = None
     historical_total_rows: int | None = None
     historical_nonzero_train: int | None = None
 
@@ -83,6 +85,8 @@ class CheckpointSummary:
             mean_train_grad_norm=float(data["mean_train_grad_norm"]),
             zero_test_cases=list(data.get("zero_test_cases", [])),
             zero_train_cases=list(data.get("zero_train_cases", [])),
+            math_eval=dict(data["math_eval"]) if data.get("math_eval") is not None else None,
+            code_eval=dict(data["code_eval"]) if data.get("code_eval") is not None else None,
             historical_total_rows=data.get("historical_total_rows"),
             historical_nonzero_train=data.get("historical_nonzero_train"),
         )
@@ -260,6 +264,8 @@ class GradCacheCheckpoint:
     zero_train_cases: list[int]
     test_infos: list[GradCacheSample]
     train_infos: list[GradCacheSample]
+    math_eval: dict[str, Any] | None = None
+    code_eval: dict[str, Any] | None = None
     historical_total_rows: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -271,6 +277,10 @@ class GradCacheCheckpoint:
             "test_infos": [item.to_dict() for item in self.test_infos],
             "train_infos": [item.to_dict() for item in self.train_infos],
         }
+        if self.math_eval is not None:
+            payload["math_eval"] = self.math_eval
+        if self.code_eval is not None:
+            payload["code_eval"] = self.code_eval
         if self.historical_total_rows is not None:
             payload["historical_total_rows"] = self.historical_total_rows
         return payload
@@ -290,6 +300,8 @@ class GradCacheCheckpoint:
                 GradCacheSample.from_dict(item)
                 for item in data.get("train_infos", [])
             ],
+            math_eval=dict(data["math_eval"]) if data.get("math_eval") is not None else None,
+            code_eval=dict(data["code_eval"]) if data.get("code_eval") is not None else None,
             historical_total_rows=data.get("historical_total_rows"),
         )
 

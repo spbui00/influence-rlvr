@@ -117,6 +117,8 @@ def build_checkpoint_summaries(checkpoint_infos: list[dict[str, Any]]) -> list[C
                 mean_train_grad_norm=float(np.mean(train_norms)) if train_norms else 0.0,
                 zero_test_cases=list(checkpoint.get("zero_test_cases", [])),
                 zero_train_cases=list(checkpoint.get("zero_train_cases", [])),
+                math_eval=checkpoint.get("math_eval"),
+                code_eval=checkpoint.get("code_eval"),
                 historical_total_rows=checkpoint.get("historical_total_rows"),
                 historical_nonzero_train=historical_nonzero_train,
             )
@@ -213,6 +215,11 @@ def build_legacy_metadata(manifest: InfluenceResultsManifest) -> dict[str, Any]:
         "device": config.get("device"),
         "influence_mode": config.get("influence_mode"),
         "batch_history_fingerprint": config.get("batch_history_fingerprint"),
+        "math_eval_split": config.get("math_eval_split"),
+        "math_eval_percent": config.get("math_eval_percent"),
+        "code_eval_split": config.get("code_eval_split"),
+        "code_eval_percent": config.get("code_eval_percent"),
+        "eval_max_new_tokens": config.get("eval_max_new_tokens"),
         "checkpoints": [item.to_dict() for item in manifest.checkpoints],
         "test_prompts": [item.prompt_preview for item in manifest.test_samples],
         "train_prompts": [item.prompt_preview for item in manifest.train_samples],
@@ -334,6 +341,11 @@ def _manifest_from_legacy_metadata(results_path: Path) -> InfluenceResultsManife
         "device": metadata.get("device"),
         "influence_mode": metadata.get("influence_mode"),
         "batch_history_fingerprint": metadata.get("batch_history_fingerprint"),
+        "math_eval_split": metadata.get("math_eval_split"),
+        "math_eval_percent": metadata.get("math_eval_percent"),
+        "code_eval_split": metadata.get("code_eval_split"),
+        "code_eval_percent": metadata.get("code_eval_percent"),
+        "eval_max_new_tokens": metadata.get("eval_max_new_tokens"),
     }
     dimensions = {
         "n_test_actual": int(metadata.get("n_test_actual", len(test_samples))),
@@ -442,6 +454,8 @@ def save_grad_cache(
                 zero_train_cases=list(checkpoint.get("zero_train_cases", [])),
                 test_infos=test_infos,
                 train_infos=train_infos,
+                math_eval=checkpoint.get("math_eval"),
+                code_eval=checkpoint.get("code_eval"),
                 historical_total_rows=checkpoint.get("historical_total_rows"),
             )
         )
@@ -518,6 +532,8 @@ def load_grad_cache(
             "zero_train_cases": checkpoint.zero_train_cases,
             "test_infos": test_infos,
             "train_infos": train_infos,
+            "math_eval": checkpoint.math_eval,
+            "code_eval": checkpoint.code_eval,
             "historical_total_rows": checkpoint.historical_total_rows,
         })
     return checkpoint_infos, manifest.fingerprint
