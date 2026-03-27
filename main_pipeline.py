@@ -41,18 +41,25 @@ OUTPUT_DIR = "./rlvr-output"
 RESULTS_DIR = "./results"
 
 LEARNING_RATE = 1e-4
-MAX_STEPS = 10
-PER_DEVICE_BATCH = 1
+MAX_STEPS = 200
+SAVE_STEPS = 5
+PER_DEVICE_BATCH = 4
 GRAD_ACCUM_STEPS = 2
 GRPO_BETA = 0.04
 GRPO_EPSILON = 0.2
 G_TRAIN = 8
 G_TEST = 8
+GENERATION_BATCH_SIZE = 32
 TRAIN_GRAD_SEED = 1234
 LAMBDA_DAMP = 0.1
-N_MATH = 100
-N_CODE = 5
-N_TRAIN_REPLAY = 10
+N_MATH = 300
+N_CODE = 10
+N_TRAIN_REPLAY = N_MATH
+MATH_EVAL_SPLIT = "test"
+MATH_EVAL_PERCENT = 10
+CODE_EVAL_SPLIT = "validation"
+CODE_EVAL_PERCENT = 10
+EVAL_MAX_NEW_TOKENS = 256
 INFLUENCE_MODE = "historical"
 
 SKIP_TRAINING = False
@@ -134,13 +141,35 @@ def format_code(example):
     }
 
 
+def percent_slice(split_name, percent):
+    if percent <= 0:
+        return None
+    if percent > 100:
+        raise ValueError(f"Split percent must be in [0, 100], got {percent}.")
+    return f"{split_name}[:{percent}%]"
+
+
 print("\nLoading datasets...")
 math_data = load_dataset("openai/gsm8k", "main", split=f"train[:{N_MATH}]")
 train_dataset = math_data.map(format_math, with_indices=True)
 code_data = load_dataset("mbpp", split=f"test[:{N_CODE}]")
 test_dataset = code_data.map(format_code)
+math_eval_split = percent_slice(MATH_EVAL_SPLIT, MATH_EVAL_PERCENT)
+math_eval_dataset = None
+if math_eval_split is not None:
+    math_eval_data = load_dataset("openai/gsm8k", "main", split=math_eval_split)
+    math_eval_dataset = math_eval_data.map(format_math, with_indices=True)
+code_eval_split = percent_slice(CODE_EVAL_SPLIT, CODE_EVAL_PERCENT)
+code_eval_dataset = None
+if code_eval_split is not None:
+    code_eval_data = load_dataset("mbpp", split=code_eval_split)
+    code_eval_dataset = code_eval_data.map(format_code)
 print(f"  Z_train (Math): {len(train_dataset)} samples")
 print(f"  Z_test  (Code): {len(test_dataset)} samples")
+if math_eval_dataset is not None:
+    print(f"  Held-out math eval ({MATH_EVAL_SPLIT}): {len(math_eval_dataset)} samples")
+if code_eval_dataset is not None:
+    print(f"  Held-out code eval ({CODE_EVAL_SPLIT}): {len(code_eval_dataset)} samples")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -159,12 +188,12 @@ def run_training():
         max_steps=MAX_STEPS,
         logging_steps=1,
         save_strategy="steps",
-        save_steps=1,
+        save_steps=SAVE_STEPS,
         save_total_limit=None,
         bf16=True,
         use_vllm=False,
         num_generations=G_TRAIN,
-        generation_batch_size=G_TRAIN,
+        generation_batch_size=GENERATION_BATCH_SIZE,
         loss_type="grpo",
         beta=GRPO_BETA,
         epsilon=GRPO_EPSILON,
@@ -211,7 +240,7 @@ checkpoint_schedule = build_checkpoint_schedule(
 if not checkpoint_schedule:
     raise RuntimeError(
         f"No checkpoints found under {OUTPUT_DIR}. "
-        "Make sure training ran with save_steps=1."
+        f"Make sure training ran with save_steps={SAVE_STEPS}."
     )
 
 print(f"Found {len(checkpoint_schedule)} checkpoints:")
@@ -269,13 +298,22 @@ RESULTS_CONFIG = {
     "influence_mode": INFLUENCE_MODE,
     "learning_rate": LEARNING_RATE,
     "max_steps": MAX_STEPS,
+    "save_steps": SAVE_STEPS,
+    "per_device_batch": PER_DEVICE_BATCH,
+    "grad_accum_steps": GRAD_ACCUM_STEPS,
     "grpo_beta": GRPO_BETA,
     "grpo_epsilon": GRPO_EPSILON,
     "g_train": G_TRAIN,
     "g_test": G_TEST,
+    "generation_batch_size": GENERATION_BATCH_SIZE,
     "n_math": N_MATH,
     "n_code": N_CODE,
     "n_train_replay": N_TRAIN_REPLAY,
+    "math_eval_split": MATH_EVAL_SPLIT,
+    "math_eval_percent": MATH_EVAL_PERCENT,
+    "code_eval_split": CODE_EVAL_SPLIT,
+    "code_eval_percent": CODE_EVAL_PERCENT,
+    "eval_max_new_tokens": EVAL_MAX_NEW_TOKENS,
     "lambda_damp": LAMBDA_DAMP,
     "train_grad_seed": TRAIN_GRAD_SEED,
     "device": str(DEVICE),
@@ -288,13 +326,22 @@ CACHE_CONFIG = {
     "influence_mode": INFLUENCE_MODE,
     "learning_rate": LEARNING_RATE,
     "max_steps": MAX_STEPS,
+    "save_steps": SAVE_STEPS,
+    "per_device_batch": PER_DEVICE_BATCH,
+    "grad_accum_steps": GRAD_ACCUM_STEPS,
     "grpo_beta": GRPO_BETA,
     "grpo_epsilon": GRPO_EPSILON,
     "g_train": G_TRAIN,
     "g_test": G_TEST,
+    "generation_batch_size": GENERATION_BATCH_SIZE,
     "n_math": N_MATH,
     "n_code": N_CODE,
     "n_train_replay": N_TRAIN_REPLAY,
+    "math_eval_split": MATH_EVAL_SPLIT,
+    "math_eval_percent": MATH_EVAL_PERCENT,
+    "code_eval_split": CODE_EVAL_SPLIT,
+    "code_eval_percent": CODE_EVAL_PERCENT,
+    "eval_max_new_tokens": EVAL_MAX_NEW_TOKENS,
     "train_grad_seed": TRAIN_GRAD_SEED,
     "batch_history_fingerprint": batch_history_fingerprint,
 }
@@ -324,6 +371,9 @@ def _run_replay():
         beta=GRPO_BETA,
         influence_mode=INFLUENCE_MODE,
         train_step_weight_lookup=batch_weight_lookup,
+        math_eval_dataset=math_eval_dataset,
+        code_eval_dataset=code_eval_dataset,
+        eval_max_new_tokens=EVAL_MAX_NEW_TOKENS,
     )
     elapsed = time.time() - t0
     print(f"\nTrajectory replay completed in {elapsed:.1f}s")
@@ -380,6 +430,22 @@ for cp in checkpoint_infos:
             else (
                 f", batch-rows={cp['historical_total_rows']}"
                 f", active-train={nonzero_train_weights}"
+            )
+        )
+        + (
+            ""
+            if cp.get("math_eval") is None
+            else (
+                f", math-exact={cp['math_eval']['accuracy_rate']:.3f}"
+                f", math-format={cp['math_eval']['format_rate']:.3f}"
+            )
+        )
+        + (
+            ""
+            if cp.get("code_eval") is None
+            else (
+                f", code-pass={cp['code_eval']['pass_rate']:.3f}"
+                f", code-compile={cp['code_eval']['compile_rate']:.3f}"
             )
         )
     )
