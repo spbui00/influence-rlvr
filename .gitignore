@@ -210,9 +210,8 @@ __marimo__/
 rlvr-mac-sandbox/
 
 # Ignore local RLVR output artifacts
-rlvr-output/
-
-# Ignore local pipeline results
+rlvr-output*/
+outputs/
 results/
 
 .DS_Store

@@ -37,8 +37,10 @@ from influence_rlvr import (
 # Configuration — edit these before launching
 # ═══════════════════════════════════════════════════════════════════════════════
 MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
-OUTPUT_DIR = "./rlvr-output"
-RESULTS_DIR = "./results"
+RUN_NAME = "run1"
+RUN_DIR = f"./outputs/{RUN_NAME}"
+OUTPUT_DIR = f"{RUN_DIR}/rlvr-output"
+RESULTS_DIR = f"{RUN_DIR}/results"
 
 LEARNING_RATE = 1e-4
 MAX_STEPS = 200
@@ -63,7 +65,7 @@ EVAL_MAX_NEW_TOKENS = 256
 INFLUENCE_MODE = "historical"
 
 SKIP_TRAINING = False
-GRAD_CACHE_DIR = "./results/grad_cache"
+GRAD_CACHE_DIR = f"{RESULTS_DIR}/grad_cache"
 
 
 def normalize_influence_mode(mode):
