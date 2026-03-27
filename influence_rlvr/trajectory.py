@@ -5,6 +5,7 @@ import time
 
 from peft import load_peft_weights, set_peft_model_state_dict
 
+from .eval import evaluate_code_dataset, evaluate_math_dataset
 from .gradients import compute_rlvr_gradient, compute_sft_gradient
 from .utils import clear_cache
 
@@ -292,6 +293,9 @@ def collect_checkpoint_infos(
     ref_model=None,
     influence_mode="dense",
     train_step_weight_lookup=None,
+    math_eval_dataset=None,
+    code_eval_dataset=None,
+    eval_max_new_tokens=256,
     progress=True,
 ):
     checkpoint_infos = []
@@ -307,6 +311,29 @@ def collect_checkpoint_infos(
             progress,
         )
         load_adapter_checkpoint(peft_model, checkpoint["path"])
+
+        math_eval = None
+        code_eval = None
+        if math_eval_dataset is not None:
+            _progress_print(f"{prefix} evaluating held-out math", progress)
+            math_eval = evaluate_math_dataset(
+                peft_model,
+                tokenizer,
+                math_eval_dataset,
+                device,
+                max_new_tokens=eval_max_new_tokens,
+                progress=False,
+            )
+        if code_eval_dataset is not None:
+            _progress_print(f"{prefix} evaluating held-out code", progress)
+            code_eval = evaluate_code_dataset(
+                peft_model,
+                tokenizer,
+                code_eval_dataset,
+                device,
+                max_new_tokens=eval_max_new_tokens,
+                progress=False,
+            )
 
         train_seed_base = None
         test_seed_base = None
@@ -384,6 +411,8 @@ def collect_checkpoint_infos(
             "zero_test_cases": zero_test_cases,
             "train_infos": train_infos,
             "zero_train_cases": zero_train_cases,
+            "math_eval": math_eval,
+            "code_eval": code_eval,
             "historical_total_rows": (
                 None
                 if step_weight_info is None

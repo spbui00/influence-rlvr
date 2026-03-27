@@ -9,6 +9,7 @@ from .attribution import (
     RepSimInfluence,
 )
 from .gradients import compute_sft_gradient, compute_rlvr_gradient
+from .eval import evaluate_math_dataset, evaluate_code_dataset
 from .rewards import (
     format_reward_func,
     accuracy_reward_func,
@@ -41,6 +42,8 @@ __all__ = [
     "RepSimInfluence",
     "compute_sft_gradient",
     "compute_rlvr_gradient",
+    "evaluate_math_dataset",
+    "evaluate_code_dataset",
     "checkpoint_step",
     "list_checkpoint_dirs",
     "build_checkpoint_schedule",
