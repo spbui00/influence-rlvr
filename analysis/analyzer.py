@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import textwrap
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +14,7 @@ from .plots import (
     eval_performance_figure,
     gradient_norms_figure,
     heatmap_figure,
+    training_curves_figure,
     trajectory_pairs_figure,
 )
 
@@ -58,6 +61,50 @@ class InfluenceAnalyzer:
             item.math_eval is not None or item.code_eval is not None
             for item in self.manifest.checkpoints
         )
+
+    @cached_property
+    def training_log_history(self) -> list[dict[str, object]]:
+        output_dir = self.results_dir.parent / "rlvr-output"
+        if not output_dir.exists():
+            raw_output_dir = self.manifest.config.get("output_dir")
+            if raw_output_dir is None:
+                return []
+            configured_dir = Path(str(raw_output_dir))
+            if configured_dir.exists():
+                output_dir = configured_dir
+            else:
+                cwd_output_dir = Path.cwd() / configured_dir
+                if not cwd_output_dir.exists():
+                    return []
+                output_dir = cwd_output_dir
+
+        preferred_state = None
+        if self.steps:
+            preferred_state = output_dir / f"checkpoint-{self.steps[-1]}" / "trainer_state.json"
+        if preferred_state is not None and preferred_state.exists():
+            state_path = preferred_state
+        else:
+            candidates = sorted(
+                output_dir.glob("checkpoint-*/trainer_state.json"),
+                key=lambda path: int(path.parent.name.split("-")[-1]),
+            )
+            if not candidates:
+                return []
+            state_path = candidates[-1]
+
+        try:
+            payload = json.loads(state_path.read_text())
+        except Exception:
+            return []
+
+        return [
+            item for item in payload.get("log_history", [])
+            if isinstance(item, dict) and item.get("step") is not None
+        ]
+
+    @property
+    def has_training_history(self) -> bool:
+        return bool(self.training_log_history)
 
     def matrix(self, method: str) -> np.ndarray:
         key = method.lower()
@@ -222,6 +269,14 @@ class InfluenceAnalyzer:
         fig.clf()
         return output
 
+    def plot_training_curves(self, output_path: str | Path):
+        fig = training_curves_figure(self.training_log_history)
+        output = Path(output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output, dpi=200)
+        fig.clf()
+        return output
+
     def build_report(self, top_k: int = 3, bottom_k: int = 0) -> str:
         lines = []
         for method in ("TracIn", "DataInf"):
@@ -342,8 +397,10 @@ class InfluenceAnalyzer:
                 output / "trajectory_top_pairs.png",
             ),
             self.plot_gradient_norms(output / "gradient_norms.png"),
-            self.write_report(output, top_k=top_k, bottom_k=bottom_k),
         ]
         if self.has_eval_metrics:
-            saved.insert(-1, self.plot_eval_performance(output / "performance_curves.png"))
+            saved.append(self.plot_eval_performance(output / "performance_curves.png"))
+        if self.has_training_history:
+            saved.append(self.plot_training_curves(output / "training_curves.png"))
+        saved.append(self.write_report(output, top_k=top_k, bottom_k=bottom_k))
         return saved

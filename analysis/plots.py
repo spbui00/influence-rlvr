@@ -4,6 +4,62 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
+def _history_entries(log_history: list[dict[str, object]]):
+    entries = []
+    for item in log_history:
+        if not isinstance(item, dict):
+            continue
+        step = item.get("step")
+        if step is None:
+            continue
+        try:
+            step_value = int(step)
+        except (TypeError, ValueError):
+            continue
+        entries.append((step_value, item))
+    entries.sort(key=lambda pair: pair[0])
+    return entries
+
+
+def _history_metric(entries: list[tuple[int, dict[str, object]]], key: str) -> np.ndarray:
+    values = []
+    for _, item in entries:
+        value = item.get(key, np.nan)
+        try:
+            values.append(float(value))
+        except (TypeError, ValueError):
+            values.append(np.nan)
+    return np.asarray(values, dtype=float)
+
+
+def _plot_sparse_series(
+    axis,
+    steps: list[int],
+    values: np.ndarray,
+    *,
+    label: str,
+    color: str,
+    linewidth: float = 1.5,
+    linestyle: str = "-",
+    marker: str = "o",
+):
+    mask = np.isfinite(values)
+    if not np.any(mask):
+        return
+    xs = np.asarray(steps, dtype=float)[mask]
+    ys = values[mask]
+    axis.plot(
+        xs,
+        ys,
+        color=color,
+        linewidth=linewidth,
+        linestyle=linestyle,
+        marker=marker,
+        markersize=4,
+        label=label,
+    )
+
+
 def heatmap_figure(
     matrix: np.ndarray,
     row_labels: list[str],
@@ -138,5 +194,94 @@ def eval_performance_figure(checkpoints: list[dict[str, object]]):
     axis_code.set_title("Held-out code performance")
     axis_code.legend(fontsize=8)
 
+    fig.tight_layout()
+    return fig
+
+
+def training_curves_figure(log_history: list[dict[str, object]]):
+    entries = _history_entries(log_history)
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8), sharex=True)
+    if not entries:
+        for axis in axes.flat:
+            axis.text(0.5, 0.5, "No training log history found.", ha="center", va="center")
+            axis.set_axis_off()
+        fig.tight_layout()
+        return fig
+
+    steps = [step for step, _ in entries]
+    loss = _history_metric(entries, "loss")
+    reward = _history_metric(entries, "reward")
+    reward_std = _history_metric(entries, "reward_std")
+    reward_accuracy = _history_metric(entries, "rewards/accuracy_reward_func/mean")
+    reward_format = _history_metric(entries, "rewards/format_reward_func/mean")
+    grad_norm = _history_metric(entries, "grad_norm")
+    kl = _history_metric(entries, "kl")
+
+    axis_loss = axes[0, 0]
+    axis_reward = axes[0, 1]
+    axis_components = axes[1, 0]
+    axis_opt = axes[1, 1]
+
+    axis_loss.plot(steps, loss, color="steelblue", linewidth=1.5)
+    axis_loss.set_title("GRPO loss")
+    axis_loss.set_ylabel("Loss")
+    axis_loss.axhline(0, color="grey", linewidth=0.5)
+
+    _plot_sparse_series(
+        axis_reward,
+        steps,
+        reward,
+        label="Reward",
+        color="seagreen",
+    )
+    _plot_sparse_series(
+        axis_reward,
+        steps,
+        reward_std,
+        label="Reward std",
+        color="darkorange",
+        linewidth=1.2,
+        linestyle="--",
+        marker="s",
+    )
+    axis_reward.set_title("Training reward")
+    axis_reward.set_ylabel("Value")
+    axis_reward.legend(fontsize=8)
+
+    _plot_sparse_series(
+        axis_components,
+        steps,
+        reward_accuracy,
+        label="Accuracy reward",
+        color="purple",
+    )
+    _plot_sparse_series(
+        axis_components,
+        steps,
+        reward_format,
+        label="Format reward",
+        color="brown",
+    )
+    axis_components.set_title("Reward components")
+    axis_components.set_xlabel("Training step")
+    axis_components.set_ylabel("Mean reward")
+    axis_components.set_ylim(-0.02, 1.02)
+    axis_components.axhline(0, color="grey", linewidth=0.5)
+    axis_components.legend(fontsize=8)
+
+    axis_opt.plot(steps, grad_norm, color="coral", linewidth=1.5, label="Grad norm")
+    axis_opt.set_title("Optimization stats")
+    axis_opt.set_xlabel("Training step")
+    axis_opt.set_ylabel("Grad norm", color="coral")
+    axis_opt.tick_params(axis="y", labelcolor="coral")
+    axis_opt_kl = axis_opt.twinx()
+    axis_opt_kl.plot(steps, kl, color="slateblue", linewidth=1.2, label="KL")
+    axis_opt_kl.set_ylabel("KL", color="slateblue")
+    axis_opt_kl.tick_params(axis="y", labelcolor="slateblue")
+    opt_handles = axis_opt.get_lines() + axis_opt_kl.get_lines()
+    axis_opt.legend(opt_handles, [line.get_label() for line in opt_handles], fontsize=8)
+
+    for axis in axes[0]:
+        axis.set_xlabel("Training step")
     fig.tight_layout()
     return fig
