@@ -208,10 +208,8 @@ def extract_math_final_answer(text):
             last_line = lines[-1]
             if ":" in last_line and last_line.lower().startswith(("answer", "final answer")):
                 return last_line.split(":", 1)[1].strip()
-
-    number_matches = _NUMBER_PATTERN.findall(stripped_region or text)
-    if number_matches:
-        return number_matches[-1]
+            if _parse_numeric_answer(last_line) is not None:
+                return last_line
     return None
 
 
