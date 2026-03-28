@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,8 @@ from .schema import (
     solution_preview,
 )
 
+_RESULTS_DIR_RE = re.compile(r"^results(?:(\d+))?$")
+
 
 def _read_json(path: Path) -> dict[str, Any]:
     with open(path, "r", encoding="utf-8") as handle:
@@ -51,6 +54,76 @@ def build_cache_fingerprint(config: dict[str, Any]) -> str:
 def build_batch_history_fingerprint(manifest: HistoricalBatchManifest) -> str:
     payload = json.dumps(manifest.to_dict()["steps"], sort_keys=True, default=str)
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+def normalize_results_config(config: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(config)
+    normalized.pop("results_dir", None)
+    normalized.pop("results_config_fingerprint", None)
+    normalized.pop("results_name", None)
+    return normalized
+
+
+def build_results_fingerprint(config: dict[str, Any]) -> str:
+    return build_cache_fingerprint(normalize_results_config(config))
+
+
+def _results_dir_index(path: Path) -> int | None:
+    match = _RESULTS_DIR_RE.fullmatch(path.name)
+    if match is None:
+        return None
+    suffix = match.group(1)
+    return 1 if suffix is None else int(suffix)
+
+
+def next_results_dir(run_dir: str | Path) -> Path:
+    run_path = Path(run_dir)
+    run_path.mkdir(parents=True, exist_ok=True)
+    next_index = 1
+    for child in run_path.iterdir():
+        if not child.is_dir():
+            continue
+        index = _results_dir_index(child)
+        if index is None:
+            continue
+        next_index = max(next_index, index + 1)
+    return run_path / f"results{next_index}"
+
+
+def resolve_results_dir(
+    run_dir: str | Path,
+    config: dict[str, Any],
+) -> tuple[Path, bool, str]:
+    run_path = Path(run_dir)
+    run_path.mkdir(parents=True, exist_ok=True)
+    normalized_config = normalize_results_config(config)
+    fingerprint = build_results_fingerprint(normalized_config)
+
+    for child in sorted(run_path.iterdir(), key=lambda item: item.name):
+        if not child.is_dir():
+            continue
+        index = _results_dir_index(child)
+        if index is None:
+            continue
+        manifest_path = child / RESULTS_MANIFEST_FILE
+        legacy_path = child / LEGACY_RESULTS_METADATA_FILE
+        if not manifest_path.exists() and not legacy_path.exists():
+            continue
+        try:
+            manifest = load_results_manifest(child)
+        except Exception:
+            continue
+        existing_config = normalize_results_config(manifest.config)
+        existing_fingerprint = manifest.config.get("results_config_fingerprint")
+        if existing_fingerprint is None:
+            existing_fingerprint = build_results_fingerprint(existing_config)
+        if (
+            existing_fingerprint == fingerprint
+            and existing_config == normalized_config
+        ):
+            return child, True, fingerprint
+
+    return next_results_dir(run_path), False, fingerprint
 
 
 def save_batch_history(

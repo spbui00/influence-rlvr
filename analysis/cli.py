@@ -11,7 +11,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "results_dir",
         nargs="?",
-        default="outputs/run1/results",
+        default="outputs/run1/results1",
     )
     parser.add_argument(
         "--output-dir",
