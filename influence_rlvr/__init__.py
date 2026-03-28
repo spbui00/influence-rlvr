@@ -11,13 +11,18 @@ from .attribution import (
     RepSimInfluence,
 )
 from .gradients import (
-    GEOMETRY_FEATURE_NONE,
-    GEOMETRY_FEATURE_POLICY_SCORE,
-    GRADIENT_OBJECTIVE_EXPECTED_REWARD,
-    GRADIENT_OBJECTIVE_GRPO_TRAIN,
     compute_policy_gradient_bundle,
     compute_sft_gradient,
     compute_rlvr_gradient,
+)
+from .modes import (
+    CodeEvalConfig,
+    ExperimentMode,
+    GeometryFeatureMode,
+    GradientObjective,
+    InfluenceMode,
+    ReplayGradientConfig,
+    SecondOrderGeometry,
 )
 from .eval import evaluate_math_dataset, evaluate_code_dataset
 from .rewards import (
@@ -52,10 +57,13 @@ __all__ = [
     "TrajectoryFisherInfluence",
     "PBRFInfluence",
     "RepSimInfluence",
-    "GRADIENT_OBJECTIVE_GRPO_TRAIN",
-    "GRADIENT_OBJECTIVE_EXPECTED_REWARD",
-    "GEOMETRY_FEATURE_NONE",
-    "GEOMETRY_FEATURE_POLICY_SCORE",
+    "InfluenceMode",
+    "ExperimentMode",
+    "GradientObjective",
+    "GeometryFeatureMode",
+    "SecondOrderGeometry",
+    "ReplayGradientConfig",
+    "CodeEvalConfig",
     "compute_policy_gradient_bundle",
     "compute_sft_gradient",
     "compute_rlvr_gradient",
