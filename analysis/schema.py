@@ -4,8 +4,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-RESULTS_SCHEMA_VERSION = 3
-GRAD_CACHE_SCHEMA_VERSION = 3
+RESULTS_SCHEMA_VERSION = 4
+GRAD_CACHE_SCHEMA_VERSION = 4
 TRAIN_BATCH_HISTORY_SCHEMA_VERSION = 1
 RESULTS_MANIFEST_FILE = "results_manifest.json"
 LEGACY_RESULTS_METADATA_FILE = "metadata.json"
@@ -13,6 +13,7 @@ GRAD_CACHE_MANIFEST_FILE = "cache_meta.json"
 TRAIN_BATCH_HISTORY_FILE = "historical_batch_history.json"
 TRACIN_MATRIX_FILE = "tracin_matrix.npy"
 DATAINF_MATRIX_FILE = "datainf_matrix.npy"
+FISHER_MATRIX_FILE = "fisher_matrix.npy"
 
 
 def prompt_preview(prompt: Any, limit: int = 200) -> str:
@@ -96,8 +97,10 @@ class CheckpointSummary:
 class MatrixManifest:
     tracin: str = TRACIN_MATRIX_FILE
     datainf: str = DATAINF_MATRIX_FILE
+    fisher: str | None = None
     tracin_steps: dict[str, str] = field(default_factory=dict)
     datainf_steps: dict[str, str] = field(default_factory=dict)
+    fisher_steps: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -107,8 +110,10 @@ class MatrixManifest:
         return cls(
             tracin=data.get("tracin", TRACIN_MATRIX_FILE),
             datainf=data.get("datainf", DATAINF_MATRIX_FILE),
+            fisher=data.get("fisher"),
             tracin_steps=dict(data.get("tracin_steps", {})),
             datainf_steps=dict(data.get("datainf_steps", {})),
+            fisher_steps=dict(data.get("fisher_steps", {})),
         )
 
 
@@ -241,6 +246,7 @@ class GradCacheSample:
     solution: Any = None
     train_index: int | None = None
     historical_weight: float | None = None
+    geometry_feature_file: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -253,6 +259,7 @@ class GradCacheSample:
             solution=data.get("solution"),
             train_index=data.get("train_index"),
             historical_weight=data.get("historical_weight"),
+            geometry_feature_file=data.get("geometry_feature_file"),
         )
 
 
@@ -345,3 +352,5 @@ class LoadedResults:
     datainf_matrix: Any
     tracin_step_matrices: dict[int, Any]
     datainf_step_matrices: dict[int, Any]
+    fisher_matrix: Any = None
+    fisher_step_matrices: dict[int, Any] | None = None

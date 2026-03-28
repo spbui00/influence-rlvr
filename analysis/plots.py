@@ -134,10 +134,16 @@ def trajectory_pairs_figure(
         axes = [axes]
 
     for axis, entry in zip(axes, pair_series):
-        tracin = np.asarray(entry["tracin"])
-        datainf = np.asarray(entry["datainf"])
-        axis.plot(steps, tracin, marker="o", markersize=4, label="TracIn", linewidth=1.5)
-        axis.plot(steps, datainf, marker="s", markersize=4, label="DataInf", linewidth=1.5)
+        line_specs = [
+            ("tracin", "TracIn", "o"),
+            ("datainf", "DataInf", "s"),
+            ("fisher", "Fisher", "^"),
+        ]
+        for key, label, marker in line_specs:
+            if key not in entry:
+                continue
+            values = np.asarray(entry[key])
+            axis.plot(steps, values, marker=marker, markersize=4, label=label, linewidth=1.5)
         axis.axhline(0, color="grey", linewidth=0.5)
         axis.set_ylabel("Per-step contribution")
         axis.set_title(str(entry["title"]))
@@ -145,7 +151,7 @@ def trajectory_pairs_figure(
 
     axes[-1].set_xlabel("Checkpoint step")
     fig.suptitle(
-        "Trajectory influence over training steps (top pairs by |TracIn|)",
+        "Trajectory influence over training steps",
         fontsize=11,
     )
     fig.tight_layout()

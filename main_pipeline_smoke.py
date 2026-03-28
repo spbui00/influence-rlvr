@@ -22,7 +22,11 @@ from analysis import (
 )
 from influence_rlvr import (
     HistoricalBatchGRPOTrainer,
+    GEOMETRY_FEATURE_POLICY_SCORE,
+    GRADIENT_OBJECTIVE_EXPECTED_REWARD,
+    GRADIENT_OBJECTIVE_GRPO_TRAIN,
     TrajectoryDataInfInfluence,
+    TrajectoryFisherInfluence,
     TrajectoryTracInInfluence,
     accuracy_reward_func,
     build_checkpoint_schedule,
@@ -71,6 +75,11 @@ CODE_EVAL_DO_SAMPLE = True
 CODE_EVAL_NUM_SAMPLES = 2
 CODE_EVAL_TEMPERATURE = 0.6
 CODE_EVAL_TOP_P = 0.95
+TRAIN_GRADIENT_OBJECTIVE = GRADIENT_OBJECTIVE_GRPO_TRAIN
+TEST_GRADIENT_OBJECTIVE = GRADIENT_OBJECTIVE_EXPECTED_REWARD
+TRAIN_GEOMETRY_FEATURE = GEOMETRY_FEATURE_POLICY_SCORE
+SECOND_ORDER_GEOMETRY = "policy_score_fisher"
+FISHER_NORMALIZE = False
 SKIP_TRAINING = False
 RESULTS_REUSE_POLICY = "ask"
 
@@ -378,6 +387,9 @@ checkpoint_infos = collect_checkpoint_infos(
     code_eval_num_samples=CODE_EVAL_NUM_SAMPLES,
     code_eval_temperature=CODE_EVAL_TEMPERATURE,
     code_eval_top_p=CODE_EVAL_TOP_P,
+    train_gradient_objective_mode=TRAIN_GRADIENT_OBJECTIVE,
+    test_gradient_objective_mode=TEST_GRADIENT_OBJECTIVE,
+    train_geometry_feature_mode=TRAIN_GEOMETRY_FEATURE,
 )
 
 print("\n" + "=" * 80)
@@ -387,6 +399,11 @@ trajectory_tracin = TrajectoryTracInInfluence(normalize=False)
 tracin_matrix, tracin_breakdown = trajectory_tracin.compute_matrix(checkpoint_infos, return_breakdown=True)
 trajectory_datainf = TrajectoryDataInfInfluence(lambda_damp=LAMBDA_DAMP, normalize=False)
 datainf_matrix, datainf_breakdown = trajectory_datainf.compute_matrix(checkpoint_infos, return_breakdown=True)
+trajectory_fisher = TrajectoryFisherInfluence(
+    lambda_damp=LAMBDA_DAMP,
+    normalize=FISHER_NORMALIZE,
+)
+fisher_matrix, fisher_breakdown = trajectory_fisher.compute_matrix(checkpoint_infos, return_breakdown=True)
 
 results_config = {
     "model_id": MODEL_ID,
@@ -418,6 +435,11 @@ results_config = {
     "code_eval_num_samples": CODE_EVAL_NUM_SAMPLES,
     "code_eval_temperature": CODE_EVAL_TEMPERATURE,
     "code_eval_top_p": CODE_EVAL_TOP_P,
+    "train_gradient_objective": TRAIN_GRADIENT_OBJECTIVE,
+    "test_gradient_objective": TEST_GRADIENT_OBJECTIVE,
+    "train_geometry_feature": TRAIN_GEOMETRY_FEATURE,
+    "second_order_geometry": SECOND_ORDER_GEOMETRY,
+    "fisher_normalize": FISHER_NORMALIZE,
     "lambda_damp": LAMBDA_DAMP,
     "train_grad_seed": TRAIN_GRAD_SEED,
     "device": str(DEVICE),
@@ -443,8 +465,10 @@ save_results_bundle(
     results_path,
     tracin_matrix,
     datainf_matrix,
+    fisher_matrix,
     tracin_breakdown,
     datainf_breakdown,
+    fisher_breakdown,
     checkpoint_infos,
     results_config,
     total_elapsed_s=time.time() - pipeline_t0,

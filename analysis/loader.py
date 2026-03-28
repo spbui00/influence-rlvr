@@ -10,6 +10,7 @@ import numpy as np
 
 from .schema import (
     DATAINF_MATRIX_FILE,
+    FISHER_MATRIX_FILE,
     GRAD_CACHE_MANIFEST_FILE,
     GRAD_CACHE_SCHEMA_VERSION,
     LEGACY_RESULTS_METADATA_FILE,
@@ -215,10 +216,12 @@ def _build_sample_descriptors(infos: list[dict[str, Any]]) -> list[SampleDescrip
 def _build_matrix_manifest(
     tracin_breakdown: list[dict[str, Any]],
     datainf_breakdown: list[dict[str, Any]],
+    fisher_breakdown: list[dict[str, Any]] | None = None,
 ) -> MatrixManifest:
     return MatrixManifest(
         tracin=TRACIN_MATRIX_FILE,
         datainf=DATAINF_MATRIX_FILE,
+        fisher=FISHER_MATRIX_FILE if fisher_breakdown is not None else None,
         tracin_steps={
             str(entry["step"]): f"tracin_step_{entry['step']}.npy"
             for entry in tracin_breakdown
@@ -227,6 +230,13 @@ def _build_matrix_manifest(
             str(entry["step"]): f"datainf_step_{entry['step']}.npy"
             for entry in datainf_breakdown
         },
+        fisher_steps=(
+            {
+                str(entry["step"]): f"fisher_step_{entry['step']}.npy"
+                for entry in fisher_breakdown
+            }
+            if fisher_breakdown is not None else {}
+        ),
     )
 
 
@@ -234,6 +244,7 @@ def build_results_manifest(
     checkpoint_infos: list[dict[str, Any]],
     tracin_breakdown: list[dict[str, Any]],
     datainf_breakdown: list[dict[str, Any]],
+    fisher_breakdown: list[dict[str, Any]] | None,
     config: dict[str, Any],
     *,
     training_elapsed_s: float | None = None,
@@ -257,7 +268,7 @@ def build_results_manifest(
         checkpoints=checkpoint_summaries,
         test_samples=test_samples,
         train_samples=train_samples,
-        matrices=_build_matrix_manifest(tracin_breakdown, datainf_breakdown),
+        matrices=_build_matrix_manifest(tracin_breakdown, datainf_breakdown, fisher_breakdown),
         training_elapsed_s=training_elapsed_s,
         replay_elapsed_s=replay_elapsed_s,
         total_elapsed_s=total_elapsed_s,
@@ -299,6 +310,11 @@ def build_legacy_metadata(manifest: InfluenceResultsManifest) -> dict[str, Any]:
         "code_eval_num_samples": config.get("code_eval_num_samples"),
         "code_eval_temperature": config.get("code_eval_temperature"),
         "code_eval_top_p": config.get("code_eval_top_p"),
+        "train_gradient_objective": config.get("train_gradient_objective"),
+        "test_gradient_objective": config.get("test_gradient_objective"),
+        "train_geometry_feature": config.get("train_geometry_feature"),
+        "second_order_geometry": config.get("second_order_geometry"),
+        "fisher_normalize": config.get("fisher_normalize"),
         "train_domain": config.get("train_domain"),
         "test_domain": config.get("test_domain"),
         "checkpoints": [item.to_dict() for item in manifest.checkpoints],
@@ -319,8 +335,10 @@ def save_results_bundle(
     results_dir: str | Path,
     tracin_matrix: np.ndarray,
     datainf_matrix: np.ndarray,
+    fisher_matrix: np.ndarray | None,
     tracin_breakdown: list[dict[str, Any]],
     datainf_breakdown: list[dict[str, Any]],
+    fisher_breakdown: list[dict[str, Any]] | None,
     checkpoint_infos: list[dict[str, Any]],
     config: dict[str, Any],
     *,
@@ -333,6 +351,8 @@ def save_results_bundle(
 
     np.save(results_path / TRACIN_MATRIX_FILE, tracin_matrix)
     np.save(results_path / DATAINF_MATRIX_FILE, datainf_matrix)
+    if fisher_matrix is not None:
+        np.save(results_path / FISHER_MATRIX_FILE, fisher_matrix)
 
     for entry in tracin_breakdown:
         np.save(
@@ -344,11 +364,17 @@ def save_results_bundle(
             results_path / f"datainf_step_{entry['step']}.npy",
             entry["weighted_matrix"],
         )
+    for entry in fisher_breakdown or []:
+        np.save(
+            results_path / f"fisher_step_{entry['step']}.npy",
+            entry["weighted_matrix"],
+        )
 
     manifest = build_results_manifest(
         checkpoint_infos,
         tracin_breakdown,
         datainf_breakdown,
+        fisher_breakdown,
         config,
         training_elapsed_s=training_elapsed_s,
         replay_elapsed_s=replay_elapsed_s,
@@ -362,19 +388,25 @@ def save_results_bundle(
 def _infer_matrix_manifest(results_path: Path, metadata: dict[str, Any]) -> MatrixManifest:
     tracin_steps = {}
     datainf_steps = {}
+    fisher_steps = {}
     for checkpoint in metadata.get("checkpoints", []):
         step = int(checkpoint["step"])
         tracin_name = f"tracin_step_{step}.npy"
         datainf_name = f"datainf_step_{step}.npy"
+        fisher_name = f"fisher_step_{step}.npy"
         if (results_path / tracin_name).exists():
             tracin_steps[str(step)] = tracin_name
         if (results_path / datainf_name).exists():
             datainf_steps[str(step)] = datainf_name
+        if (results_path / fisher_name).exists():
+            fisher_steps[str(step)] = fisher_name
     return MatrixManifest(
         tracin=TRACIN_MATRIX_FILE,
         datainf=DATAINF_MATRIX_FILE,
+        fisher=FISHER_MATRIX_FILE if (results_path / FISHER_MATRIX_FILE).exists() else None,
         tracin_steps=tracin_steps,
         datainf_steps=datainf_steps,
+        fisher_steps=fisher_steps,
     )
 
 
@@ -434,6 +466,11 @@ def _manifest_from_legacy_metadata(results_path: Path) -> InfluenceResultsManife
         "code_eval_num_samples": metadata.get("code_eval_num_samples"),
         "code_eval_temperature": metadata.get("code_eval_temperature"),
         "code_eval_top_p": metadata.get("code_eval_top_p"),
+        "train_gradient_objective": metadata.get("train_gradient_objective"),
+        "test_gradient_objective": metadata.get("test_gradient_objective"),
+        "train_geometry_feature": metadata.get("train_geometry_feature"),
+        "second_order_geometry": metadata.get("second_order_geometry"),
+        "fisher_normalize": metadata.get("fisher_normalize"),
         "train_domain": metadata.get("train_domain"),
         "test_domain": metadata.get("test_domain"),
     }
@@ -480,6 +517,11 @@ def load_results_bundle(results_dir: str | Path) -> LoadedResults:
     manifest = load_results_manifest(results_path)
     tracin_matrix = np.load(results_path / manifest.matrices.tracin)
     datainf_matrix = np.load(results_path / manifest.matrices.datainf)
+    fisher_matrix = None
+    if manifest.matrices.fisher is not None:
+        fisher_path = results_path / manifest.matrices.fisher
+        if fisher_path.exists():
+            fisher_matrix = np.load(fisher_path)
     tracin_step_matrices = _load_step_matrices(
         results_path,
         manifest.matrices.tracin_steps,
@@ -488,6 +530,10 @@ def load_results_bundle(results_dir: str | Path) -> LoadedResults:
         results_path,
         manifest.matrices.datainf_steps,
     )
+    fisher_step_matrices = _load_step_matrices(
+        results_path,
+        manifest.matrices.fisher_steps,
+    )
     return LoadedResults(
         root_dir=results_path,
         manifest=manifest,
@@ -495,6 +541,8 @@ def load_results_bundle(results_dir: str | Path) -> LoadedResults:
         datainf_matrix=datainf_matrix,
         tracin_step_matrices=tracin_step_matrices,
         datainf_step_matrices=datainf_step_matrices,
+        fisher_matrix=fisher_matrix,
+        fisher_step_matrices=fisher_step_matrices,
     )
 
 
@@ -514,6 +562,10 @@ def save_grad_cache(
         for index, info in enumerate(checkpoint["test_infos"]):
             grad_file = f"step{step}_test_{index}.npy"
             np.save(cache_path / grad_file, info["grad"].numpy())
+            geometry_feature_file = None
+            if info.get("geometry_feature") is not None:
+                geometry_feature_file = f"step{step}_test_{index}_geometry.npy"
+                np.save(cache_path / geometry_feature_file, info["geometry_feature"].numpy())
             test_infos.append(
                 GradCacheSample(
                     grad_file=grad_file,
@@ -521,12 +573,17 @@ def save_grad_cache(
                     solution=info.get("solution"),
                     train_index=info.get("train_index"),
                     historical_weight=info.get("historical_weight"),
+                    geometry_feature_file=geometry_feature_file,
                 )
             )
         train_infos = []
         for index, info in enumerate(checkpoint["train_infos"]):
             grad_file = f"step{step}_train_{index}.npy"
             np.save(cache_path / grad_file, info["grad"].numpy())
+            geometry_feature_file = None
+            if info.get("geometry_feature") is not None:
+                geometry_feature_file = f"step{step}_train_{index}_geometry.npy"
+                np.save(cache_path / geometry_feature_file, info["geometry_feature"].numpy())
             train_infos.append(
                 GradCacheSample(
                     grad_file=grad_file,
@@ -534,6 +591,7 @@ def save_grad_cache(
                     solution=info.get("solution"),
                     train_index=info.get("train_index"),
                     historical_weight=info.get("historical_weight"),
+                    geometry_feature_file=geometry_feature_file,
                 )
             )
         checkpoints.append(
@@ -599,6 +657,10 @@ def load_grad_cache(
                 "prompt": sample.prompt,
                 "solution": sample.solution,
             }
+            if sample.geometry_feature_file is not None:
+                info["geometry_feature"] = torch.from_numpy(
+                    np.load(cache_path / sample.geometry_feature_file)
+                )
             if sample.train_index is not None:
                 info["train_index"] = sample.train_index
             if sample.historical_weight is not None:
@@ -612,6 +674,10 @@ def load_grad_cache(
                 "prompt": sample.prompt,
                 "solution": sample.solution,
             }
+            if sample.geometry_feature_file is not None:
+                info["geometry_feature"] = torch.from_numpy(
+                    np.load(cache_path / sample.geometry_feature_file)
+                )
             if sample.train_index is not None:
                 info["train_index"] = sample.train_index
             if sample.historical_weight is not None:

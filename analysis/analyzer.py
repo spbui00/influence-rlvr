@@ -120,6 +120,10 @@ class InfluenceAnalyzer:
             return self.bundle.tracin_matrix
         if key == "datainf":
             return self.bundle.datainf_matrix
+        if key == "fisher":
+            if self.bundle.fisher_matrix is None:
+                raise ValueError("Fisher influence matrix is not available in this bundle.")
+            return self.bundle.fisher_matrix
         raise ValueError(f"Unknown method: {method}")
 
     def step_matrices(self, method: str) -> dict[int, np.ndarray]:
@@ -128,6 +132,8 @@ class InfluenceAnalyzer:
             return self.bundle.tracin_step_matrices
         if key == "datainf":
             return self.bundle.datainf_step_matrices
+        if key == "fisher":
+            return self.bundle.fisher_step_matrices or {}
         raise ValueError(f"Unknown method: {method}")
 
     def _rank_indices(self, row: np.ndarray, k: int, largest: bool, use_abs: bool) -> np.ndarray:
@@ -235,9 +241,10 @@ class InfluenceAnalyzer:
     ):
         tracin_steps = self.step_matrices("tracin")
         datainf_steps = self.step_matrices("datainf")
+        fisher_steps = self.step_matrices("fisher") if self.bundle.fisher_matrix is not None else {}
         pair_series = []
         for test_idx, train_idx in pairs:
-            pair_series.append({
+            entry = {
                 "title": f"Test {test_idx} ↔ Train {train_idx}",
                 "tracin": [
                     tracin_steps.get(step, np.full((1, 1), np.nan))[test_idx, train_idx]
@@ -249,7 +256,14 @@ class InfluenceAnalyzer:
                     if step in datainf_steps else np.nan
                     for step in self.steps
                 ],
-            })
+            }
+            if fisher_steps:
+                entry["fisher"] = [
+                    fisher_steps.get(step, np.full((1, 1), np.nan))[test_idx, train_idx]
+                    if step in fisher_steps else np.nan
+                    for step in self.steps
+                ]
+            pair_series.append(entry)
         fig = trajectory_pairs_figure(self.steps, pair_series)
         output = Path(output_path)
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -287,7 +301,10 @@ class InfluenceAnalyzer:
 
     def build_report(self, top_k: int = 3, bottom_k: int = 0) -> str:
         lines = []
-        for method in ("TracIn", "DataInf"):
+        methods = ["TracIn", "DataInf"]
+        if self.bundle.fisher_matrix is not None:
+            methods.append("Fisher")
+        for method in methods:
             lines.append("")
             lines.append("=" * 60)
             lines.append(f"Top-{top_k} influential train samples per test ({method})")
@@ -341,6 +358,11 @@ class InfluenceAnalyzer:
             "code_eval_num_samples",
             "code_eval_temperature",
             "code_eval_top_p",
+            "train_gradient_objective",
+            "test_gradient_objective",
+            "train_geometry_feature",
+            "second_order_geometry",
+            "fisher_normalize",
             "train_domain",
             "test_domain",
         ]:
@@ -440,6 +462,8 @@ class InfluenceAnalyzer:
             ),
             self.plot_gradient_norms(output / "gradient_norms.png"),
         ]
+        if self.bundle.fisher_matrix is not None:
+            saved.append(self.plot_heatmap("fisher", output / "fisher_heatmap.png"))
         if self.has_eval_metrics:
             saved.append(self.plot_eval_performance(output / "performance_curves.png"))
         if self.has_training_history:
