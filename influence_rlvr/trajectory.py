@@ -294,6 +294,10 @@ def collect_checkpoint_infos(
     math_eval_dataset=None,
     code_eval_dataset=None,
     eval_max_new_tokens=256,
+    code_eval_do_sample=False,
+    code_eval_num_samples=1,
+    code_eval_temperature=0.6,
+    code_eval_top_p=0.95,
     progress=True,
 ):
     checkpoint_infos = []
@@ -330,6 +334,10 @@ def collect_checkpoint_infos(
                 code_eval_dataset,
                 device,
                 max_new_tokens=eval_max_new_tokens,
+                do_sample=code_eval_do_sample,
+                num_samples=code_eval_num_samples,
+                temperature=code_eval_temperature,
+                top_p=code_eval_top_p,
                 progress=False,
             )
 

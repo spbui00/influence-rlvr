@@ -7,27 +7,52 @@ from .rewards import accuracy_reward_func, format_reward_func, mbpp_execution_re
 from .utils import clear_cache, tokenize_prompt
 
 
-def _generate_completion(
+def _generate_completions(
     peft_model,
     tokenizer,
     prompt,
     device,
     max_new_tokens=256,
+    *,
+    do_sample=False,
+    temperature=0.6,
+    top_p=0.95,
+    num_samples=1,
 ):
+    if num_samples < 1:
+        raise ValueError(f"num_samples must be >= 1, got {num_samples}.")
+    if not do_sample and num_samples != 1:
+        raise ValueError(
+            "Greedy evaluation only supports num_samples=1. "
+            "Set do_sample=True to evaluate multiple completions."
+        )
+
     peft_model.eval()
     _, prompt_ids, prompt_attention_mask = tokenize_prompt(tokenizer, prompt, device)
     with torch.no_grad():
+        generate_kwargs = {
+            "input_ids": prompt_ids,
+            "attention_mask": prompt_attention_mask,
+            "max_new_tokens": max_new_tokens,
+            "do_sample": do_sample,
+            "pad_token_id": tokenizer.pad_token_id,
+            "eos_token_id": tokenizer.eos_token_id,
+        }
+        if do_sample:
+            generate_kwargs.update({
+                "temperature": temperature,
+                "top_p": top_p,
+                "num_return_sequences": num_samples,
+            })
         generated = peft_model.generate(
-            input_ids=prompt_ids,
-            attention_mask=prompt_attention_mask,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
+            **generate_kwargs,
         )
-    completion_ids = generated[0, prompt_ids.shape[1]:]
-    completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True)
-    return [[{"role": "assistant", "content": completion_text}]]
+    completions = []
+    for sequence in generated[:num_samples]:
+        completion_ids = sequence[prompt_ids.shape[1]:]
+        completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True)
+        completions.append([{"role": "assistant", "content": completion_text}])
+    return completions
 
 
 def evaluate_math_dataset(
@@ -47,7 +72,7 @@ def evaluate_math_dataset(
 
     for idx in range(count):
         sample = dataset[idx]
-        completions = _generate_completion(
+        completions = _generate_completions(
             peft_model,
             tokenizer,
             sample["prompt"],
@@ -84,6 +109,10 @@ def evaluate_code_dataset(
     max_new_tokens=256,
     progress=False,
     progress_prefix="",
+    do_sample=False,
+    temperature=0.6,
+    top_p=0.95,
+    num_samples=1,
 ):
     count = len(dataset) if limit is None else min(limit, len(dataset))
     rewards = []
@@ -92,35 +121,55 @@ def evaluate_code_dataset(
 
     for idx in range(count):
         sample = dataset[idx]
-        completions = _generate_completion(
+        completions = _generate_completions(
             peft_model,
             tokenizer,
             sample["prompt"],
             device,
             max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_p=top_p,
+            num_samples=num_samples,
         )
-        reward = float(
-            mbpp_execution_reward_func(
+        completion_rewards = [
+            float(score)
+            for score in mbpp_execution_reward_func(
                 completions,
                 test_list=sample["test_list"],
                 test_setup_code=sample["test_setup_code"],
                 challenge_test_list=sample.get("challenge_test_list"),
-            )[0]
-        )
+            )
+        ]
+        reward = max(completion_rewards, default=0.0)
         rewards.append(reward)
-        pass_flags.append(1.0 if reward >= 0.999 else 0.0)
-        compile_flags.append(1.0 if reward > 0.0 else 0.0)
+        pass_flags.append(
+            1.0 if any(score >= 0.999 for score in completion_rewards) else 0.0
+        )
+        compile_flags.append(
+            1.0 if any(score > 0.0 for score in completion_rewards) else 0.0
+        )
         if progress:
             print(
                 f"{progress_prefix} code eval sample {idx + 1}/{count} "
-                f"| reward={reward:.3f}",
+                f"| best_reward={reward:.3f}",
                 flush=True,
             )
         clear_cache(device)
 
+    pass_metric = "pass@1" if num_samples == 1 else f"pass@{num_samples}"
+    compile_metric = (
+        "compile@1" if num_samples == 1 else f"compile@{num_samples}"
+    )
     return {
         "count": count,
         "pass_rate": float(np.mean(pass_flags)) if pass_flags else 0.0,
         "compile_rate": float(np.mean(compile_flags)) if compile_flags else 0.0,
         "mean_reward": float(np.mean(rewards)) if rewards else 0.0,
+        "pass_metric": pass_metric,
+        "compile_metric": compile_metric,
+        "sample_count": int(num_samples),
+        "do_sample": bool(do_sample),
+        "temperature": float(temperature) if do_sample else None,
+        "top_p": float(top_p) if do_sample else None,
     }
