@@ -65,6 +65,7 @@ EVAL_MAX_NEW_TOKENS = 256
 INFLUENCE_MODE = "historical"
 
 SKIP_TRAINING = False
+ENABLE_GRAD_CACHE = False
 GRAD_CACHE_DIR = f"{RESULTS_DIR}/grad_cache"
 
 
@@ -298,6 +299,7 @@ RESULTS_CONFIG = {
     "output_dir": OUTPUT_DIR,
     "results_dir": RESULTS_DIR,
     "influence_mode": INFLUENCE_MODE,
+    "enable_grad_cache": ENABLE_GRAD_CACHE,
     "learning_rate": LEARNING_RATE,
     "max_steps": MAX_STEPS,
     "save_steps": SAVE_STEPS,
@@ -326,6 +328,7 @@ CACHE_CONFIG = {
     "model_id": MODEL_ID,
     "output_dir": os.path.abspath(OUTPUT_DIR),
     "influence_mode": INFLUENCE_MODE,
+    "enable_grad_cache": ENABLE_GRAD_CACHE,
     "learning_rate": LEARNING_RATE,
     "max_steps": MAX_STEPS,
     "save_steps": SAVE_STEPS,
@@ -379,16 +382,19 @@ def _run_replay():
     )
     elapsed = time.time() - t0
     print(f"\nTrajectory replay completed in {elapsed:.1f}s")
-    save_grad_cache(infos, GRAD_CACHE_DIR, CACHE_FINGERPRINT, CACHE_CONFIG)
-    print(f"Gradient cache saved to {Path(GRAD_CACHE_DIR).resolve()}/")
-    print(f"  config fingerprint: {CACHE_FINGERPRINT}")
+    if ENABLE_GRAD_CACHE:
+        save_grad_cache(infos, GRAD_CACHE_DIR, CACHE_FINGERPRINT, CACHE_CONFIG)
+        print(f"Gradient cache saved to {Path(GRAD_CACHE_DIR).resolve()}/")
+        print(f"  config fingerprint: {CACHE_FINGERPRINT}")
+    else:
+        print("Gradient cache disabled; skipping grad_cache save.")
     return infos, elapsed
 
 
 grad_cache_path = Path(GRAD_CACHE_DIR) / "cache_meta.json"
 checkpoint_infos = None
 replay_elapsed_s = None
-if grad_cache_path.exists():
+if ENABLE_GRAD_CACHE and grad_cache_path.exists():
     print("\nGradient cache found — checking config fingerprint...")
     checkpoint_infos, stored_fingerprint = load_grad_cache(
         GRAD_CACHE_DIR,
