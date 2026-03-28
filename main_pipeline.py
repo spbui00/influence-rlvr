@@ -25,9 +25,6 @@ from analysis import (
 )
 from influence_rlvr import (
     HistoricalBatchGRPOTrainer,
-    GEOMETRY_FEATURE_POLICY_SCORE,
-    GRADIENT_OBJECTIVE_EXPECTED_REWARD,
-    GRADIENT_OBJECTIVE_GRPO_TRAIN,
     TrajectoryDataInfInfluence,
     TrajectoryFisherInfluence,
     TrajectoryTracInInfluence,
@@ -39,6 +36,15 @@ from influence_rlvr import (
     ensure_reference_adapter,
     format_reward_func,
     mbpp_execution_reward_func,
+)
+from influence_rlvr.modes import (
+    CodeEvalConfig,
+    ExperimentMode,
+    GeometryFeatureMode,
+    GradientObjective,
+    InfluenceMode,
+    ReplayGradientConfig,
+    SecondOrderGeometry,
 )
 from influence_rlvr.prompts import (
     build_code_prompt,
@@ -76,17 +82,21 @@ CODE_TRAIN_SPLIT = "train"
 CODE_EVAL_SPLIT = "validation"
 CODE_EVAL_PERCENT = 10
 EVAL_MAX_NEW_TOKENS = 256
-INFLUENCE_MODE = "historical"
-EXPERIMENT_MODE = "math_grpo"
-CODE_EVAL_DO_SAMPLE = True
-CODE_EVAL_NUM_SAMPLES = 4
-CODE_EVAL_TEMPERATURE = 0.6
-CODE_EVAL_TOP_P = 0.95
-TRAIN_GRADIENT_OBJECTIVE = GRADIENT_OBJECTIVE_GRPO_TRAIN
-TEST_GRADIENT_OBJECTIVE = GRADIENT_OBJECTIVE_EXPECTED_REWARD
-TRAIN_GEOMETRY_FEATURE = GEOMETRY_FEATURE_POLICY_SCORE
-SECOND_ORDER_GEOMETRY = "policy_score_fisher"
-FISHER_NORMALIZE = False
+INFLUENCE_MODE = InfluenceMode.HISTORICAL
+EXPERIMENT_MODE = ExperimentMode.MATH_GRPO
+CODE_EVAL_CONFIG = CodeEvalConfig(
+    do_sample=True,
+    num_samples=4,
+    temperature=0.6,
+    top_p=0.95,
+)
+REPLAY_GRADIENT_CONFIG = ReplayGradientConfig(
+    train_objective=GradientObjective.GRPO_TRAIN,
+    test_objective=GradientObjective.EXPECTED_REWARD_PG,
+    train_geometry_feature=GeometryFeatureMode.POLICY_SCORE,
+    second_order_geometry=SecondOrderGeometry.POLICY_SCORE_FISHER,
+    fisher_normalize=False,
+)
 
 SKIP_TRAINING = False
 ENABLE_GRAD_CACHE = False
@@ -96,25 +106,27 @@ RESULTS_REUSE_POLICY = "ask"
 def normalize_influence_mode(mode):
     value = str(mode).strip().lower()
     if value == "counterfactual":
-        value = "dense"
-    if value not in {"historical", "dense"}:
+        return InfluenceMode.DENSE
+    try:
+        return InfluenceMode.parse(value)
+    except ValueError as exc:
         raise ValueError(
-            f"Unsupported INFLUENCE_MODE={mode!r}. Use 'historical' or 'dense'."
-        )
-    return value
+            f"Unsupported INFLUENCE_MODE={mode!r}. "
+            "Use InfluenceMode.HISTORICAL or InfluenceMode.DENSE."
+        ) from exc
 
 
 INFLUENCE_MODE = normalize_influence_mode(INFLUENCE_MODE)
 
 
 def normalize_experiment_mode(mode):
-    value = str(mode).strip().lower()
-    if value not in {"math_grpo", "code_grpo", "base_eval"}:
+    try:
+        return ExperimentMode.parse(mode)
+    except ValueError as exc:
         raise ValueError(
             f"Unsupported EXPERIMENT_MODE={mode!r}. "
-            "Use 'math_grpo', 'code_grpo', or 'base_eval'."
-        )
-    return value
+            "Use ExperimentMode.MATH_GRPO, CODE_GRPO, or BASE_EVAL."
+        ) from exc
 
 
 EXPERIMENT_MODE = normalize_experiment_mode(EXPERIMENT_MODE)
@@ -298,7 +310,7 @@ if code_eval_split is not None:
     code_eval_data = load_dataset("mbpp", split=code_eval_split)
     code_eval_dataset = code_eval_data.map(format_code)
 
-if EXPERIMENT_MODE == "code_grpo":
+if EXPERIMENT_MODE == ExperimentMode.CODE_GRPO:
     training_domain = "Code"
     training_dataset = code_train_dataset
     training_reward_funcs = [mbpp_execution_reward_func]
@@ -369,7 +381,7 @@ training_elapsed_s = None
 
 if SKIP_TRAINING:
     print("\nSKIP_TRAINING=True — skipping Phase 1")
-elif EXPERIMENT_MODE == "base_eval":
+elif EXPERIMENT_MODE == ExperimentMode.BASE_EVAL:
     print("\nEXPERIMENT_MODE='base_eval' — skipping Phase 1")
 else:
     t_train_start = time.time()
@@ -400,17 +412,17 @@ if GRPO_BETA != 0.0:
     ensure_reference_adapter(model)
 
 effective_influence_mode = INFLUENCE_MODE
-if EXPERIMENT_MODE == "base_eval" and INFLUENCE_MODE == "historical":
+if EXPERIMENT_MODE == ExperimentMode.BASE_EVAL and INFLUENCE_MODE == InfluenceMode.HISTORICAL:
     print(
         "EXPERIMENT_MODE='base_eval' has no optimizer-step history; "
         "falling back to dense influence mode."
     )
-    effective_influence_mode = "dense"
+    effective_influence_mode = InfluenceMode.DENSE
 
 batch_history_manifest = None
 batch_weight_lookup = None
 batch_history_fingerprint = None
-if effective_influence_mode == "historical":
+if effective_influence_mode == InfluenceMode.HISTORICAL:
     batch_history_manifest = load_batch_history(OUTPUT_DIR)
     if batch_history_manifest is None:
         raise RuntimeError(
@@ -453,7 +465,7 @@ def build_code_reward_fns(sample, num_generations):
     ]
 
 
-if EXPERIMENT_MODE == "code_grpo":
+if EXPERIMENT_MODE == ExperimentMode.CODE_GRPO:
     replay_reward_fn_builder = build_code_reward_fns
 else:
     replay_reward_fn_builder = build_math_reward_fns
@@ -486,15 +498,8 @@ RESULTS_CONFIG = {
     "code_eval_split": CODE_EVAL_SPLIT,
     "code_eval_percent": CODE_EVAL_PERCENT,
     "eval_max_new_tokens": EVAL_MAX_NEW_TOKENS,
-    "code_eval_do_sample": CODE_EVAL_DO_SAMPLE,
-    "code_eval_num_samples": CODE_EVAL_NUM_SAMPLES,
-    "code_eval_temperature": CODE_EVAL_TEMPERATURE,
-    "code_eval_top_p": CODE_EVAL_TOP_P,
-    "train_gradient_objective": TRAIN_GRADIENT_OBJECTIVE,
-    "test_gradient_objective": TEST_GRADIENT_OBJECTIVE,
-    "train_geometry_feature": TRAIN_GEOMETRY_FEATURE,
-    "second_order_geometry": SECOND_ORDER_GEOMETRY,
-    "fisher_normalize": FISHER_NORMALIZE,
+    **CODE_EVAL_CONFIG.to_config_dict(),
+    **REPLAY_GRADIENT_CONFIG.to_config_dict(),
     "lambda_damp": LAMBDA_DAMP,
     "train_grad_seed": TRAIN_GRAD_SEED,
     "device": str(DEVICE),
@@ -545,15 +550,8 @@ CACHE_CONFIG = {
     "code_eval_split": CODE_EVAL_SPLIT,
     "code_eval_percent": CODE_EVAL_PERCENT,
     "eval_max_new_tokens": EVAL_MAX_NEW_TOKENS,
-    "code_eval_do_sample": CODE_EVAL_DO_SAMPLE,
-    "code_eval_num_samples": CODE_EVAL_NUM_SAMPLES,
-    "code_eval_temperature": CODE_EVAL_TEMPERATURE,
-    "code_eval_top_p": CODE_EVAL_TOP_P,
-    "train_gradient_objective": TRAIN_GRADIENT_OBJECTIVE,
-    "test_gradient_objective": TEST_GRADIENT_OBJECTIVE,
-    "train_geometry_feature": TRAIN_GEOMETRY_FEATURE,
-    "second_order_geometry": SECOND_ORDER_GEOMETRY,
-    "fisher_normalize": FISHER_NORMALIZE,
+    **CODE_EVAL_CONFIG.to_config_dict(),
+    **REPLAY_GRADIENT_CONFIG.to_config_dict(),
     "train_grad_seed": TRAIN_GRAD_SEED,
     "batch_history_fingerprint": batch_history_fingerprint,
     "train_domain": training_domain,
@@ -588,13 +586,8 @@ def _run_replay():
         math_eval_dataset=math_eval_dataset,
         code_eval_dataset=code_eval_dataset,
         eval_max_new_tokens=EVAL_MAX_NEW_TOKENS,
-        code_eval_do_sample=CODE_EVAL_DO_SAMPLE,
-        code_eval_num_samples=CODE_EVAL_NUM_SAMPLES,
-        code_eval_temperature=CODE_EVAL_TEMPERATURE,
-        code_eval_top_p=CODE_EVAL_TOP_P,
-        train_gradient_objective_mode=TRAIN_GRADIENT_OBJECTIVE,
-        test_gradient_objective_mode=TEST_GRADIENT_OBJECTIVE,
-        train_geometry_feature_mode=TRAIN_GEOMETRY_FEATURE,
+        **CODE_EVAL_CONFIG.to_kwargs(),
+        **REPLAY_GRADIENT_CONFIG.to_kwargs(),
     )
     elapsed = time.time() - t0
     print(f"\nTrajectory replay completed in {elapsed:.1f}s")
@@ -694,7 +687,8 @@ datainf_matrix, datainf_breakdown = trajectory_datainf.compute_matrix(
 )
 
 trajectory_fisher = TrajectoryFisherInfluence(
-    lambda_damp=LAMBDA_DAMP, normalize=FISHER_NORMALIZE,
+    lambda_damp=LAMBDA_DAMP,
+    normalize=REPLAY_GRADIENT_CONFIG.fisher_normalize,
 )
 fisher_matrix, fisher_breakdown = trajectory_fisher.compute_matrix(
     checkpoint_infos, return_breakdown=True,
