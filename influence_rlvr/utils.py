@@ -47,11 +47,11 @@ def extract_lora_gradients(peft_model):
     grads = []
     for _, param in peft_model.named_parameters():
         if param.requires_grad and param.grad is not None:
-            grads.append(param.grad.detach().float().view(-1).cpu().clone())
+            grads.append(param.grad.detach().to(dtype=torch.float32).reshape(-1))
     peft_model.zero_grad()
     if not grads:
         raise RuntimeError("No LoRA gradients were found after backward().")
-    return torch.cat(grads)
+    return torch.cat(grads).cpu()
 
 
 def get_reward_name(reward_fn):
