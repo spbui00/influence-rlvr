@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import time
@@ -35,36 +36,48 @@ from influence_rlvr import (
     format_reward_func,
     mbpp_execution_reward_func,
 )
+from influence_rlvr.prompts import (
+    build_code_prompt,
+    build_r1_math_prompt,
+    extract_gsm8k_target,
+)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Configuration — edit these before launching
 # ═══════════════════════════════════════════════════════════════════════════════
-MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
-RUN_NAME = "run1"
+MODEL_ID = "Qwen/Qwen2.5-Math-1.5B"
+RUN_NAME = "run6"
 RUN_DIR = f"./outputs/{RUN_NAME}"
 OUTPUT_DIR = f"{RUN_DIR}/rlvr-output"
 
 LEARNING_RATE = 1e-4
 MAX_STEPS = 200
 SAVE_STEPS = 5
-PER_DEVICE_BATCH = 4
+PER_DEVICE_BATCH = 8
 GRAD_ACCUM_STEPS = 2
 GRPO_BETA = 0.04
 GRPO_EPSILON = 0.2
 G_TRAIN = 8
 G_TEST = 8
-GENERATION_BATCH_SIZE = 32
+GENERATION_BATCH_SIZE = 128
 TRAIN_GRAD_SEED = 1234
 LAMBDA_DAMP = 0.1
 N_MATH = 300
 N_CODE = 10
 N_TRAIN_REPLAY = N_MATH
+N_CODE_TRAIN = N_MATH
 MATH_EVAL_SPLIT = "test"
 MATH_EVAL_PERCENT = 10
+CODE_TRAIN_SPLIT = "train"
 CODE_EVAL_SPLIT = "validation"
 CODE_EVAL_PERCENT = 10
 EVAL_MAX_NEW_TOKENS = 256
 INFLUENCE_MODE = "historical"
+EXPERIMENT_MODE = "math_grpo"
+CODE_EVAL_DO_SAMPLE = True
+CODE_EVAL_NUM_SAMPLES = 4
+CODE_EVAL_TEMPERATURE = 0.6
+CODE_EVAL_TOP_P = 0.95
 
 SKIP_TRAINING = False
 ENABLE_GRAD_CACHE = False
@@ -83,6 +96,19 @@ def normalize_influence_mode(mode):
 
 
 INFLUENCE_MODE = normalize_influence_mode(INFLUENCE_MODE)
+
+
+def normalize_experiment_mode(mode):
+    value = str(mode).strip().lower()
+    if value not in {"math_grpo", "code_grpo", "base_eval"}:
+        raise ValueError(
+            f"Unsupported EXPERIMENT_MODE={mode!r}. "
+            "Use 'math_grpo', 'code_grpo', or 'base_eval'."
+        )
+    return value
+
+
+EXPERIMENT_MODE = normalize_experiment_mode(EXPERIMENT_MODE)
 
 
 def normalize_results_reuse_policy(policy):
@@ -152,6 +178,19 @@ def finalize_results_dir(
 
 RESULTS_REUSE_POLICY = normalize_results_reuse_policy(RESULTS_REUSE_POLICY)
 
+optimizer_step_rows = PER_DEVICE_BATCH * GRAD_ACCUM_STEPS
+generation_prompt_pool = GENERATION_BATCH_SIZE // max(G_TRAIN, 1)
+print(
+    "Historical coverage target: "
+    f"{optimizer_step_rows} prompt rows/optimizer step, "
+    f"{generation_prompt_pool} unique prompts/generation cycle"
+)
+if generation_prompt_pool < optimizer_step_rows:
+    print(
+        "Warning: generation_batch_size is smaller than the optimizer-step "
+        "prompt demand, so historical attribution may still be sparse."
+    )
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Device
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -181,37 +220,47 @@ model = get_peft_model(base_model, lora_config)
 model.print_trainable_parameters()
 
 
+def save_base_checkpoint(peft_model, tokenizer_obj, output_dir):
+    checkpoint_dir = Path(output_dir) / "checkpoint-0"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    peft_model.save_pretrained(checkpoint_dir)
+    tokenizer_obj.save_pretrained(checkpoint_dir)
+    trainer_state_path = checkpoint_dir / "trainer_state.json"
+    trainer_state_path.write_text(json.dumps({
+        "global_step": 0,
+        "log_history": [{
+            "step": 0,
+            "learning_rate": 0.0,
+        }],
+    }, indent=2))
+    return checkpoint_dir
+
+
+save_base_checkpoint(model, tokenizer, OUTPUT_DIR)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Datasets
 # ═══════════════════════════════════════════════════════════════════════════════
 def format_math(example, idx):
     return {
-        "prompt": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a math reasoning assistant. "
-                    "Think inside <think> tags, then output your answer inside <answer> tags."
-                ),
-            },
-            {"role": "user", "content": example["question"]},
-        ],
-        "solution": example["answer"].split("#### ")[-1],
+        "prompt": build_r1_math_prompt(example["question"]),
+        "solution": extract_gsm8k_target(example["answer"]),
         "train_index": idx,
     }
 
 
-def format_code(example):
-    return {
-        "prompt": [
-            {"role": "system", "content": "You are a coding assistant."},
-            {"role": "user", "content": example["text"]},
-        ],
+def format_code(example, idx=None):
+    payload = {
+        "prompt": build_code_prompt(example["text"]),
         "solution": example["code"],
         "test_list": example["test_list"],
         "test_setup_code": example["test_setup_code"],
         "challenge_test_list": example["challenge_test_list"],
     }
+    if idx is not None:
+        payload["train_index"] = idx
+    return payload
 
 
 def percent_slice(split_name, percent):
@@ -223,10 +272,12 @@ def percent_slice(split_name, percent):
 
 
 print("\nLoading datasets...")
-math_data = load_dataset("openai/gsm8k", "main", split=f"train[:{N_MATH}]")
-train_dataset = math_data.map(format_math, with_indices=True)
-code_data = load_dataset("mbpp", split=f"test[:{N_CODE}]")
-test_dataset = code_data.map(format_code)
+math_train_data = load_dataset("openai/gsm8k", "main", split=f"train[:{N_MATH}]")
+math_train_dataset = math_train_data.map(format_math, with_indices=True)
+code_train_data = load_dataset("mbpp", split=f"{CODE_TRAIN_SPLIT}[:{N_CODE_TRAIN}]")
+code_train_dataset = code_train_data.map(format_code, with_indices=True)
+code_test_data = load_dataset("mbpp", split=f"test[:{N_CODE}]")
+test_dataset = code_test_data.map(format_code)
 math_eval_split = percent_slice(MATH_EVAL_SPLIT, MATH_EVAL_PERCENT)
 math_eval_dataset = None
 if math_eval_split is not None:
@@ -237,8 +288,22 @@ code_eval_dataset = None
 if code_eval_split is not None:
     code_eval_data = load_dataset("mbpp", split=code_eval_split)
     code_eval_dataset = code_eval_data.map(format_code)
-print(f"  Z_train (Math): {len(train_dataset)} samples")
-print(f"  Z_test  (Code): {len(test_dataset)} samples")
+
+if EXPERIMENT_MODE == "code_grpo":
+    training_domain = "Code"
+    training_dataset = code_train_dataset
+    training_reward_funcs = [mbpp_execution_reward_func]
+else:
+    training_domain = "Math"
+    training_dataset = math_train_dataset
+    training_reward_funcs = [format_reward_func, accuracy_reward_func]
+
+replay_train_dataset = training_dataset
+test_domain = "Code"
+
+print(f"  RL train ({training_domain}): {len(training_dataset)} samples")
+print(f"  Replay test ({test_domain}): {len(test_dataset)} samples")
+print(f"  Code train pool ({CODE_TRAIN_SPLIT}): {len(code_train_dataset)} samples")
 if math_eval_dataset is not None:
     print(f"  Held-out math eval ({MATH_EVAL_SPLIT}): {len(math_eval_dataset)} samples")
 if code_eval_dataset is not None:
@@ -276,9 +341,9 @@ def run_training():
 
     trainer = HistoricalBatchGRPOTrainer(
         model=model,
-        reward_funcs=[format_reward_func, accuracy_reward_func],
+        reward_funcs=training_reward_funcs,
         args=training_args,
-        train_dataset=train_dataset,
+        train_dataset=training_dataset,
         processing_class=tokenizer,
         history_output_dir=OUTPUT_DIR,
     )
@@ -295,6 +360,8 @@ training_elapsed_s = None
 
 if SKIP_TRAINING:
     print("\nSKIP_TRAINING=True — skipping Phase 1")
+elif EXPERIMENT_MODE == "base_eval":
+    print("\nEXPERIMENT_MODE='base_eval' — skipping Phase 1")
 else:
     t_train_start = time.time()
     run_training()
@@ -323,10 +390,18 @@ for cp in checkpoint_schedule:
 if GRPO_BETA != 0.0:
     ensure_reference_adapter(model)
 
+effective_influence_mode = INFLUENCE_MODE
+if EXPERIMENT_MODE == "base_eval" and INFLUENCE_MODE == "historical":
+    print(
+        "EXPERIMENT_MODE='base_eval' has no optimizer-step history; "
+        "falling back to dense influence mode."
+    )
+    effective_influence_mode = "dense"
+
 batch_history_manifest = None
 batch_weight_lookup = None
 batch_history_fingerprint = None
-if INFLUENCE_MODE == "historical":
+if effective_influence_mode == "historical":
     batch_history_manifest = load_batch_history(OUTPUT_DIR)
     if batch_history_manifest is None:
         raise RuntimeError(
@@ -341,6 +416,11 @@ if INFLUENCE_MODE == "historical":
         f"{len(batch_history_manifest.steps)} optimizer steps "
         f"(fingerprint={batch_history_fingerprint})"
     )
+    batch_weight_lookup[0] = {
+        "total_rows": 0,
+        "microbatch_count": 0,
+        "weights": {},
+    }
 else:
     print("Using dense counterfactual influence mode.")
 
@@ -359,16 +439,23 @@ def build_code_reward_fns(sample, num_generations):
             mbpp_execution_reward_func,
             test_list=sample["test_list"],
             test_setup_code=sample["test_setup_code"],
-            challenge_test_list=sample["challenge_test_list"],
+            challenge_test_list=sample.get("challenge_test_list"),
         ),
     ]
+
+
+if EXPERIMENT_MODE == "code_grpo":
+    replay_reward_fn_builder = build_code_reward_fns
+else:
+    replay_reward_fn_builder = build_math_reward_fns
 
 
 RESULTS_CONFIG = {
     "model_id": MODEL_ID,
     "run_name": RUN_NAME,
     "output_dir": OUTPUT_DIR,
-    "influence_mode": INFLUENCE_MODE,
+    "influence_mode": effective_influence_mode,
+    "experiment_mode": EXPERIMENT_MODE,
     "enable_grad_cache": ENABLE_GRAD_CACHE,
     "learning_rate": LEARNING_RATE,
     "max_steps": MAX_STEPS,
@@ -382,16 +469,24 @@ RESULTS_CONFIG = {
     "generation_batch_size": GENERATION_BATCH_SIZE,
     "n_math": N_MATH,
     "n_code": N_CODE,
+    "n_code_train": N_CODE_TRAIN,
     "n_train_replay": N_TRAIN_REPLAY,
+    "code_train_split": CODE_TRAIN_SPLIT,
     "math_eval_split": MATH_EVAL_SPLIT,
     "math_eval_percent": MATH_EVAL_PERCENT,
     "code_eval_split": CODE_EVAL_SPLIT,
     "code_eval_percent": CODE_EVAL_PERCENT,
     "eval_max_new_tokens": EVAL_MAX_NEW_TOKENS,
+    "code_eval_do_sample": CODE_EVAL_DO_SAMPLE,
+    "code_eval_num_samples": CODE_EVAL_NUM_SAMPLES,
+    "code_eval_temperature": CODE_EVAL_TEMPERATURE,
+    "code_eval_top_p": CODE_EVAL_TOP_P,
     "lambda_damp": LAMBDA_DAMP,
     "train_grad_seed": TRAIN_GRAD_SEED,
     "device": str(DEVICE),
     "batch_history_fingerprint": batch_history_fingerprint,
+    "train_domain": training_domain,
+    "test_domain": test_domain,
 }
 
 results_path, reusing_results_dir, results_config_fingerprint = resolve_results_dir(
@@ -413,7 +508,8 @@ RESULTS_CONFIG["results_config_fingerprint"] = results_config_fingerprint
 CACHE_CONFIG = {
     "model_id": MODEL_ID,
     "output_dir": os.path.abspath(OUTPUT_DIR),
-    "influence_mode": INFLUENCE_MODE,
+    "influence_mode": effective_influence_mode,
+    "experiment_mode": EXPERIMENT_MODE,
     "enable_grad_cache": ENABLE_GRAD_CACHE,
     "learning_rate": LEARNING_RATE,
     "max_steps": MAX_STEPS,
@@ -427,14 +523,22 @@ CACHE_CONFIG = {
     "generation_batch_size": GENERATION_BATCH_SIZE,
     "n_math": N_MATH,
     "n_code": N_CODE,
+    "n_code_train": N_CODE_TRAIN,
     "n_train_replay": N_TRAIN_REPLAY,
+    "code_train_split": CODE_TRAIN_SPLIT,
     "math_eval_split": MATH_EVAL_SPLIT,
     "math_eval_percent": MATH_EVAL_PERCENT,
     "code_eval_split": CODE_EVAL_SPLIT,
     "code_eval_percent": CODE_EVAL_PERCENT,
     "eval_max_new_tokens": EVAL_MAX_NEW_TOKENS,
+    "code_eval_do_sample": CODE_EVAL_DO_SAMPLE,
+    "code_eval_num_samples": CODE_EVAL_NUM_SAMPLES,
+    "code_eval_temperature": CODE_EVAL_TEMPERATURE,
+    "code_eval_top_p": CODE_EVAL_TOP_P,
     "train_grad_seed": TRAIN_GRAD_SEED,
     "batch_history_fingerprint": batch_history_fingerprint,
+    "train_domain": training_domain,
+    "test_domain": test_domain,
 }
 
 CACHE_FINGERPRINT = build_cache_fingerprint(CACHE_CONFIG)
@@ -447,24 +551,28 @@ def _run_replay():
         tokenizer,
         checkpoint_schedule,
         test_dataset,
-        train_dataset,
+        replay_train_dataset,
         DEVICE,
-        reward_fn_builder=build_math_reward_fns,
+        reward_fn_builder=replay_reward_fn_builder,
         G=G_TRAIN,
         enable_vllm=False,
         test_limit=len(test_dataset),
-        train_limit=min(N_TRAIN_REPLAY, len(train_dataset)),
+        train_limit=min(N_TRAIN_REPLAY, len(replay_train_dataset)),
         include_debug=False,
         base_seed=TRAIN_GRAD_SEED,
         test_reward_fn_builder=build_code_reward_fns,
         test_G=G_TEST,
         epsilon=GRPO_EPSILON,
         beta=GRPO_BETA,
-        influence_mode=INFLUENCE_MODE,
+        influence_mode=effective_influence_mode,
         train_step_weight_lookup=batch_weight_lookup,
         math_eval_dataset=math_eval_dataset,
         code_eval_dataset=code_eval_dataset,
         eval_max_new_tokens=EVAL_MAX_NEW_TOKENS,
+        code_eval_do_sample=CODE_EVAL_DO_SAMPLE,
+        code_eval_num_samples=CODE_EVAL_NUM_SAMPLES,
+        code_eval_temperature=CODE_EVAL_TEMPERATURE,
+        code_eval_top_p=CODE_EVAL_TOP_P,
     )
     elapsed = time.time() - t0
     print(f"\nTrajectory replay completed in {elapsed:.1f}s")
