@@ -7,10 +7,15 @@ from peft import load_peft_weights, set_peft_model_state_dict
 
 from .eval import evaluate_code_dataset, evaluate_math_dataset
 from .gradients import (
-    GEOMETRY_FEATURE_NONE,
-    GRADIENT_OBJECTIVE_GRPO_TRAIN,
     compute_policy_gradient_bundle,
     compute_sft_gradient,
+)
+from .modes import (
+    CodeEvalConfig,
+    GeometryFeatureMode,
+    GradientObjective,
+    InfluenceMode,
+    ReplayGradientConfig,
 )
 from .utils import clear_cache
 
@@ -172,8 +177,8 @@ def collect_reward_infos(
     ref_model=None,
     sample_weight_lookup=None,
     sample_index_key=None,
-    gradient_objective_mode=GRADIENT_OBJECTIVE_GRPO_TRAIN,
-    geometry_feature_mode=GEOMETRY_FEATURE_NONE,
+    gradient_objective_mode=GradientObjective.GRPO_TRAIN,
+    geometry_feature_mode=GeometryFeatureMode.NONE,
     progress=False,
     progress_prefix="",
 ):
@@ -255,8 +260,8 @@ def collect_train_infos(
     beta=0.0,
     ref_model=None,
     sample_weight_lookup=None,
-    gradient_objective_mode=GRADIENT_OBJECTIVE_GRPO_TRAIN,
-    geometry_feature_mode=GEOMETRY_FEATURE_NONE,
+    gradient_objective_mode=GradientObjective.GRPO_TRAIN,
+    geometry_feature_mode=GeometryFeatureMode.NONE,
     progress=False,
     progress_prefix="",
 ):
@@ -302,7 +307,7 @@ def collect_checkpoint_infos(
     epsilon=0.2,
     beta=0.0,
     ref_model=None,
-    influence_mode="dense",
+    influence_mode=InfluenceMode.DENSE,
     train_step_weight_lookup=None,
     math_eval_dataset=None,
     code_eval_dataset=None,
@@ -311,11 +316,24 @@ def collect_checkpoint_infos(
     code_eval_num_samples=1,
     code_eval_temperature=0.6,
     code_eval_top_p=0.95,
-    train_gradient_objective_mode=GRADIENT_OBJECTIVE_GRPO_TRAIN,
-    test_gradient_objective_mode=GRADIENT_OBJECTIVE_GRPO_TRAIN,
-    train_geometry_feature_mode=GEOMETRY_FEATURE_NONE,
+    train_gradient_objective_mode=GradientObjective.GRPO_TRAIN,
+    test_gradient_objective_mode=GradientObjective.GRPO_TRAIN,
+    train_geometry_feature_mode=GeometryFeatureMode.NONE,
     progress=True,
 ):
+    influence_mode = InfluenceMode.parse(influence_mode)
+    code_eval_config = CodeEvalConfig(
+        do_sample=code_eval_do_sample,
+        num_samples=code_eval_num_samples,
+        temperature=code_eval_temperature,
+        top_p=code_eval_top_p,
+    )
+    replay_gradient_config = ReplayGradientConfig(
+        train_objective=GradientObjective.parse(train_gradient_objective_mode),
+        test_objective=GradientObjective.parse(test_gradient_objective_mode),
+        train_geometry_feature=GeometryFeatureMode.parse(train_geometry_feature_mode),
+    )
+
     checkpoint_infos = []
     checkpoint_count = len(checkpoint_schedule)
 
@@ -350,10 +368,10 @@ def collect_checkpoint_infos(
                 code_eval_dataset,
                 device,
                 max_new_tokens=eval_max_new_tokens,
-                do_sample=code_eval_do_sample,
-                num_samples=code_eval_num_samples,
-                temperature=code_eval_temperature,
-                top_p=code_eval_top_p,
+                do_sample=code_eval_config.do_sample,
+                num_samples=code_eval_config.num_samples,
+                temperature=code_eval_config.temperature,
+                top_p=code_eval_config.top_p,
                 progress=False,
             )
 
@@ -390,7 +408,7 @@ def collect_checkpoint_infos(
                 epsilon=epsilon,
                 beta=beta,
                 ref_model=ref_model,
-                gradient_objective_mode=test_gradient_objective_mode,
+                gradient_objective_mode=replay_gradient_config.test_objective,
                 progress=progress,
                 progress_prefix=f"{prefix} [test]",
             )
@@ -399,7 +417,7 @@ def collect_checkpoint_infos(
         step_weight_info = None
         if train_step_weight_lookup is not None:
             step_weight_info = train_step_weight_lookup.get(int(checkpoint["step"]))
-            if influence_mode == "historical" and step_weight_info is None:
+            if influence_mode == InfluenceMode.HISTORICAL and step_weight_info is None:
                 raise RuntimeError(
                     f"Missing historical batch metadata for checkpoint step {checkpoint['step']}."
                 )
@@ -419,11 +437,11 @@ def collect_checkpoint_infos(
             ref_model=ref_model,
             sample_weight_lookup=(
                 step_weight_info.get("weights")
-                if influence_mode == "historical" and step_weight_info is not None
+                if influence_mode == InfluenceMode.HISTORICAL and step_weight_info is not None
                 else None
             ),
-            gradient_objective_mode=train_gradient_objective_mode,
-            geometry_feature_mode=train_geometry_feature_mode,
+            gradient_objective_mode=replay_gradient_config.train_objective,
+            geometry_feature_mode=replay_gradient_config.train_geometry_feature,
             progress=progress,
             progress_prefix=f"{prefix} [train]",
         )

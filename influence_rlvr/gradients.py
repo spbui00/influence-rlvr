@@ -4,12 +4,8 @@ from contextlib import contextmanager
 import torch
 import torch.nn.functional as F
 
+from .modes import GeometryFeatureMode, GradientObjective
 from .utils import clear_cache, tokenize_prompt, extract_lora_gradients, get_reward_name
-
-GRADIENT_OBJECTIVE_GRPO_TRAIN = "grpo_train"
-GRADIENT_OBJECTIVE_EXPECTED_REWARD = "expected_reward_pg"
-GEOMETRY_FEATURE_NONE = "none"
-GEOMETRY_FEATURE_POLICY_SCORE = "policy_score"
 
 
 def _set_generation_seed(seed):
@@ -236,9 +232,12 @@ def compute_policy_gradient_bundle(
     old_peft_model=None,
     ref_model=None,
     advantage_eps=1e-4,
-    objective_mode=GRADIENT_OBJECTIVE_GRPO_TRAIN,
-    geometry_feature_mode=GEOMETRY_FEATURE_NONE,
+    objective_mode=GradientObjective.GRPO_TRAIN,
+    geometry_feature_mode=GeometryFeatureMode.NONE,
 ):
+    objective_mode = GradientObjective.parse(objective_mode)
+    geometry_feature_mode = GeometryFeatureMode.parse(geometry_feature_mode)
+
     peft_model.eval()
     peft_model.zero_grad()
     sampling_model = _get_sampling_model(peft_model, old_peft_model)
@@ -306,7 +305,7 @@ def compute_policy_gradient_bundle(
         response_mask,
     )
 
-    if objective_mode == GRADIENT_OBJECTIVE_GRPO_TRAIN:
+    if objective_mode == GradientObjective.GRPO_TRAIN:
         objective, advantages, per_token_kl = _compute_grpo_policy_loss(
             total_rewards,
             per_token_logps,
@@ -318,7 +317,7 @@ def compute_policy_gradient_bundle(
             advantage_eps=advantage_eps,
         )
         objective_name = "grpo_policy_loss"
-    elif objective_mode == GRADIENT_OBJECTIVE_EXPECTED_REWARD:
+    elif objective_mode == GradientObjective.EXPECTED_REWARD_PG:
         objective = _compute_expected_reward_policy_loss(total_rewards, sequence_log_probs)
         advantages = total_rewards.detach()
         per_token_kl = torch.zeros_like(per_token_logps)
@@ -327,7 +326,7 @@ def compute_policy_gradient_bundle(
         raise ValueError(f"Unsupported objective_mode={objective_mode!r}.")
 
     geometry_feature = None
-    retain_graph = geometry_feature_mode != GEOMETRY_FEATURE_NONE
+    retain_graph = geometry_feature_mode != GeometryFeatureMode.NONE
     grad_vector = _grad_vector_from_scalar(
         peft_model,
         objective,
@@ -338,7 +337,7 @@ def compute_policy_gradient_bundle(
         context=f"compute_policy_gradient_bundle[{objective_mode}]",
     )
 
-    if geometry_feature_mode == GEOMETRY_FEATURE_POLICY_SCORE:
+    if geometry_feature_mode == GeometryFeatureMode.POLICY_SCORE:
         geometry_scalar = sequence_log_probs.mean()
         geometry_feature = _grad_vector_from_scalar(
             peft_model,
@@ -349,7 +348,7 @@ def compute_policy_gradient_bundle(
             geometry_feature,
             context="compute_policy_gradient_bundle[policy_score]",
         )
-    elif geometry_feature_mode != GEOMETRY_FEATURE_NONE:
+    elif geometry_feature_mode != GeometryFeatureMode.NONE:
         raise ValueError(
             f"Unsupported geometry_feature_mode={geometry_feature_mode!r}."
         )
@@ -508,8 +507,8 @@ def compute_rlvr_gradient(
         old_peft_model=old_peft_model,
         ref_model=ref_model,
         advantage_eps=advantage_eps,
-        objective_mode=GRADIENT_OBJECTIVE_GRPO_TRAIN,
-        geometry_feature_mode=GEOMETRY_FEATURE_NONE,
+        objective_mode=GradientObjective.GRPO_TRAIN,
+        geometry_feature_mode=GeometryFeatureMode.NONE,
     )
     if return_debug:
         return result["grad"], result["debug"]
