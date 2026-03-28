@@ -24,11 +24,31 @@ All artifacts land in a single folder: `outputs/<RUN_NAME>/`.
 Key settings in `main_pipeline.py`:
 
 - `RUN_NAME` — folder name under `outputs/`
+- `MODEL_ID` — default base model, now `Qwen/Qwen2.5-Math-1.5B`
 - `MAX_STEPS` — GRPO training steps
 - `N_MATH` / `N_CODE` — train/test dataset sizes
+- `EXPERIMENT_MODE` — `"math_grpo"`, `"code_grpo"`, or `"base_eval"`
 - `INFLUENCE_MODE` — `"historical"` (default) or `"dense"`
 - `SKIP_TRAINING` — reuse existing checkpoints
 - `RESULTS_REUSE_POLICY` — `"ask"` (default), `"reuse"`, or `"new"`
+- `CODE_EVAL_NUM_SAMPLES` / `CODE_EVAL_TEMPERATURE` / `CODE_EVAL_TOP_P` — sampled code-eval settings for pass@k-style benchmarking
+
+Math training now follows a DeepSeek-R1-style prompt/reward setup:
+
+- no math system prompt
+- reasoning is requested inside `<think></think>`
+- the final answer is requested inside `\boxed{}`
+- held-out math verification uses the same boxed-answer parser as training
+
+## Generalization Study
+
+The intended comparison is:
+
+1. `EXPERIMENT_MODE="base_eval"` to measure checkpoint-0 math/code behavior.
+2. `EXPERIMENT_MODE="math_grpo"` to train only on GSM8K math prompts and evaluate held-out code.
+3. `EXPERIMENT_MODE="code_grpo"` as a matched direct-code baseline under the same GRPO budget.
+
+Evidence of positive math-to-code transfer is a held-out code gain in the `math_grpo` run relative to checkpoint 0, ideally with math also improving at the same time. The `code_grpo` run is the direct-code upper bound for that budget and helps separate cross-domain transfer from the effect of RL on the target domain itself.
 
 ## Analyze
 

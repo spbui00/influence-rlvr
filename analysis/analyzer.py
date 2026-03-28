@@ -106,6 +106,14 @@ class InfluenceAnalyzer:
     def has_training_history(self) -> bool:
         return bool(self.training_log_history)
 
+    @property
+    def train_domain(self) -> str:
+        return str(self.manifest.config.get("train_domain", "Math"))
+
+    @property
+    def test_domain(self) -> str:
+        return str(self.manifest.config.get("test_domain", "Code"))
+
     def matrix(self, method: str) -> np.ndarray:
         key = method.lower()
         if key == "tracin":
@@ -191,8 +199,8 @@ class InfluenceAnalyzer:
             self.test_labels,
             self.train_labels,
             title,
-            "Train samples (Math)",
-            "Test samples (Code)",
+            f"Train samples ({self.train_domain})",
+            f"Test samples ({self.test_domain})",
         )
         output = Path(output_path)
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -306,6 +314,7 @@ class InfluenceAnalyzer:
         lines.append("=" * 60)
         for key in [
             "model_id",
+            "experiment_mode",
             "influence_mode",
             "learning_rate",
             "max_steps",
@@ -319,17 +328,26 @@ class InfluenceAnalyzer:
             "generation_batch_size",
             "n_math",
             "n_code",
+            "n_code_train",
             "n_train_replay",
+            "code_train_split",
             "lambda_damp",
             "batch_history_fingerprint",
             "math_eval_split",
             "math_eval_percent",
             "code_eval_split",
             "code_eval_percent",
+            "code_eval_do_sample",
+            "code_eval_num_samples",
+            "code_eval_temperature",
+            "code_eval_top_p",
+            "train_domain",
+            "test_domain",
         ]:
             lines.append(f"  {key}: {self.manifest.config.get(key)}")
 
         if self.has_eval_metrics and self.manifest.checkpoints:
+            base = self.manifest.checkpoints[0]
             latest = self.manifest.checkpoints[-1]
             lines.append("")
             lines.append("=" * 60)
@@ -344,13 +362,37 @@ class InfluenceAnalyzer:
                     f"count={latest.math_eval.get('count', 0)}"
                 )
             if latest.code_eval is not None:
+                pass_label = latest.code_eval.get("pass_metric", "pass")
+                compile_label = latest.code_eval.get("compile_metric", "compile")
                 lines.append(
                     "  code: "
-                    f"pass={latest.code_eval.get('pass_rate', 0.0):.3f}, "
-                    f"compile={latest.code_eval.get('compile_rate', 0.0):.3f}, "
+                    f"{pass_label}={latest.code_eval.get('pass_rate', 0.0):.3f}, "
+                    f"{compile_label}={latest.code_eval.get('compile_rate', 0.0):.3f}, "
                     f"reward={latest.code_eval.get('mean_reward', 0.0):.3f}, "
                     f"count={latest.code_eval.get('count', 0)}"
                 )
+            if latest.step != base.step:
+                delta_lines = []
+                if base.math_eval is not None and latest.math_eval is not None:
+                    delta_lines.append(
+                        "math exact="
+                        f"{latest.math_eval.get('accuracy_rate', 0.0) - base.math_eval.get('accuracy_rate', 0.0):+.3f}"
+                    )
+                    delta_lines.append(
+                        "math format="
+                        f"{latest.math_eval.get('format_rate', 0.0) - base.math_eval.get('format_rate', 0.0):+.3f}"
+                    )
+                if base.code_eval is not None and latest.code_eval is not None:
+                    delta_lines.append(
+                        f"{latest.code_eval.get('pass_metric', 'code pass')}="
+                        f"{latest.code_eval.get('pass_rate', 0.0) - base.code_eval.get('pass_rate', 0.0):+.3f}"
+                    )
+                    delta_lines.append(
+                        f"{latest.code_eval.get('compile_metric', 'code compile')}="
+                        f"{latest.code_eval.get('compile_rate', 0.0) - base.code_eval.get('compile_rate', 0.0):+.3f}"
+                    )
+                if delta_lines:
+                    lines.append("  delta vs base: " + ", ".join(delta_lines))
 
         m = self.manifest
         if m.training_elapsed_s is not None or m.replay_elapsed_s is not None or m.total_elapsed_s is not None:

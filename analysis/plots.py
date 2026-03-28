@@ -32,6 +32,21 @@ def _history_metric(entries: list[tuple[int, dict[str, object]]], key: str) -> n
     return np.asarray(values, dtype=float)
 
 
+def _reward_component_series(entries: list[tuple[int, dict[str, object]]]) -> dict[str, np.ndarray]:
+    metric_keys = []
+    for _, item in entries:
+        for key in item:
+            if key.startswith("rewards/") and key.endswith("/mean") and key not in metric_keys:
+                metric_keys.append(key)
+
+    series = {}
+    for key in metric_keys:
+        label = key[len("rewards/"):-len("/mean")]
+        label = label.replace("_func", "").replace("_", " ").strip().title()
+        series[label] = _history_metric(entries, key)
+    return series
+
+
 def _plot_sparse_series(
     axis,
     steps: list[int],
@@ -177,6 +192,15 @@ def eval_performance_figure(checkpoints: list[dict[str, object]]):
         if checkpoint.get("code_eval") is not None else np.nan
         for checkpoint in checkpoints
     ]
+    latest_code_eval = next(
+        (checkpoint.get("code_eval") for checkpoint in reversed(checkpoints) if checkpoint.get("code_eval") is not None),
+        None,
+    )
+    pass_label = "Code pass"
+    compile_label = "Code compile"
+    if latest_code_eval is not None:
+        pass_label = str(latest_code_eval.get("pass_metric", pass_label)).replace("_", " ")
+        compile_label = str(latest_code_eval.get("compile_metric", compile_label)).replace("_", " ")
 
     axis_math.plot(steps, math_accuracy, marker="o", linewidth=1.5, label="Math exact")
     axis_math.plot(steps, math_format, marker="s", linewidth=1.5, label="Math format")
@@ -186,13 +210,55 @@ def eval_performance_figure(checkpoints: list[dict[str, object]]):
     axis_math.set_title("Held-out math performance")
     axis_math.legend(fontsize=8)
 
-    axis_code.plot(steps, code_pass, marker="o", linewidth=1.5, label="Code pass")
-    axis_code.plot(steps, code_compile, marker="s", linewidth=1.5, label="Code compile")
+    axis_code.plot(steps, code_pass, marker="o", linewidth=1.5, label=pass_label)
+    axis_code.plot(steps, code_compile, marker="s", linewidth=1.5, label=compile_label)
     axis_code.set_ylim(-0.02, 1.02)
     axis_code.set_xlabel("Checkpoint step")
     axis_code.set_ylabel("Rate")
     axis_code.set_title("Held-out code performance")
     axis_code.legend(fontsize=8)
+
+    if len(steps) > 1 and np.isfinite(math_accuracy[0]) and np.isfinite(math_accuracy[-1]):
+        math_delta = math_accuracy[-1] - math_accuracy[0]
+        format_delta = (
+            math_format[-1] - math_format[0]
+            if np.isfinite(math_format[0]) and np.isfinite(math_format[-1])
+            else np.nan
+        )
+        axis_math.text(
+            0.02,
+            0.04,
+            (
+                f"Delta exact: {math_delta:+.3f}\n"
+                f"Delta format: {format_delta:+.3f}"
+                if np.isfinite(format_delta)
+                else f"Delta exact: {math_delta:+.3f}"
+            ),
+            transform=axis_math.transAxes,
+            fontsize=8,
+            va="bottom",
+        )
+
+    if len(steps) > 1 and np.isfinite(code_pass[0]) and np.isfinite(code_pass[-1]):
+        code_delta = code_pass[-1] - code_pass[0]
+        compile_delta = (
+            code_compile[-1] - code_compile[0]
+            if np.isfinite(code_compile[0]) and np.isfinite(code_compile[-1])
+            else np.nan
+        )
+        axis_code.text(
+            0.02,
+            0.04,
+            (
+                f"Delta {pass_label}: {code_delta:+.3f}\n"
+                f"Delta {compile_label}: {compile_delta:+.3f}"
+                if np.isfinite(compile_delta)
+                else f"Delta {pass_label}: {code_delta:+.3f}"
+            ),
+            transform=axis_code.transAxes,
+            fontsize=8,
+            va="bottom",
+        )
 
     fig.tight_layout()
     return fig
@@ -212,8 +278,7 @@ def training_curves_figure(log_history: list[dict[str, object]]):
     loss = _history_metric(entries, "loss")
     reward = _history_metric(entries, "reward")
     reward_std = _history_metric(entries, "reward_std")
-    reward_accuracy = _history_metric(entries, "rewards/accuracy_reward_func/mean")
-    reward_format = _history_metric(entries, "rewards/format_reward_func/mean")
+    reward_components = _reward_component_series(entries)
     grad_norm = _history_metric(entries, "grad_norm")
     kl = _history_metric(entries, "kl")
 
@@ -248,26 +313,24 @@ def training_curves_figure(log_history: list[dict[str, object]]):
     axis_reward.set_ylabel("Value")
     axis_reward.legend(fontsize=8)
 
-    _plot_sparse_series(
-        axis_components,
-        steps,
-        reward_accuracy,
-        label="Accuracy reward",
-        color="purple",
-    )
-    _plot_sparse_series(
-        axis_components,
-        steps,
-        reward_format,
-        label="Format reward",
-        color="brown",
-    )
+    component_colors = ["purple", "brown", "teal", "darkgoldenrod"]
+    for (label, values), color in zip(reward_components.items(), component_colors):
+        _plot_sparse_series(
+            axis_components,
+            steps,
+            values,
+            label=label,
+            color=color,
+        )
     axis_components.set_title("Reward components")
     axis_components.set_xlabel("Training step")
     axis_components.set_ylabel("Mean reward")
     axis_components.set_ylim(-0.02, 1.02)
     axis_components.axhline(0, color="grey", linewidth=0.5)
-    axis_components.legend(fontsize=8)
+    if reward_components:
+        axis_components.legend(fontsize=8)
+    else:
+        axis_components.text(0.5, 0.5, "No reward component logs found.", ha="center", va="center")
 
     axis_opt.plot(steps, grad_norm, color="coral", linewidth=1.5, label="Grad norm")
     axis_opt.set_title("Optimization stats")
