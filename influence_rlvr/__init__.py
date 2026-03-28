@@ -5,10 +5,20 @@ from .attribution import (
     DataInfInfluence,
     TrajectoryTracInInfluence,
     TrajectoryDataInfInfluence,
+    FisherInfluence,
+    TrajectoryFisherInfluence,
     PBRFInfluence,
     RepSimInfluence,
 )
-from .gradients import compute_sft_gradient, compute_rlvr_gradient
+from .gradients import (
+    GEOMETRY_FEATURE_NONE,
+    GEOMETRY_FEATURE_POLICY_SCORE,
+    GRADIENT_OBJECTIVE_EXPECTED_REWARD,
+    GRADIENT_OBJECTIVE_GRPO_TRAIN,
+    compute_policy_gradient_bundle,
+    compute_sft_gradient,
+    compute_rlvr_gradient,
+)
 from .eval import evaluate_math_dataset, evaluate_code_dataset
 from .rewards import (
     format_reward_func,
@@ -36,10 +46,17 @@ __all__ = [
     "InfluenceCalculator",
     "TracInInfluence",
     "DataInfInfluence",
+    "FisherInfluence",
     "TrajectoryTracInInfluence",
     "TrajectoryDataInfInfluence",
+    "TrajectoryFisherInfluence",
     "PBRFInfluence",
     "RepSimInfluence",
+    "GRADIENT_OBJECTIVE_GRPO_TRAIN",
+    "GRADIENT_OBJECTIVE_EXPECTED_REWARD",
+    "GEOMETRY_FEATURE_NONE",
+    "GEOMETRY_FEATURE_POLICY_SCORE",
+    "compute_policy_gradient_bundle",
     "compute_sft_gradient",
     "compute_rlvr_gradient",
     "evaluate_math_dataset",

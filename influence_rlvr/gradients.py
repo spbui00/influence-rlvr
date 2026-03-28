@@ -6,6 +6,11 @@ import torch.nn.functional as F
 
 from .utils import clear_cache, tokenize_prompt, extract_lora_gradients, get_reward_name
 
+GRADIENT_OBJECTIVE_GRPO_TRAIN = "grpo_train"
+GRADIENT_OBJECTIVE_EXPECTED_REWARD = "expected_reward_pg"
+GEOMETRY_FEATURE_NONE = "none"
+GEOMETRY_FEATURE_POLICY_SCORE = "policy_score"
+
 
 def _set_generation_seed(seed):
     if seed is None:
@@ -81,6 +86,302 @@ def _compute_per_token_logps(model, prompt_ids, prompt_attention_mask, response_
     log_probs = F.log_softmax(completion_logits, dim=-1)
     per_token_logps = log_probs.gather(2, response_ids.unsqueeze(-1)).squeeze(-1)
     return per_token_logps
+
+
+def _lora_trainable_params(peft_model):
+    return [
+        param
+        for _, param in peft_model.named_parameters()
+        if param.requires_grad
+    ]
+
+
+def _grad_vector_from_scalar(peft_model, scalar, *, retain_graph=False):
+    params = _lora_trainable_params(peft_model)
+    grads = torch.autograd.grad(
+        scalar,
+        params,
+        retain_graph=retain_graph,
+        allow_unused=True,
+    )
+    flat_grads = []
+    for param, grad in zip(params, grads):
+        if grad is None:
+            flat_grads.append(torch.zeros_like(param, dtype=torch.float32).view(-1).cpu())
+        else:
+            flat_grads.append(grad.detach().float().view(-1).cpu().clone())
+    if not flat_grads:
+        raise RuntimeError("No LoRA gradients were found for the requested scalar objective.")
+    return torch.cat(flat_grads)
+
+
+def _sanitize_grad_vector(grad_vector, *, context):
+    if torch.isfinite(grad_vector).all():
+        return grad_vector
+    n_bad = int((~torch.isfinite(grad_vector)).sum().item())
+    warnings.warn(
+        f"{context}: {n_bad}/{grad_vector.numel()} non-finite gradient entries detected. "
+        "Replacing with zeros.",
+        stacklevel=2,
+    )
+    return torch.nan_to_num(grad_vector, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _generate_response_texts(
+    sampling_model,
+    tokenizer,
+    prompt_ids,
+    prompt_attention_mask,
+    *,
+    G,
+    max_new_tokens,
+    temperature,
+    top_p,
+):
+    prompt_len = prompt_ids.shape[1]
+    with torch.no_grad():
+        generated = sampling_model.generate(
+            input_ids=prompt_ids.repeat(G, 1),
+            attention_mask=prompt_attention_mask.repeat(G, 1),
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=temperature,
+            top_p=top_p,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+
+    response_texts = []
+    for i in range(G):
+        gen_ids = generated[i, prompt_len:]
+        response_texts.append(tokenizer.decode(gen_ids, skip_special_tokens=True))
+    return response_texts
+
+
+def _evaluate_rewards(reward_funcs, completions_trl, device):
+    total_rewards = torch.zeros(len(completions_trl), device=device)
+    reward_breakdown = {}
+    for reward_fn in reward_funcs:
+        scores = reward_fn(completions_trl)
+        reward_breakdown[get_reward_name(reward_fn)] = [float(score) for score in scores]
+        total_rewards += torch.tensor(scores, device=device, dtype=torch.float32)
+    return total_rewards, reward_breakdown
+
+
+def _sequence_log_stats(per_token_logps, response_mask):
+    token_mask = response_mask.float()
+    token_counts = token_mask.sum(dim=1).clamp(min=1.0)
+    sequence_log_probs = (per_token_logps * token_mask).sum(dim=1)
+    mean_sequence_log_probs = sequence_log_probs / token_counts
+    return token_mask, token_counts, sequence_log_probs, mean_sequence_log_probs
+
+
+def _compute_grpo_policy_loss(
+    total_rewards,
+    per_token_logps,
+    old_per_token_logps,
+    response_mask,
+    *,
+    epsilon,
+    beta,
+    ref_per_token_logps=None,
+    advantage_eps=1e-4,
+):
+    advantages = (total_rewards - total_rewards.mean()) / (total_rewards.std() + advantage_eps)
+    log_ratio = per_token_logps - old_per_token_logps
+    log_ratio = torch.nan_to_num(log_ratio, nan=0.0)
+    log_ratio = torch.clamp(log_ratio, -20.0, 20.0)
+    ratios = torch.exp(log_ratio)
+    clipped_ratios = torch.clamp(ratios, 1 - epsilon, 1 + epsilon)
+
+    advantages = advantages.unsqueeze(1)
+    per_token_objective_1 = ratios * advantages
+    per_token_objective_2 = clipped_ratios * advantages
+    per_token_objective = torch.min(per_token_objective_1, per_token_objective_2)
+
+    per_token_kl = torch.zeros_like(per_token_logps)
+    if beta != 0.0:
+        if ref_per_token_logps is None:
+            raise ValueError("A reference policy is required when beta is non-zero.")
+        ref_log_diff = ref_per_token_logps - per_token_logps
+        per_token_kl = torch.exp(ref_log_diff) - ref_log_diff - 1.0
+
+    token_mask, token_counts, _, _ = _sequence_log_stats(per_token_logps, response_mask)
+    per_sequence_objective = (
+        (per_token_objective - beta * per_token_kl) * token_mask
+    ).sum(dim=1) / token_counts
+    policy_loss = -per_sequence_objective.mean()
+    return policy_loss, advantages.squeeze(1), per_token_kl
+
+
+def _compute_expected_reward_policy_loss(total_rewards, sequence_log_probs):
+    return -(total_rewards.detach() * sequence_log_probs).mean()
+
+
+def compute_policy_gradient_bundle(
+    peft_model,
+    tokenizer,
+    prompt,
+    reward_funcs,
+    *,
+    G=4,
+    device="cpu",
+    enable_vllm=False,
+    max_new_tokens=256,
+    temperature=0.7,
+    top_p=0.9,
+    seed=None,
+    epsilon=0.2,
+    beta=0.0,
+    old_peft_model=None,
+    ref_model=None,
+    advantage_eps=1e-4,
+    objective_mode=GRADIENT_OBJECTIVE_GRPO_TRAIN,
+    geometry_feature_mode=GEOMETRY_FEATURE_NONE,
+):
+    peft_model.eval()
+    peft_model.zero_grad()
+    sampling_model = _get_sampling_model(peft_model, old_peft_model)
+    sampling_model.eval()
+    if old_peft_model is not None:
+        old_peft_model.eval()
+    if ref_model is not None:
+        ref_model.eval()
+
+    prompt_text, prompt_ids, prompt_attention_mask = tokenize_prompt(tokenizer, prompt, device)
+
+    if enable_vllm:
+        raise NotImplementedError(
+            "vLLM generation backend is not yet implemented. "
+            "Set enable_vllm=False to use standard HF generate()."
+        )
+
+    _set_generation_seed(seed)
+    response_texts = _generate_response_texts(
+        sampling_model,
+        tokenizer,
+        prompt_ids,
+        prompt_attention_mask,
+        G=G,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+    )
+    completions_trl = [[{"role": "assistant", "content": text}] for text in response_texts]
+    total_rewards, reward_breakdown = _evaluate_rewards(reward_funcs, completions_trl, device)
+
+    response_ids, response_mask = _tokenize_responses(tokenizer, response_texts, device)
+    per_token_logps = _compute_per_token_logps(
+        peft_model,
+        prompt_ids,
+        prompt_attention_mask,
+        response_ids,
+        response_mask,
+    )
+    if old_peft_model is None:
+        old_per_token_logps = per_token_logps.detach()
+    else:
+        old_per_token_logps = _compute_old_per_token_logps(
+            peft_model,
+            old_peft_model,
+            prompt_ids,
+            prompt_attention_mask,
+            response_ids,
+            response_mask,
+        )
+
+    ref_per_token_logps = None
+    if beta != 0.0:
+        ref_per_token_logps = _compute_ref_per_token_logps(
+            peft_model,
+            ref_model,
+            prompt_ids,
+            prompt_attention_mask,
+            response_ids,
+            response_mask,
+        )
+
+    token_mask, token_counts, sequence_log_probs, mean_sequence_log_probs = _sequence_log_stats(
+        per_token_logps,
+        response_mask,
+    )
+
+    if objective_mode == GRADIENT_OBJECTIVE_GRPO_TRAIN:
+        objective, advantages, per_token_kl = _compute_grpo_policy_loss(
+            total_rewards,
+            per_token_logps,
+            old_per_token_logps,
+            response_mask,
+            epsilon=epsilon,
+            beta=beta,
+            ref_per_token_logps=ref_per_token_logps,
+            advantage_eps=advantage_eps,
+        )
+        objective_name = "grpo_policy_loss"
+    elif objective_mode == GRADIENT_OBJECTIVE_EXPECTED_REWARD:
+        objective = _compute_expected_reward_policy_loss(total_rewards, sequence_log_probs)
+        advantages = total_rewards.detach()
+        per_token_kl = torch.zeros_like(per_token_logps)
+        objective_name = "expected_reward_pg_loss"
+    else:
+        raise ValueError(f"Unsupported objective_mode={objective_mode!r}.")
+
+    geometry_feature = None
+    retain_graph = geometry_feature_mode != GEOMETRY_FEATURE_NONE
+    grad_vector = _grad_vector_from_scalar(
+        peft_model,
+        objective,
+        retain_graph=retain_graph,
+    )
+    grad_vector = _sanitize_grad_vector(
+        grad_vector,
+        context=f"compute_policy_gradient_bundle[{objective_mode}]",
+    )
+
+    if geometry_feature_mode == GEOMETRY_FEATURE_POLICY_SCORE:
+        geometry_scalar = sequence_log_probs.mean()
+        geometry_feature = _grad_vector_from_scalar(
+            peft_model,
+            geometry_scalar,
+            retain_graph=False,
+        )
+        geometry_feature = _sanitize_grad_vector(
+            geometry_feature,
+            context="compute_policy_gradient_bundle[policy_score]",
+        )
+    elif geometry_feature_mode != GEOMETRY_FEATURE_NONE:
+        raise ValueError(
+            f"Unsupported geometry_feature_mode={geometry_feature_mode!r}."
+        )
+
+    debug_info = {
+        "prompt_text": prompt_text,
+        "responses": response_texts,
+        "reward_breakdown": reward_breakdown,
+        "total_rewards": total_rewards.detach().cpu().tolist(),
+        "advantages": advantages.detach().cpu().tolist(),
+        "log_probs": sequence_log_probs.detach().float().cpu().tolist(),
+        "sequence_log_probs": sequence_log_probs.detach().float().cpu().tolist(),
+        "mean_sequence_log_probs": mean_sequence_log_probs.detach().float().cpu().tolist(),
+        "policy_loss": float(objective.detach().float().cpu()),
+        "mean_kl": float(((per_token_kl * token_mask).sum(dim=1) / token_counts).mean().detach().cpu()),
+        "epsilon": epsilon,
+        "beta": beta,
+        "seed": seed,
+        "objective_mode": objective_mode,
+        "objective_name": objective_name,
+        "geometry_feature_mode": geometry_feature_mode,
+    }
+    if geometry_feature is not None:
+        debug_info["geometry_feature_norm"] = float(geometry_feature.norm().item())
+
+    del per_token_logps, old_per_token_logps, objective
+    clear_cache(device)
+    return {
+        "grad": grad_vector,
+        "geometry_feature": geometry_feature,
+        "debug": debug_info,
+    }
 
 
 def _compute_old_per_token_logps(
@@ -190,139 +491,26 @@ def compute_rlvr_gradient(
     ref_model=None,
     advantage_eps=1e-4,
 ):
-    peft_model.eval()
-    peft_model.zero_grad()
-    sampling_model = _get_sampling_model(peft_model, old_peft_model)
-    sampling_model.eval()
-    if old_peft_model is not None:
-        old_peft_model.eval()
-    if ref_model is not None:
-        ref_model.eval()
-
-    prompt_text, prompt_ids, prompt_attention_mask = tokenize_prompt(tokenizer, prompt, device)
-    prompt_len = prompt_ids.shape[1]
-
-    if enable_vllm:
-        raise NotImplementedError(
-            "vLLM generation backend is not yet implemented. "
-            "Set enable_vllm=False to use standard HF generate()."
-        )
-
-    _set_generation_seed(seed)
-
-    with torch.no_grad():
-        generated = sampling_model.generate(
-            input_ids=prompt_ids.repeat(G, 1),
-            attention_mask=prompt_attention_mask.repeat(G, 1),
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-            temperature=temperature,
-            top_p=top_p,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-        )
-
-    response_texts = []
-    for i in range(G):
-        gen_ids = generated[i, prompt_len:]
-        response_texts.append(tokenizer.decode(gen_ids, skip_special_tokens=True))
-
-    completions_trl = [[{"role": "assistant", "content": t}] for t in response_texts]
-
-    total_rewards = torch.zeros(G, device=device)
-    reward_breakdown = {}
-    for reward_fn in reward_funcs:
-        scores = reward_fn(completions_trl)
-        reward_breakdown[get_reward_name(reward_fn)] = [float(s) for s in scores]
-        total_rewards += torch.tensor(scores, device=device, dtype=torch.float32)
-
-    advantages = (total_rewards - total_rewards.mean()) / (total_rewards.std() + advantage_eps)
-    sequence_advantages = advantages.detach().cpu().tolist()
-
-    response_ids, response_mask = _tokenize_responses(tokenizer, response_texts, device)
-    per_token_logps = _compute_per_token_logps(
+    result = compute_policy_gradient_bundle(
         peft_model,
-        prompt_ids,
-        prompt_attention_mask,
-        response_ids,
-        response_mask,
+        tokenizer,
+        prompt,
+        reward_funcs,
+        G=G,
+        device=device,
+        enable_vllm=enable_vllm,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        seed=seed,
+        epsilon=epsilon,
+        beta=beta,
+        old_peft_model=old_peft_model,
+        ref_model=ref_model,
+        advantage_eps=advantage_eps,
+        objective_mode=GRADIENT_OBJECTIVE_GRPO_TRAIN,
+        geometry_feature_mode=GEOMETRY_FEATURE_NONE,
     )
-    if old_peft_model is None:
-        old_per_token_logps = per_token_logps.detach()
-    else:
-        old_per_token_logps = _compute_old_per_token_logps(
-            peft_model,
-            old_peft_model,
-            prompt_ids,
-            prompt_attention_mask,
-            response_ids,
-            response_mask,
-        )
-
-    log_ratio = per_token_logps - old_per_token_logps
-    log_ratio = torch.nan_to_num(log_ratio, nan=0.0)
-    log_ratio = torch.clamp(log_ratio, -20.0, 20.0)
-    ratios = torch.exp(log_ratio)
-    clipped_ratios = torch.clamp(ratios, 1 - epsilon, 1 + epsilon)
-
-    advantages = advantages.unsqueeze(1)
-    per_token_objective_1 = ratios * advantages
-    per_token_objective_2 = clipped_ratios * advantages
-    per_token_objective = torch.min(per_token_objective_1, per_token_objective_2)
-
-    ref_per_token_logps = None
-    per_token_kl = torch.zeros_like(per_token_logps)
-    if beta != 0.0:
-        ref_per_token_logps = _compute_ref_per_token_logps(
-            peft_model,
-            ref_model,
-            prompt_ids,
-            prompt_attention_mask,
-            response_ids,
-            response_mask,
-        )
-        if ref_per_token_logps is None:
-            raise ValueError("A reference policy is required when beta is non-zero.")
-        ref_log_diff = ref_per_token_logps - per_token_logps
-        per_token_kl = torch.exp(ref_log_diff) - ref_log_diff - 1.0
-
-    token_mask = response_mask.float()
-    token_counts = token_mask.sum(dim=1).clamp(min=1.0)
-    per_sequence_objective = (
-        (per_token_objective - beta * per_token_kl) * token_mask
-    ).sum(dim=1) / token_counts
-    policy_loss = -per_sequence_objective.mean()
-    policy_loss.backward()
-
-    grad_vector = extract_lora_gradients(peft_model)
-
-    if not torch.isfinite(grad_vector).all():
-        n_bad = int((~torch.isfinite(grad_vector)).sum().item())
-        warnings.warn(
-            f"compute_rlvr_gradient: {n_bad}/{grad_vector.numel()} non-finite "
-            f"gradient entries detected (seed={seed}). Replacing with zeros.",
-            stacklevel=2,
-        )
-        grad_vector = torch.nan_to_num(grad_vector, nan=0.0, posinf=0.0, neginf=0.0)
-
-    debug_info = {
-        "prompt_text": prompt_text,
-        "responses": response_texts,
-        "reward_breakdown": reward_breakdown,
-        "total_rewards": total_rewards.detach().cpu().tolist(),
-        "advantages": sequence_advantages,
-        "log_probs": (per_token_logps * token_mask).sum(dim=1).detach().float().cpu().tolist(),
-        "sequence_log_probs": (per_token_logps * token_mask).sum(dim=1).detach().float().cpu().tolist(),
-        "policy_loss": float(policy_loss.detach().float().cpu()),
-        "mean_kl": float(((per_token_kl * token_mask).sum(dim=1) / token_counts).mean().detach().cpu()),
-        "epsilon": epsilon,
-        "beta": beta,
-        "seed": seed,
-    }
-
-    del generated, per_token_logps, old_per_token_logps, policy_loss
-    clear_cache(device)
-
     if return_debug:
-        return grad_vector, debug_info
-    return grad_vector
+        return result["grad"], result["debug"]
+    return result["grad"]
