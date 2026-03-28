@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import torch
 
 from .schema import (
     DATAINF_MATRIX_FILE,
@@ -565,6 +564,8 @@ def load_grad_cache(
     cache_dir: str | Path,
     expected_fingerprint: str,
 ) -> tuple[list[dict[str, Any]] | None, str | None]:
+    import torch
+
     manifest = _load_grad_cache_manifest(cache_dir)
     if manifest.fingerprint != expected_fingerprint:
         return None, manifest.fingerprint
