@@ -147,7 +147,6 @@ def collect_test_infos(
             ).strip(),
             progress,
         )
-        clear_cache(device)
 
     return test_infos
 
@@ -228,7 +227,6 @@ def collect_reward_infos(
             ).strip(),
             progress,
         )
-        clear_cache(device)
 
     return reward_infos, zero_cases
 
