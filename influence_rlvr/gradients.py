@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from .modes import GeometryFeatureMode, GradientObjective
-from .utils import clear_cache, tokenize_prompt, extract_lora_gradients, get_reward_name
+from .utils import tokenize_prompt, extract_lora_gradients, get_reward_name
 
 
 def _set_generation_seed(seed):
@@ -76,7 +76,7 @@ def _compute_per_token_logps(model, prompt_ids, prompt_attention_mask, response_
     input_ids = torch.cat([prompt_batch, response_ids], dim=1)
     attention_mask = torch.cat([prompt_mask_batch, response_mask], dim=1)
 
-    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
     prompt_len = prompt_ids.shape[1]
     completion_logits = outputs.logits[:, prompt_len - 1:prompt_len - 1 + response_ids.shape[1], :]
     log_probs = F.log_softmax(completion_logits, dim=-1)
@@ -103,12 +103,12 @@ def _grad_vector_from_scalar(peft_model, scalar, *, retain_graph=False):
     flat_grads = []
     for param, grad in zip(params, grads):
         if grad is None:
-            flat_grads.append(torch.zeros_like(param, dtype=torch.float32).view(-1).cpu())
+            flat_grads.append(torch.zeros(param.numel(), dtype=torch.float32, device=param.device))
         else:
-            flat_grads.append(grad.detach().float().view(-1).cpu().clone())
+            flat_grads.append(grad.detach().to(dtype=torch.float32).reshape(-1))
     if not flat_grads:
         raise RuntimeError("No LoRA gradients were found for the requested scalar objective.")
-    return torch.cat(flat_grads)
+    return torch.cat(flat_grads).cpu()
 
 
 def _sanitize_grad_vector(grad_vector, *, context):
@@ -135,7 +135,7 @@ def _generate_response_texts(
     top_p,
 ):
     prompt_len = prompt_ids.shape[1]
-    with torch.no_grad():
+    with torch.inference_mode():
         generated = sampling_model.generate(
             input_ids=prompt_ids.repeat(G, 1),
             attention_mask=prompt_attention_mask.repeat(G, 1),
@@ -375,7 +375,6 @@ def compute_policy_gradient_bundle(
         debug_info["geometry_feature_norm"] = float(geometry_feature.norm().item())
 
     del per_token_logps, old_per_token_logps, objective
-    clear_cache(device)
     return {
         "grad": grad_vector,
         "geometry_feature": geometry_feature,
@@ -474,7 +473,6 @@ def compute_sft_gradient(peft_model, tokenizer, prompt, target, device):
     outputs.loss.backward()
 
     grad_vector = extract_lora_gradients(peft_model)
-    clear_cache(device)
     return grad_vector
 
 

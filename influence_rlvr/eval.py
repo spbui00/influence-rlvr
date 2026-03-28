@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 from .rewards import accuracy_reward_func, format_reward_func, mbpp_execution_reward_func
-from .utils import clear_cache, tokenize_prompt
+from .utils import tokenize_prompt
 
 
 def _generate_completions(
@@ -29,7 +29,7 @@ def _generate_completions(
 
     peft_model.eval()
     _, prompt_ids, prompt_attention_mask = tokenize_prompt(tokenizer, prompt, device)
-    with torch.no_grad():
+    with torch.inference_mode():
         generate_kwargs = {
             "input_ids": prompt_ids,
             "attention_mask": prompt_attention_mask,
@@ -90,7 +90,6 @@ def evaluate_math_dataset(
                 f"| format={format_score:.1f} acc={accuracy_score:.1f}",
                 flush=True,
             )
-        clear_cache(device)
 
     return {
         "count": count,
@@ -155,7 +154,6 @@ def evaluate_code_dataset(
                 f"| best_reward={reward:.3f}",
                 flush=True,
             )
-        clear_cache(device)
 
     pass_metric = "pass@1" if num_samples == 1 else f"pass@{num_samples}"
     compile_metric = (
