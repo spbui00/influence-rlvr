@@ -199,7 +199,6 @@ def collect_reward_infos(
             G=G,
             device=device,
             enable_vllm=enable_vllm,
-            return_debug=include_debug,
             seed=seed,
             epsilon=epsilon,
             beta=beta,
