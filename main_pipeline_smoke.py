@@ -1,6 +1,6 @@
+import sys
 import time
 from functools import partial
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -14,6 +14,8 @@ from analysis import (
     build_batch_history_fingerprint,
     build_batch_weight_lookup,
     load_batch_history,
+    next_results_dir,
+    resolve_results_dir,
     save_results_bundle,
 )
 from influence_rlvr import (
@@ -33,7 +35,6 @@ MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
 RUN_NAME = "smoke"
 RUN_DIR = f"./outputs/{RUN_NAME}"
 OUTPUT_DIR = f"{RUN_DIR}/rlvr-output"
-RESULTS_DIR = f"{RUN_DIR}/results"
 
 LEARNING_RATE = 1e-4
 MAX_STEPS = 2
@@ -57,12 +58,81 @@ CODE_EVAL_PERCENT = 5
 EVAL_MAX_NEW_TOKENS = 128
 INFLUENCE_MODE = "historical"
 SKIP_TRAINING = False
+RESULTS_REUSE_POLICY = "ask"
 
 
 def percent_slice(split_name, percent):
     if percent <= 0:
         return None
     return f"{split_name}[:{percent}%]"
+
+
+def normalize_results_reuse_policy(policy):
+    value = str(policy).strip().lower()
+    if value not in {"ask", "reuse", "new"}:
+        raise ValueError(
+            "Unsupported RESULTS_REUSE_POLICY="
+            f"{policy!r}. Use 'ask', 'reuse', or 'new'."
+        )
+    return value
+
+
+def finalize_results_dir(
+    run_dir,
+    results_path,
+    reusing_results_dir,
+    results_config_fingerprint,
+):
+    if not reusing_results_dir:
+        print(f"Allocating new results directory: {results_path.resolve()}/")
+        return results_path, False, results_config_fingerprint
+
+    if RESULTS_REUSE_POLICY == "reuse":
+        print(
+            "Reusing existing results directory for matching config: "
+            f"{results_path.resolve()}/"
+        )
+        return results_path, True, results_config_fingerprint
+
+    if RESULTS_REUSE_POLICY == "new":
+        new_path = next_results_dir(run_dir)
+        print(
+            "Matching results directory found, but "
+            "RESULTS_REUSE_POLICY='new' so a fresh directory will be used: "
+            f"{new_path.resolve()}/"
+        )
+        return new_path, False, results_config_fingerprint
+
+    if not sys.stdin.isatty():
+        new_path = next_results_dir(run_dir)
+        print(
+            "Matching results directory found, but no interactive terminal is "
+            "available for confirmation. Allocating a fresh results directory: "
+            f"{new_path.resolve()}/"
+        )
+        return new_path, False, results_config_fingerprint
+
+    print(
+        "Warning: matching results directory already exists and rerunning this "
+        f"analysis will overwrite files in {results_path.resolve()}/"
+    )
+    answer = input(
+        "Reuse this results directory? [y]es / [n]ew / [a]bort: "
+    ).strip().lower()
+    if answer in {"y", "yes"}:
+        print(
+            "Reusing existing results directory for matching config: "
+            f"{results_path.resolve()}/"
+        )
+        return results_path, True, results_config_fingerprint
+    if answer in {"", "n", "new", "no"}:
+        new_path = next_results_dir(run_dir)
+        print(f"Allocating new results directory: {new_path.resolve()}/")
+        return new_path, False, results_config_fingerprint
+    raise SystemExit("Aborted to avoid overwriting existing results.")
+
+
+RESULTS_REUSE_POLICY = normalize_results_reuse_policy(RESULTS_REUSE_POLICY)
 
 
 def format_math(example, idx):
@@ -236,7 +306,48 @@ tracin_matrix, tracin_breakdown = trajectory_tracin.compute_matrix(checkpoint_in
 trajectory_datainf = TrajectoryDataInfInfluence(lambda_damp=LAMBDA_DAMP, normalize=False)
 datainf_matrix, datainf_breakdown = trajectory_datainf.compute_matrix(checkpoint_infos, return_breakdown=True)
 
-results_path = Path(RESULTS_DIR)
+results_config = {
+    "model_id": MODEL_ID,
+    "run_name": RUN_NAME,
+    "output_dir": OUTPUT_DIR,
+    "influence_mode": INFLUENCE_MODE,
+    "learning_rate": LEARNING_RATE,
+    "max_steps": MAX_STEPS,
+    "save_steps": SAVE_STEPS,
+    "per_device_batch": PER_DEVICE_BATCH,
+    "grad_accum_steps": GRAD_ACCUM_STEPS,
+    "grpo_beta": GRPO_BETA,
+    "grpo_epsilon": GRPO_EPSILON,
+    "g_train": G_TRAIN,
+    "g_test": G_TEST,
+    "generation_batch_size": GENERATION_BATCH_SIZE,
+    "n_math": N_MATH,
+    "n_code": N_CODE,
+    "n_train_replay": N_TRAIN_REPLAY,
+    "math_eval_split": MATH_EVAL_SPLIT,
+    "math_eval_percent": MATH_EVAL_PERCENT,
+    "code_eval_split": CODE_EVAL_SPLIT,
+    "code_eval_percent": CODE_EVAL_PERCENT,
+    "eval_max_new_tokens": EVAL_MAX_NEW_TOKENS,
+    "lambda_damp": LAMBDA_DAMP,
+    "train_grad_seed": TRAIN_GRAD_SEED,
+    "device": str(DEVICE),
+    "batch_history_fingerprint": batch_history_fingerprint,
+}
+results_path, reusing_results_dir, results_config_fingerprint = resolve_results_dir(
+    RUN_DIR,
+    results_config,
+)
+results_path, reusing_results_dir, results_config_fingerprint = finalize_results_dir(
+    RUN_DIR,
+    results_path,
+    reusing_results_dir,
+    results_config_fingerprint,
+)
+results_config["results_name"] = results_path.name
+results_config["results_dir"] = str(results_path)
+results_config["results_config_fingerprint"] = results_config_fingerprint
+
 save_results_bundle(
     results_path,
     tracin_matrix,
@@ -244,34 +355,7 @@ save_results_bundle(
     tracin_breakdown,
     datainf_breakdown,
     checkpoint_infos,
-    {
-        "model_id": MODEL_ID,
-        "output_dir": OUTPUT_DIR,
-        "results_dir": RESULTS_DIR,
-        "influence_mode": INFLUENCE_MODE,
-        "learning_rate": LEARNING_RATE,
-        "max_steps": MAX_STEPS,
-        "save_steps": SAVE_STEPS,
-        "per_device_batch": PER_DEVICE_BATCH,
-        "grad_accum_steps": GRAD_ACCUM_STEPS,
-        "grpo_beta": GRPO_BETA,
-        "grpo_epsilon": GRPO_EPSILON,
-        "g_train": G_TRAIN,
-        "g_test": G_TEST,
-        "generation_batch_size": GENERATION_BATCH_SIZE,
-        "n_math": N_MATH,
-        "n_code": N_CODE,
-        "n_train_replay": N_TRAIN_REPLAY,
-        "math_eval_split": MATH_EVAL_SPLIT,
-        "math_eval_percent": MATH_EVAL_PERCENT,
-        "code_eval_split": CODE_EVAL_SPLIT,
-        "code_eval_percent": CODE_EVAL_PERCENT,
-        "eval_max_new_tokens": EVAL_MAX_NEW_TOKENS,
-        "lambda_damp": LAMBDA_DAMP,
-        "train_grad_seed": TRAIN_GRAD_SEED,
-        "device": str(DEVICE),
-        "batch_history_fingerprint": batch_history_fingerprint,
-    },
+    results_config,
     total_elapsed_s=time.time() - pipeline_t0,
 )
 

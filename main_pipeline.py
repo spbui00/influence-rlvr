@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 from functools import partial
 from pathlib import Path
@@ -16,6 +17,8 @@ from analysis import (
     build_cache_fingerprint,
     load_batch_history,
     load_grad_cache,
+    next_results_dir,
+    resolve_results_dir,
     save_grad_cache,
     save_results_bundle,
 )
@@ -40,7 +43,6 @@ MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
 RUN_NAME = "run1"
 RUN_DIR = f"./outputs/{RUN_NAME}"
 OUTPUT_DIR = f"{RUN_DIR}/rlvr-output"
-RESULTS_DIR = f"{RUN_DIR}/results"
 
 LEARNING_RATE = 1e-4
 MAX_STEPS = 200
@@ -66,7 +68,7 @@ INFLUENCE_MODE = "historical"
 
 SKIP_TRAINING = False
 ENABLE_GRAD_CACHE = False
-GRAD_CACHE_DIR = f"{RESULTS_DIR}/grad_cache"
+RESULTS_REUSE_POLICY = "ask"
 
 
 def normalize_influence_mode(mode):
@@ -81,6 +83,74 @@ def normalize_influence_mode(mode):
 
 
 INFLUENCE_MODE = normalize_influence_mode(INFLUENCE_MODE)
+
+
+def normalize_results_reuse_policy(policy):
+    value = str(policy).strip().lower()
+    if value not in {"ask", "reuse", "new"}:
+        raise ValueError(
+            "Unsupported RESULTS_REUSE_POLICY="
+            f"{policy!r}. Use 'ask', 'reuse', or 'new'."
+        )
+    return value
+
+
+def finalize_results_dir(
+    run_dir,
+    results_path,
+    reusing_results_dir,
+    results_config_fingerprint,
+):
+    if not reusing_results_dir:
+        print(f"Allocating new results directory: {results_path.resolve()}/")
+        return results_path, False, results_config_fingerprint
+
+    if RESULTS_REUSE_POLICY == "reuse":
+        print(
+            "Reusing existing results directory for matching config: "
+            f"{results_path.resolve()}/"
+        )
+        return results_path, True, results_config_fingerprint
+
+    if RESULTS_REUSE_POLICY == "new":
+        new_path = next_results_dir(run_dir)
+        print(
+            "Matching results directory found, but "
+            "RESULTS_REUSE_POLICY='new' so a fresh directory will be used: "
+            f"{new_path.resolve()}/"
+        )
+        return new_path, False, results_config_fingerprint
+
+    if not sys.stdin.isatty():
+        new_path = next_results_dir(run_dir)
+        print(
+            "Matching results directory found, but no interactive terminal is "
+            "available for confirmation. Allocating a fresh results directory: "
+            f"{new_path.resolve()}/"
+        )
+        return new_path, False, results_config_fingerprint
+
+    print(
+        "Warning: matching results directory already exists and rerunning this "
+        f"analysis will overwrite files in {results_path.resolve()}/"
+    )
+    answer = input(
+        "Reuse this results directory? [y]es / [n]ew / [a]bort: "
+    ).strip().lower()
+    if answer in {"y", "yes"}:
+        print(
+            "Reusing existing results directory for matching config: "
+            f"{results_path.resolve()}/"
+        )
+        return results_path, True, results_config_fingerprint
+    if answer in {"", "n", "new", "no"}:
+        new_path = next_results_dir(run_dir)
+        print(f"Allocating new results directory: {new_path.resolve()}/")
+        return new_path, False, results_config_fingerprint
+    raise SystemExit("Aborted to avoid overwriting existing results.")
+
+
+RESULTS_REUSE_POLICY = normalize_results_reuse_policy(RESULTS_REUSE_POLICY)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Device
@@ -296,8 +366,8 @@ def build_code_reward_fns(sample, num_generations):
 
 RESULTS_CONFIG = {
     "model_id": MODEL_ID,
+    "run_name": RUN_NAME,
     "output_dir": OUTPUT_DIR,
-    "results_dir": RESULTS_DIR,
     "influence_mode": INFLUENCE_MODE,
     "enable_grad_cache": ENABLE_GRAD_CACHE,
     "learning_rate": LEARNING_RATE,
@@ -323,6 +393,22 @@ RESULTS_CONFIG = {
     "device": str(DEVICE),
     "batch_history_fingerprint": batch_history_fingerprint,
 }
+
+results_path, reusing_results_dir, results_config_fingerprint = resolve_results_dir(
+    RUN_DIR,
+    RESULTS_CONFIG,
+)
+results_path, reusing_results_dir, results_config_fingerprint = finalize_results_dir(
+    RUN_DIR,
+    results_path,
+    reusing_results_dir,
+    results_config_fingerprint,
+)
+RESULTS_DIR = str(results_path)
+GRAD_CACHE_DIR = str(results_path / "grad_cache")
+RESULTS_CONFIG["results_name"] = results_path.name
+RESULTS_CONFIG["results_dir"] = RESULTS_DIR
+RESULTS_CONFIG["results_config_fingerprint"] = results_config_fingerprint
 
 CACHE_CONFIG = {
     "model_id": MODEL_ID,
