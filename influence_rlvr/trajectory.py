@@ -6,7 +6,12 @@ import time
 from peft import load_peft_weights, set_peft_model_state_dict
 
 from .eval import evaluate_code_dataset, evaluate_math_dataset
-from .gradients import compute_rlvr_gradient, compute_sft_gradient
+from .gradients import (
+    GEOMETRY_FEATURE_NONE,
+    GRADIENT_OBJECTIVE_GRPO_TRAIN,
+    compute_policy_gradient_bundle,
+    compute_sft_gradient,
+)
 from .utils import clear_cache
 
 
@@ -167,6 +172,8 @@ def collect_reward_infos(
     ref_model=None,
     sample_weight_lookup=None,
     sample_index_key=None,
+    gradient_objective_mode=GRADIENT_OBJECTIVE_GRPO_TRAIN,
+    geometry_feature_mode=GEOMETRY_FEATURE_NONE,
     progress=False,
     progress_prefix="",
 ):
@@ -179,7 +186,7 @@ def collect_reward_infos(
         sample = dataset[idx]
         reward_funcs = reward_fn_builder(sample, G)
         seed = None if seed_base is None else seed_base + idx
-        result = compute_rlvr_gradient(
+        result = compute_policy_gradient_bundle(
             peft_model,
             tokenizer,
             sample["prompt"],
@@ -192,19 +199,21 @@ def collect_reward_infos(
             epsilon=epsilon,
             beta=beta,
             ref_model=ref_model,
+            objective_mode=gradient_objective_mode,
+            geometry_feature_mode=geometry_feature_mode,
         )
 
-        if include_debug:
-            grad, debug = result
-        else:
-            grad = result
-            debug = None
+        grad = result["grad"]
+        debug = result["debug"] if include_debug else None
+        geometry_feature = result.get("geometry_feature")
 
         info = {
             "grad": grad,
             "prompt": sample["prompt"],
             "solution": sample.get("solution"),
         }
+        if geometry_feature is not None:
+            info["geometry_feature"] = geometry_feature
         if sample_index_key is not None:
             sample_index = int(sample.get(sample_index_key, idx))
             info["train_index"] = sample_index
@@ -246,6 +255,8 @@ def collect_train_infos(
     beta=0.0,
     ref_model=None,
     sample_weight_lookup=None,
+    gradient_objective_mode=GRADIENT_OBJECTIVE_GRPO_TRAIN,
+    geometry_feature_mode=GEOMETRY_FEATURE_NONE,
     progress=False,
     progress_prefix="",
 ):
@@ -265,6 +276,8 @@ def collect_train_infos(
         ref_model=ref_model,
         sample_weight_lookup=sample_weight_lookup,
         sample_index_key="train_index",
+        gradient_objective_mode=gradient_objective_mode,
+        geometry_feature_mode=geometry_feature_mode,
         progress=progress,
         progress_prefix=progress_prefix,
     )
@@ -298,6 +311,9 @@ def collect_checkpoint_infos(
     code_eval_num_samples=1,
     code_eval_temperature=0.6,
     code_eval_top_p=0.95,
+    train_gradient_objective_mode=GRADIENT_OBJECTIVE_GRPO_TRAIN,
+    test_gradient_objective_mode=GRADIENT_OBJECTIVE_GRPO_TRAIN,
+    train_geometry_feature_mode=GEOMETRY_FEATURE_NONE,
     progress=True,
 ):
     checkpoint_infos = []
@@ -374,6 +390,7 @@ def collect_checkpoint_infos(
                 epsilon=epsilon,
                 beta=beta,
                 ref_model=ref_model,
+                gradient_objective_mode=test_gradient_objective_mode,
                 progress=progress,
                 progress_prefix=f"{prefix} [test]",
             )
@@ -405,6 +422,8 @@ def collect_checkpoint_infos(
                 if influence_mode == "historical" and step_weight_info is not None
                 else None
             ),
+            gradient_objective_mode=train_gradient_objective_mode,
+            geometry_feature_mode=train_geometry_feature_mode,
             progress=progress,
             progress_prefix=f"{prefix} [train]",
         )
