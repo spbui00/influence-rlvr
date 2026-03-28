@@ -2,16 +2,17 @@ import json
 import re
 import subprocess
 import sys
+from fractions import Fraction
 
-_THINK_ANSWER_PATTERN = re.compile(
-    r"^<think>.*?</think><answer>.*?</answer>$",
-    re.DOTALL | re.IGNORECASE,
-)
+_THINK_OPEN_PATTERN = re.compile(r"^\s*<think>", re.IGNORECASE)
+_THINK_CLOSE_PATTERN = re.compile(r"</think>", re.IGNORECASE)
 _ANSWER_TAG_PATTERN = re.compile(
     r"<answer>(.*?)</answer>",
     re.DOTALL | re.IGNORECASE,
 )
-_NUMBER_PATTERN = re.compile(r"[\d,]+\.?\d*")
+_NUMBER_PATTERN = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?(?:/\d[\d,]*(?:\.\d+)?)?")
+_ASSIGNMENT_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]*=(.+)$")
+_LATEX_FRAC_PATTERN = re.compile(r"\\(?:d?frac)\{([^{}]+)\}\{([^{}]+)\}")
 _CODE_BLOCK_PATTERN = re.compile(
     r"```(?:python)?\s*(.*?)```",
     re.DOTALL | re.IGNORECASE,
@@ -93,6 +94,147 @@ def _extract_answer_tag(text):
     return match.group(1).strip() if match else None
 
 
+def _answer_region_after_think(text):
+    match = _THINK_CLOSE_PATTERN.search(text)
+    if match is None:
+        return text
+    return text[match.end():]
+
+
+def _extract_boxed_answer(text):
+    markers = (r"\boxed{", "boxed{")
+    last_match = None
+    last_index = -1
+    for marker in markers:
+        marker_index = text.rfind(marker)
+        if marker_index > last_index:
+            last_index = marker_index
+            last_match = marker
+    if last_match is None or last_index < 0:
+        return None
+
+    cursor = last_index + len(last_match)
+    depth = 1
+    chars = []
+    while cursor < len(text):
+        char = text[cursor]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return "".join(chars).strip()
+        chars.append(char)
+        cursor += 1
+    return None
+
+
+def _clean_math_answer_text(text):
+    cleaned = str(text).strip()
+    cleaned = cleaned.replace("$", "")
+    cleaned = cleaned.replace("\\left", "")
+    cleaned = cleaned.replace("\\right", "")
+    cleaned = cleaned.replace("\\,", "")
+    cleaned = cleaned.replace(",", "")
+    cleaned = cleaned.rstrip(".。")
+    cleaned = cleaned.strip()
+    if cleaned.startswith("Final answer:"):
+        cleaned = cleaned.split(":", 1)[1].strip()
+    cleaned = cleaned.replace(" ", "")
+    assignment_match = _ASSIGNMENT_PATTERN.fullmatch(cleaned)
+    if assignment_match is not None:
+        cleaned = assignment_match.group(1)
+    return cleaned
+
+
+def _fraction_from_latex(text):
+    match = _LATEX_FRAC_PATTERN.fullmatch(text)
+    if match is None:
+        return None
+    try:
+        numerator = Fraction(match.group(1))
+        denominator = Fraction(match.group(2))
+        if denominator == 0:
+            return None
+        return numerator / denominator
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+def _parse_numeric_answer(text):
+    cleaned = _clean_math_answer_text(text)
+    if not cleaned:
+        return None
+    if cleaned.endswith("%"):
+        try:
+            return Fraction(cleaned[:-1]) / 100
+        except (ValueError, ZeroDivisionError):
+            return None
+    latex_fraction = _fraction_from_latex(cleaned)
+    if latex_fraction is not None:
+        return latex_fraction
+    try:
+        return Fraction(cleaned)
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+def _normalize_symbolic_answer(text):
+    return _clean_math_answer_text(text).lower()
+
+
+def extract_math_final_answer(text):
+    answer_region = _answer_region_after_think(text)
+    boxed_answer = _extract_boxed_answer(answer_region)
+    if boxed_answer is not None:
+        return boxed_answer.strip()
+
+    boxed_answer = _extract_boxed_answer(text)
+    if boxed_answer is not None:
+        return boxed_answer.strip()
+
+    answer_tag = _extract_answer_tag(answer_region)
+    if answer_tag is not None:
+        return answer_tag
+
+    answer_tag = _extract_answer_tag(text)
+    if answer_tag is not None:
+        return answer_tag
+
+    stripped_region = answer_region.strip()
+    if stripped_region:
+        lines = [line.strip() for line in stripped_region.splitlines() if line.strip()]
+        if lines:
+            last_line = lines[-1]
+            if ":" in last_line and last_line.lower().startswith(("answer", "final answer")):
+                return last_line.split(":", 1)[1].strip()
+
+    number_matches = _NUMBER_PATTERN.findall(stripped_region or text)
+    if number_matches:
+        return number_matches[-1]
+    return None
+
+
+def _answers_match(model_answer, true_answer):
+    if model_answer is None:
+        return False
+    model_numeric = _parse_numeric_answer(model_answer)
+    true_numeric = _parse_numeric_answer(true_answer)
+    if model_numeric is not None and true_numeric is not None:
+        return model_numeric == true_numeric
+    return _normalize_symbolic_answer(model_answer) == _normalize_symbolic_answer(true_answer)
+
+
+def _has_r1_reasoning_format(text):
+    stripped = text.strip()
+    if not _THINK_OPEN_PATTERN.match(stripped):
+        return False
+    answer_region = _answer_region_after_think(stripped).strip()
+    if not answer_region:
+        return False
+    return _extract_boxed_answer(answer_region) is not None
+
+
 def _extract_python_code(text):
     fenced = _CODE_BLOCK_PATTERN.search(text)
     if fenced:
@@ -149,23 +291,18 @@ def _run_code_tests(code, test_setup_code, tests, timeout_seconds):
     return execution_result["passed"], True
 
 
-# ── Strict reward functions (binary) ─────────────────────────────────────────
-
 def format_reward_func(completions, **kwargs):
     return [
-        1.0 if _THINK_ANSWER_PATTERN.match(r) else 0.0
-        for r in _extract_responses(completions)
+        1.0 if _has_r1_reasoning_format(response) else 0.0
+        for response in _extract_responses(completions)
     ]
 
 
 def accuracy_reward_func(completions, solution, **kwargs):
     rewards = []
     for response, true_answer in zip(_extract_responses(completions), solution):
-        model_answer = _extract_answer_tag(response)
-        if model_answer is not None and model_answer == true_answer.strip():
-            rewards.append(1.0)
-        else:
-            rewards.append(0.0)
+        model_answer = extract_math_final_answer(response)
+        rewards.append(1.0 if _answers_match(model_answer, true_answer) else 0.0)
     return rewards
 
 
@@ -209,16 +346,18 @@ def mbpp_execution_reward_func(
     return rewards
 
 
-# ── Soft reward functions (partial credit) ────────────────────────────────────
-
-_FORMAT_TAGS = ["<think>", "</think>", "<answer>", "</answer>"]
-
-
 def soft_format_reward_func(completions, **kwargs):
     rewards = []
-    for r in _extract_responses(completions):
-        lower = r.lower()
-        score = sum(0.25 for tag in _FORMAT_TAGS if tag in lower)
+    for response in _extract_responses(completions):
+        stripped = response.strip()
+        score = 0.0
+        if _THINK_OPEN_PATTERN.match(stripped):
+            score += 0.25
+        if _THINK_CLOSE_PATTERN.search(stripped) is not None:
+            score += 0.25
+        answer_region = _answer_region_after_think(stripped)
+        if _extract_boxed_answer(answer_region) is not None:
+            score += 0.5
         rewards.append(score)
     return rewards
 
@@ -226,15 +365,13 @@ def soft_format_reward_func(completions, **kwargs):
 def soft_accuracy_reward_func(completions, solution, **kwargs):
     rewards = []
     for response, true_answer in zip(_extract_responses(completions), solution):
-        true_answer = true_answer.strip()
-
-        model_answer = _extract_answer_tag(response)
-        if model_answer is not None and model_answer == true_answer:
+        model_answer = extract_math_final_answer(response)
+        if _answers_match(model_answer, true_answer):
             rewards.append(1.0)
             continue
 
-        answer_nums = set(_NUMBER_PATTERN.findall(true_answer))
-        response_nums = set(_NUMBER_PATTERN.findall(response))
+        answer_nums = set(_NUMBER_PATTERN.findall(_clean_math_answer_text(true_answer)))
+        response_nums = set(_NUMBER_PATTERN.findall(_clean_math_answer_text(model_answer or response)))
 
         if answer_nums and answer_nums.issubset(response_nums):
             rewards.append(0.5)
