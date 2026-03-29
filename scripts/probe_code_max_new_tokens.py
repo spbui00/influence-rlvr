@@ -53,6 +53,7 @@ def _build_model(model_id: str, device: torch.device):
 
 def _code_row_to_sample(row) -> dict:
     return {
+        "task_text": row["text"],
         "prompt": build_code_prompt(row["text"]),
         "test_list": row["test_list"],
         "test_setup_code": row.get("test_setup_code") or "",
@@ -127,6 +128,26 @@ def main():
     p.add_argument("--temperature", type=float, default=0.6)
     p.add_argument("--top-p", type=float, default=0.95)
     p.add_argument("--seed", type=int, default=1234)
+    p.add_argument(
+        "--show-prompts",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Indices into the first num-prompts MBPP rows: print raw completions (after table).",
+    )
+    p.add_argument(
+        "--show-budget",
+        type=int,
+        default=None,
+        help="max_new_tokens for --show-prompts (default: max of --budgets).",
+    )
+    p.add_argument("--show-samples", type=int, default=1)
+    p.add_argument(
+        "--show-chars",
+        type=int,
+        default=12000,
+        help="Truncate each printed completion to this many characters.",
+    )
     args = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -229,6 +250,56 @@ def main():
         "cmp% / pass% = fraction with MBPP reward > 0 / >= 0.999 (same spirit as evaluate_code_dataset).\n"
         "If cap% is high and code%/cmp% jump at larger budgets, generation was likely truncating."
     )
+
+    if args.show_prompts is not None:
+        show_budget = args.show_budget if args.show_budget is not None else max(args.budgets)
+        print()
+        print("=" * 80)
+        print(
+            f"RAW OUTPUTS (budget={show_budget}, samples={args.show_samples}, "
+            f"truncation={args.show_chars} chars)"
+        )
+        print("=" * 80)
+        for pi in args.show_prompts:
+            if pi < 0 or pi >= n:
+                print(f"\n[skip] show prompt index {pi} out of range [0, {n - 1}]")
+                continue
+            sample = rows[pi]
+            texts, lens = _generate_batch_code(
+                model,
+                tokenizer,
+                sample["prompt"],
+                device,
+                max_new_tokens=show_budget,
+                num_samples=args.show_samples,
+                do_sample=do_sample,
+                temperature=args.temperature,
+                top_p=args.top_p,
+            )
+            for si, (text, li) in enumerate(zip(texts, lens)):
+                completions = [[{"role": "assistant", "content": text}]]
+                rw = mbpp_execution_reward_func(
+                    completions,
+                    test_list=sample["test_list"],
+                    test_setup_code=sample["test_setup_code"],
+                    challenge_test_list=sample["challenge_test_list"],
+                )[0]
+                extracted = _extract_python_code(text) or ""
+                cap_hit = li >= show_budget
+                body = text if len(text) <= args.show_chars else text[: args.show_chars] + "\n... [truncated]"
+                ext_preview = (
+                    extracted
+                    if len(extracted) <= 2000
+                    else extracted[:2000] + "\n... [extracted truncated]"
+                )
+                print(f"\n{'#' * 80}\nprompt_index={pi} sample={si} new_tokens={li} cap_hit={cap_hit} reward={rw:.4f}\n")
+                print("--- MBPP task ---")
+                print(sample["task_text"])
+                print("\n--- extract_python_code ---")
+                print(ext_preview or "(empty)")
+                print("\n--- assistant completion ---")
+                print(body)
+                print()
 
 
 if __name__ == "__main__":
