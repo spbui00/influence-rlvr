@@ -16,10 +16,14 @@ from influence_rlvr import (
     ensure_reference_adapter,
     format_reward_func,
 )
+from influence_rlvr.modes import GenerationBackend, VLLMConfig
 
 DEVICE = detect_device()
-ENABLE_VLLM = DEVICE.type == "cuda"
-print(f"Device: {DEVICE} | vLLM enabled: {ENABLE_VLLM}")
+GENERATION_BACKEND = GenerationBackend.HF
+VLLM_CONFIG = VLLMConfig()
+if GENERATION_BACKEND == GenerationBackend.VLLM and DEVICE.type != "cuda":
+    raise ValueError("GenerationBackend.VLLM requires a CUDA device.")
+print(f"Device: {DEVICE} | generation backend: {GENERATION_BACKEND}")
 
 MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
 OUTPUT_DIR = "./rlvr-mac-sandbox"
@@ -107,13 +111,16 @@ checkpoint_infos = collect_checkpoint_infos(
     DEVICE,
     reward_fn_builder=build_math_reward_fns,
     G=G_TRAIN,
-    enable_vllm=ENABLE_VLLM,
+    enable_vllm=GENERATION_BACKEND == GenerationBackend.VLLM,
+    generation_backend=GENERATION_BACKEND,
     test_limit=len(test_dataset),
     train_limit=min(N_TRAIN, len(train_dataset)),
     include_debug=False,
     base_seed=TRAIN_GRAD_SEED,
     epsilon=GRPO_EPSILON,
     beta=GRPO_BETA,
+    vllm_config=VLLM_CONFIG,
+    model_id=MODEL_ID,
 )
 
 print("\n=== SFT Test / GRPO Train Trajectory TracIn Matrix ===")

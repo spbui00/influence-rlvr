@@ -36,11 +36,13 @@ from influence_rlvr import (
 from influence_rlvr.modes import (
     CodeEvalConfig,
     ExperimentMode,
+    GenerationBackend,
     GeometryFeatureMode,
     GradientObjective,
     InfluenceMode,
     ReplayGradientConfig,
     SecondOrderGeometry,
+    VLLMConfig,
 )
 from influence_rlvr.prompts import (
     build_code_prompt,
@@ -77,6 +79,8 @@ CODE_EVAL_PERCENT = 5
 EVAL_MAX_NEW_TOKENS = 128
 INFLUENCE_MODE = InfluenceMode.HISTORICAL
 EXPERIMENT_MODE = ExperimentMode.MATH_GRPO
+GENERATION_BACKEND = GenerationBackend.HF
+VLLM_CONFIG = VLLMConfig()
 CODE_EVAL_CONFIG = CodeEvalConfig(
     do_sample=True,
     num_samples=2,
@@ -89,6 +93,9 @@ REPLAY_GRADIENT_CONFIG = ReplayGradientConfig(
     train_geometry_feature=GeometryFeatureMode.POLICY_SCORE,
     second_order_geometry=SecondOrderGeometry.POLICY_SCORE_FISHER,
     fisher_normalize=False,
+    max_new_tokens=EVAL_MAX_NEW_TOKENS,
+    temperature=0.7,
+    top_p=0.9,
 )
 SKIP_TRAINING = False
 RESULTS_REUSE_POLICY = "ask"
@@ -197,6 +204,19 @@ def normalize_experiment_mode(mode):
 EXPERIMENT_MODE = normalize_experiment_mode(EXPERIMENT_MODE)
 
 
+def normalize_generation_backend(backend):
+    try:
+        return GenerationBackend.parse(backend)
+    except ValueError as exc:
+        raise ValueError(
+            f"Unsupported GENERATION_BACKEND={backend!r}. "
+            "Use GenerationBackend.HF or GenerationBackend.VLLM."
+        ) from exc
+
+
+GENERATION_BACKEND = normalize_generation_backend(GENERATION_BACKEND)
+
+
 def format_math(example, idx):
     return {
         "prompt": build_r1_math_prompt(example["question"]),
@@ -251,7 +271,18 @@ MODEL_DTYPE = (
     else torch.float32
 )
 
-print(f"Device: {DEVICE}")
+if VLLM_CONFIG.training_use_vllm and GENERATION_BACKEND != GenerationBackend.VLLM:
+    raise ValueError(
+        "VLLM_CONFIG.training_use_vllm=True requires GENERATION_BACKEND=GenerationBackend.VLLM."
+    )
+if GENERATION_BACKEND == GenerationBackend.VLLM:
+    if DEVICE.type != "cuda":
+        raise ValueError("GenerationBackend.VLLM requires a CUDA device.")
+    if sys.platform != "linux":
+        raise ValueError("GenerationBackend.VLLM is only supported on Linux/CUDA hosts.")
+print(f"Device: {DEVICE} | generation backend: {GENERATION_BACKEND}")
+if GENERATION_BACKEND == GenerationBackend.VLLM and not VLLM_CONFIG.training_use_vllm:
+    print("Phase 1 training will stay on HF/TRL; vLLM is used for replay/eval only.")
 print(f"Loading model: {MODEL_ID}")
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
@@ -336,7 +367,10 @@ if not SKIP_TRAINING:
         save_steps=SAVE_STEPS,
         save_total_limit=None,
         bf16=DEVICE.type == "cuda",
-        use_vllm=False,
+        use_vllm=(
+            GENERATION_BACKEND == GenerationBackend.VLLM
+            and VLLM_CONFIG.training_use_vllm
+        ),
         num_generations=G_TRAIN,
         generation_batch_size=GENERATION_BATCH_SIZE,
         loss_type="grpo",
@@ -395,7 +429,8 @@ checkpoint_infos = collect_checkpoint_infos(
     DEVICE,
     reward_fn_builder=replay_reward_fn_builder,
     G=G_TRAIN,
-    enable_vllm=False,
+    enable_vllm=GENERATION_BACKEND == GenerationBackend.VLLM,
+    generation_backend=GENERATION_BACKEND,
     test_limit=len(test_dataset),
     train_limit=min(N_TRAIN_REPLAY, len(replay_train_dataset)),
     include_debug=False,
@@ -409,6 +444,8 @@ checkpoint_infos = collect_checkpoint_infos(
     math_eval_dataset=math_eval_dataset,
     code_eval_dataset=code_eval_dataset,
     eval_max_new_tokens=EVAL_MAX_NEW_TOKENS,
+    vllm_config=VLLM_CONFIG,
+    model_id=MODEL_ID,
     **CODE_EVAL_CONFIG.to_kwargs(),
     **REPLAY_GRADIENT_CONFIG.to_kwargs(),
 )
@@ -452,8 +489,10 @@ results_config = {
     "code_eval_split": CODE_EVAL_SPLIT,
     "code_eval_percent": CODE_EVAL_PERCENT,
     "eval_max_new_tokens": EVAL_MAX_NEW_TOKENS,
+    "generation_backend": GENERATION_BACKEND,
     **CODE_EVAL_CONFIG.to_config_dict(),
     **REPLAY_GRADIENT_CONFIG.to_config_dict(),
+    **VLLM_CONFIG.to_config_dict(),
     "lambda_damp": LAMBDA_DAMP,
     "train_grad_seed": TRAIN_GRAD_SEED,
     "device": str(DEVICE),

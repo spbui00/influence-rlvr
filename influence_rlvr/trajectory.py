@@ -12,10 +12,12 @@ from .gradients import (
 )
 from .modes import (
     CodeEvalConfig,
+    GenerationBackend,
     GeometryFeatureMode,
     GradientObjective,
     InfluenceMode,
     ReplayGradientConfig,
+    VLLMConfig,
 )
 from .utils import clear_cache
 
@@ -169,6 +171,7 @@ def collect_reward_infos(
     reward_fn_builder,
     G=4,
     enable_vllm=False,
+    generation_backend=None,
     limit=None,
     include_debug=False,
     seed_base=None,
@@ -179,6 +182,12 @@ def collect_reward_infos(
     sample_index_key=None,
     gradient_objective_mode=GradientObjective.GRPO_TRAIN,
     geometry_feature_mode=GeometryFeatureMode.NONE,
+    max_new_tokens=256,
+    temperature=0.7,
+    top_p=0.9,
+    vllm_config=None,
+    adapter_path=None,
+    model_id=None,
     progress=False,
     progress_prefix="",
 ):
@@ -199,12 +208,19 @@ def collect_reward_infos(
             G=G,
             device=device,
             enable_vllm=enable_vllm,
+            generation_backend=generation_backend,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
             seed=seed,
             epsilon=epsilon,
             beta=beta,
             ref_model=ref_model,
             objective_mode=gradient_objective_mode,
             geometry_feature_mode=geometry_feature_mode,
+            vllm_config=vllm_config,
+            adapter_path=adapter_path,
+            model_id=model_id,
         )
 
         grad = result["grad"]
@@ -252,6 +268,7 @@ def collect_train_infos(
     reward_fn_builder,
     G=4,
     enable_vllm=False,
+    generation_backend=None,
     limit=None,
     include_debug=False,
     seed_base=None,
@@ -261,6 +278,12 @@ def collect_train_infos(
     sample_weight_lookup=None,
     gradient_objective_mode=GradientObjective.GRPO_TRAIN,
     geometry_feature_mode=GeometryFeatureMode.NONE,
+    max_new_tokens=256,
+    temperature=0.7,
+    top_p=0.9,
+    vllm_config=None,
+    adapter_path=None,
+    model_id=None,
     progress=False,
     progress_prefix="",
 ):
@@ -272,6 +295,7 @@ def collect_train_infos(
         reward_fn_builder,
         G=G,
         enable_vllm=enable_vllm,
+        generation_backend=generation_backend,
         limit=limit,
         include_debug=include_debug,
         seed_base=seed_base,
@@ -282,6 +306,12 @@ def collect_train_infos(
         sample_index_key="train_index",
         gradient_objective_mode=gradient_objective_mode,
         geometry_feature_mode=geometry_feature_mode,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        vllm_config=vllm_config,
+        adapter_path=adapter_path,
+        model_id=model_id,
         progress=progress,
         progress_prefix=progress_prefix,
     )
@@ -297,6 +327,7 @@ def collect_checkpoint_infos(
     reward_fn_builder,
     G=4,
     enable_vllm=False,
+    generation_backend=None,
     test_limit=None,
     train_limit=None,
     include_debug=False,
@@ -318,9 +349,21 @@ def collect_checkpoint_infos(
     train_gradient_objective_mode=GradientObjective.GRPO_TRAIN,
     test_gradient_objective_mode=GradientObjective.GRPO_TRAIN,
     train_geometry_feature_mode=GeometryFeatureMode.NONE,
+    replay_max_new_tokens=256,
+    replay_temperature=0.7,
+    replay_top_p=0.9,
+    vllm_config=None,
+    model_id=None,
     progress=True,
 ):
     influence_mode = InfluenceMode.parse(influence_mode)
+    generation_backend = (
+        GenerationBackend.VLLM
+        if generation_backend is None and enable_vllm
+        else GenerationBackend.parse(
+            GenerationBackend.HF if generation_backend is None else generation_backend
+        )
+    )
     code_eval_config = CodeEvalConfig(
         do_sample=code_eval_do_sample,
         num_samples=code_eval_num_samples,
@@ -331,7 +374,12 @@ def collect_checkpoint_infos(
         train_objective=GradientObjective.parse(train_gradient_objective_mode),
         test_objective=GradientObjective.parse(test_gradient_objective_mode),
         train_geometry_feature=GeometryFeatureMode.parse(train_geometry_feature_mode),
+        max_new_tokens=replay_max_new_tokens,
+        temperature=replay_temperature,
+        top_p=replay_top_p,
     )
+    if vllm_config is None:
+        vllm_config = VLLMConfig()
 
     checkpoint_infos = []
     checkpoint_count = len(checkpoint_schedule)
@@ -358,6 +406,11 @@ def collect_checkpoint_infos(
                 device,
                 max_new_tokens=eval_max_new_tokens,
                 progress=False,
+                enable_vllm=enable_vllm,
+                generation_backend=generation_backend,
+                vllm_config=vllm_config,
+                adapter_path=checkpoint["path"],
+                model_id=model_id,
             )
         if code_eval_dataset is not None:
             _progress_print(f"{prefix} evaluating held-out code", progress)
@@ -372,6 +425,11 @@ def collect_checkpoint_infos(
                 temperature=code_eval_config.temperature,
                 top_p=code_eval_config.top_p,
                 progress=False,
+                enable_vllm=enable_vllm,
+                generation_backend=generation_backend,
+                vllm_config=vllm_config,
+                adapter_path=checkpoint["path"],
+                model_id=model_id,
             )
 
         train_seed_base = None
@@ -401,6 +459,7 @@ def collect_checkpoint_infos(
                 test_reward_fn_builder,
                 G=G if test_G is None else test_G,
                 enable_vllm=enable_vllm,
+                generation_backend=generation_backend,
                 limit=test_limit,
                 include_debug=False,
                 seed_base=test_seed_base,
@@ -408,6 +467,12 @@ def collect_checkpoint_infos(
                 beta=beta,
                 ref_model=ref_model,
                 gradient_objective_mode=replay_gradient_config.test_objective,
+                max_new_tokens=replay_gradient_config.max_new_tokens,
+                temperature=replay_gradient_config.temperature,
+                top_p=replay_gradient_config.top_p,
+                vllm_config=vllm_config,
+                adapter_path=checkpoint["path"],
+                model_id=model_id,
                 progress=progress,
                 progress_prefix=f"{prefix} [test]",
             )
@@ -428,6 +493,7 @@ def collect_checkpoint_infos(
             reward_fn_builder,
             G=G,
             enable_vllm=enable_vllm,
+            generation_backend=generation_backend,
             limit=train_limit,
             include_debug=include_debug,
             seed_base=train_seed_base,
@@ -441,6 +507,12 @@ def collect_checkpoint_infos(
             ),
             gradient_objective_mode=replay_gradient_config.train_objective,
             geometry_feature_mode=replay_gradient_config.train_geometry_feature,
+            max_new_tokens=replay_gradient_config.max_new_tokens,
+            temperature=replay_gradient_config.temperature,
+            top_p=replay_gradient_config.top_p,
+            vllm_config=vllm_config,
+            adapter_path=checkpoint["path"],
+            model_id=model_id,
             progress=progress,
             progress_prefix=f"{prefix} [train]",
         )
