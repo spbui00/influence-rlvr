@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+import argparse
+import math
+import statistics
+import time
+from pathlib import Path
+
+import torch
+from datasets import load_dataset
+from peft import LoraConfig, get_peft_model
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from influence_rlvr.prompts import build_r1_math_prompt, extract_gsm8k_target
+from influence_rlvr.rewards import accuracy_reward_func, format_reward_func
+from influence_rlvr.trajectory import load_adapter_checkpoint
+from influence_rlvr.utils import tokenize_prompt
+
+
+def _resolve_checkpoint(run_dir: Path | None, step: int | None, explicit: Path | None) -> Path | None:
+    if explicit is not None:
+        return explicit
+    if run_dir is None or step is None:
+        return None
+    root = run_dir / "rlvr-output" if (run_dir / "rlvr-output" / f"checkpoint-{step}").exists() else run_dir
+    cand = root / f"checkpoint-{step}"
+    return cand if cand.exists() else None
+
+
+def _build_model(model_id: str, device: torch.device):
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
+
+    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    base = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=dtype).to(device)
+    lora = LoraConfig(
+        r=8,
+        lora_alpha=16,
+        target_modules=["q_proj", "v_proj"],
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(base, lora)
+    model.eval()
+    tid = tokenizer.pad_token_id
+    model.config.pad_token_id = tid
+    model.generation_config.pad_token_id = tid
+    if tokenizer.eos_token_id is not None:
+        model.config.eos_token_id = tokenizer.eos_token_id
+        model.generation_config.eos_token_id = tokenizer.eos_token_id
+    return model, tokenizer
+
+
+@torch.inference_mode()
+def _generate_batch(
+    model,
+    tokenizer,
+    question: str,
+    device: torch.device,
+    max_new_tokens: int,
+    num_samples: int,
+    do_sample: bool,
+    temperature: float,
+    top_p: float,
+):
+    prompt = build_r1_math_prompt(question)
+    _, input_ids, attention_mask = tokenize_prompt(tokenizer, prompt, device)
+    plen = int(input_ids.shape[1])
+    input_ids = input_ids.expand(num_samples, -1)
+    attention_mask = attention_mask.expand(num_samples, -1)
+
+    kwargs = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "max_new_tokens": max_new_tokens,
+        "pad_token_id": tokenizer.pad_token_id,
+        "eos_token_id": tokenizer.eos_token_id,
+        "do_sample": do_sample,
+    }
+    if do_sample:
+        kwargs["temperature"] = temperature
+        kwargs["top_p"] = top_p
+
+    out = model.generate(**kwargs)
+    texts = []
+    lens = []
+    for row in out:
+        cids = row[plen:]
+        lens.append(int(cids.shape[0]))
+        texts.append(tokenizer.decode(cids, skip_special_tokens=True))
+    return texts, lens
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description=(
+            "Sweep max_new_tokens on GSM8K-style R1 prompts; report cap hits and reward stats. "
+            "Use before long runs to pick EVAL_MAX_NEW_TOKENS / gradient replay budgets."
+        )
+    )
+    p.add_argument("--model-id", default="Qwen/Qwen2.5-Math-1.5B")
+    p.add_argument("--checkpoint", type=Path, default=None, help="PEFT adapter dir (e.g. .../checkpoint-200)")
+    p.add_argument("--run-dir", type=Path, default=None, help="e.g. outputs/run6; use with --checkpoint-step")
+    p.add_argument("--checkpoint-step", type=int, default=None)
+    p.add_argument(
+        "--budgets",
+        type=int,
+        nargs="+",
+        default=[256, 384, 512, 768, 1024],
+    )
+    p.add_argument("--split", default="test", help='HF datasets split, e.g. "test" or "test[:5%]"')
+    p.add_argument("--num-prompts", type=int, default=24)
+    p.add_argument("--num-samples", type=int, default=8, help="Rollouts per prompt (match G_TRAIN if possible)")
+    p.add_argument("--greedy", action="store_true")
+    p.add_argument("--temperature", type=float, default=0.7)
+    p.add_argument("--top-p", type=float, default=0.9)
+    p.add_argument("--seed", type=int, default=1234)
+    args = p.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ckpt = args.checkpoint or _resolve_checkpoint(args.run_dir, args.checkpoint_step, None)
+    if args.run_dir is not None and args.checkpoint_step is not None and ckpt is None:
+        raise SystemExit(
+            f"No checkpoint-{args.checkpoint_step} under {args.run_dir} (tried rlvr-output/)."
+        )
+
+    torch.manual_seed(args.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(args.seed)
+
+    ds = load_dataset("openai/gsm8k", "main", split=args.split)
+    n = min(args.num_prompts, len(ds))
+    rows = [ds[i] for i in range(n)]
+
+    model, tokenizer = _build_model(args.model_id, device)
+    if ckpt is not None:
+        load_adapter_checkpoint(model, ckpt)
+        model.eval()
+
+    do_sample = not args.greedy
+    print(f"device={device} checkpoint={ckpt}")
+    print(f"split={args.split!r} prompts={n} samples_per_prompt={args.num_samples}")
+    print(f"do_sample={do_sample} temperature={args.temperature if do_sample else None} top_p={args.top_p if do_sample else None}")
+    print()
+
+    header = (
+        f"{'budget':>6}  {'cap%':>6}  {'tok_mean':>8}  {'tok_p95':>8}  "
+        f"{'fmt%':>6}  {'acc%':>6}  {'fmt+acc':>8}  {'secs':>6}"
+    )
+    print(header)
+    print("-" * len(header))
+
+    for budget in args.budgets:
+        t0 = time.perf_counter()
+        all_lens = []
+        cap_hits = 0
+        fmt_sum = 0.0
+        acc_sum = 0.0
+        pair_sum = 0.0
+        total = 0
+
+        for ex in rows:
+            question = ex["question"]
+            gold = extract_gsm8k_target(ex["answer"])
+            texts, lens = _generate_batch(
+                model,
+                tokenizer,
+                question,
+                device,
+                max_new_tokens=budget,
+                num_samples=args.num_samples,
+                do_sample=do_sample,
+                temperature=args.temperature,
+                top_p=args.top_p,
+            )
+            completions = [[{"role": "assistant", "content": t}] for t in texts]
+            fmt = format_reward_func(completions)
+            acc = accuracy_reward_func(completions, [gold] * len(texts))
+            for li, f, a in zip(lens, fmt, acc):
+                all_lens.append(li)
+                if li >= budget:
+                    cap_hits += 1
+                fmt_sum += float(f)
+                acc_sum += float(a)
+                pair_sum += float(f) + float(a)
+                total += 1
+
+        elapsed = time.perf_counter() - t0
+        cap_pct = 100.0 * cap_hits / max(total, 1)
+        fmt_pct = 100.0 * fmt_sum / max(total, 1)
+        acc_pct = 100.0 * acc_sum / max(total, 1)
+        pair_mean = pair_sum / max(total, 1)
+        mean_len = statistics.mean(all_lens) if all_lens else 0.0
+        if not all_lens:
+            p95_len = 0.0
+        else:
+            s = sorted(all_lens)
+            p95_len = float(s[min(len(s) - 1, max(0, math.ceil(0.95 * len(s)) - 1))])
+
+        print(
+            f"{budget:6d}  {cap_pct:5.1f}%  {mean_len:8.1f}  {p95_len:8.1f}  "
+            f"{fmt_pct:5.1f}%  {acc_pct:5.1f}%  {pair_mean:8.3f}  {elapsed:6.1f}"
+        )
+
+    print()
+    print(
+        "cap% = share of rollouts whose completion length equals max_new_tokens (often length-stopped).\n"
+        "fmt% / acc% = mean format_reward_func / accuracy_reward_func over all rollouts.\n"
+        "Pick the smallest budget where cap% drops (e.g. under ~20-30%) and fmt% / acc% stop improving much."
+    )
+    print(
+        "After choosing a budget, set main_pipeline EVAL_MAX_NEW_TOKENS and the same max_new_tokens "
+        "inside GRPO / replay gradient code paths if they still default to 256."
+    )
+
+
+if __name__ == "__main__":
+    main()
