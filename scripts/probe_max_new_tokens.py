@@ -11,7 +11,11 @@ from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from influence_rlvr.prompts import build_r1_math_prompt, extract_gsm8k_target
-from influence_rlvr.rewards import accuracy_reward_func, format_reward_func
+from influence_rlvr.rewards import (
+    accuracy_reward_func,
+    extract_math_final_answer,
+    format_reward_func,
+)
 from influence_rlvr.trajectory import load_adapter_checkpoint
 from influence_rlvr.utils import tokenize_prompt
 
@@ -32,7 +36,10 @@ def _build_model(model_id: str, device: torch.device):
         tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
 
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
-    base = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=dtype).to(device)
+    try:
+        base = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype).to(device)
+    except TypeError:
+        base = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=dtype).to(device)
     lora = LoraConfig(
         r=8,
         lora_alpha=16,
@@ -115,6 +122,21 @@ def main():
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--top-p", type=float, default=0.9)
     p.add_argument("--seed", type=int, default=1234)
+    p.add_argument(
+        "--show-prompts",
+        type=int,
+        nargs="+",
+        default=None,
+        help="GSM8K row indices (within first num-prompts): print raw completions after the table.",
+    )
+    p.add_argument(
+        "--show-budget",
+        type=int,
+        default=None,
+        help="max_new_tokens for --show-prompts (default: max of --budgets).",
+    )
+    p.add_argument("--show-samples", type=int, default=1)
+    p.add_argument("--show-chars", type=int, default=12000)
     args = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -204,14 +226,64 @@ def main():
 
     print()
     print(
-        "cap% = share of rollouts whose completion length equals max_new_tokens (often length-stopped).\n"
+        "cap% = share of rollouts whose completion length equals max_new_tokens (length stop).\n"
         "fmt% / acc% = mean format_reward_func / accuracy_reward_func over all rollouts.\n"
         "Pick the smallest budget where cap% drops (e.g. under ~20-30%) and fmt% / acc% stop improving much."
     )
     print(
-        "After choosing a budget, set main_pipeline EVAL_MAX_NEW_TOKENS and the same max_new_tokens "
-        "inside GRPO / replay gradient code paths if they still default to 256."
+        "If cap% stays ~100% even at 768–1024, raising the limit further usually will not fix training: "
+        "the model is not emitting EOS early (degenerate / non-stopping decode). "
+        "Use --show-prompts to inspect; consider lower temperature, repetition penalty, or reward/prompt changes—not only a bigger budget."
     )
+    print(
+        "After choosing a budget, set main_pipeline EVAL_MAX_NEW_TOKENS and thread the same max_new_tokens "
+        "into GRPO / replay gradient paths (collect_reward_infos currently defaults to 256 in gradients.py)."
+    )
+
+    if args.show_prompts is not None:
+        show_budget = args.show_budget if args.show_budget is not None else max(args.budgets)
+        print()
+        print("=" * 80)
+        print(
+            f"RAW OUTPUTS (budget={show_budget}, samples={args.show_samples}, "
+            f"truncation={args.show_chars} chars)"
+        )
+        print("=" * 80)
+        for pi in args.show_prompts:
+            if pi < 0 or pi >= n:
+                print(f"\n[skip] show prompt index {pi} out of range [0, {n - 1}]")
+                continue
+            ex = rows[pi]
+            question = ex["question"]
+            gold = extract_gsm8k_target(ex["answer"])
+            texts, lens = _generate_batch(
+                model,
+                tokenizer,
+                question,
+                device,
+                max_new_tokens=show_budget,
+                num_samples=args.show_samples,
+                do_sample=do_sample,
+                temperature=args.temperature,
+                top_p=args.top_p,
+            )
+            for si, (text, li) in enumerate(zip(texts, lens)):
+                completions = [[{"role": "assistant", "content": text}]]
+                fr = float(format_reward_func(completions)[0])
+                ar = float(accuracy_reward_func(completions, [gold])[0])
+                parsed = extract_math_final_answer(text)
+                cap_hit = li >= show_budget
+                body = text if len(text) <= args.show_chars else text[: args.show_chars] + "\n... [truncated]"
+                print(
+                    f"\n{'#' * 80}\n"
+                    f"prompt_index={pi} sample={si} new_tokens={li} cap_hit={cap_hit} "
+                    f"format_reward={fr} accuracy_reward={ar} parsed={parsed!r} gold={gold!r}\n"
+                )
+                print("--- question ---")
+                print(question)
+                print("\n--- assistant completion ---")
+                print(body)
+                print()
 
 
 if __name__ == "__main__":
