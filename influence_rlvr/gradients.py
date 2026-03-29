@@ -4,7 +4,8 @@ from contextlib import contextmanager
 import torch
 import torch.nn.functional as F
 
-from .modes import GeometryFeatureMode, GradientObjective
+from .generation import generate_rollout_batch, rollout_to_completions
+from .modes import GenerationBackend, GeometryFeatureMode, GradientObjective, VLLMConfig
 from .utils import tokenize_prompt, extract_lora_gradients, get_reward_name
 
 
@@ -20,6 +21,17 @@ def _get_sampling_model(peft_model, old_peft_model=None):
     return peft_model if old_peft_model is None else old_peft_model
 
 
+def _resolve_generation_backend(enable_vllm, generation_backend):
+    if generation_backend is None:
+        return GenerationBackend.VLLM if enable_vllm else GenerationBackend.HF
+    backend = GenerationBackend.parse(generation_backend)
+    if enable_vllm and backend != GenerationBackend.VLLM:
+        raise ValueError(
+            "Received enable_vllm=True with generation_backend set to a non-vLLM backend."
+        )
+    return backend
+
+
 @contextmanager
 def _use_adapter(model, adapter_name):
     if adapter_name is None or not hasattr(model, "set_adapter"):
@@ -33,41 +45,6 @@ def _use_adapter(model, adapter_name):
     finally:
         if previous_adapter is not None:
             model.set_adapter(previous_adapter)
-
-
-def _tokenize_responses(tokenizer, response_texts, device):
-    tokenized = []
-    max_len = 0
-    for text in response_texts:
-        response_ids = tokenizer(
-            text + tokenizer.eos_token,
-            return_tensors="pt",
-            add_special_tokens=False,
-        ).input_ids.squeeze(0)
-        tokenized.append(response_ids)
-        max_len = max(max_len, response_ids.shape[0])
-
-    if max_len == 0:
-        raise RuntimeError("No response tokens were generated.")
-
-    pad_token_id = tokenizer.pad_token_id
-    if pad_token_id is None:
-        pad_token_id = tokenizer.eos_token_id
-
-    response_ids = torch.full(
-        (len(tokenized), max_len),
-        pad_token_id,
-        dtype=tokenized[0].dtype,
-        device=device,
-    )
-    response_mask = torch.zeros((len(tokenized), max_len), dtype=torch.long, device=device)
-
-    for idx, ids in enumerate(tokenized):
-        length = ids.shape[0]
-        response_ids[idx, :length] = ids.to(device)
-        response_mask[idx, :length] = 1
-
-    return response_ids, response_mask
 
 
 def _compute_per_token_logps(model, prompt_ids, prompt_attention_mask, response_ids, response_mask):
@@ -121,37 +98,6 @@ def _sanitize_grad_vector(grad_vector, *, context):
         stacklevel=2,
     )
     return torch.nan_to_num(grad_vector, nan=0.0, posinf=0.0, neginf=0.0)
-
-
-def _generate_response_texts(
-    sampling_model,
-    tokenizer,
-    prompt_ids,
-    prompt_attention_mask,
-    *,
-    G,
-    max_new_tokens,
-    temperature,
-    top_p,
-):
-    prompt_len = prompt_ids.shape[1]
-    with torch.inference_mode():
-        generated = sampling_model.generate(
-            input_ids=prompt_ids.repeat(G, 1),
-            attention_mask=prompt_attention_mask.repeat(G, 1),
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-            temperature=temperature,
-            top_p=top_p,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-        )
-
-    response_texts = []
-    for i in range(G):
-        gen_ids = generated[i, prompt_len:]
-        response_texts.append(tokenizer.decode(gen_ids, skip_special_tokens=True))
-    return response_texts
 
 
 def _evaluate_rewards(reward_funcs, completions_trl, device):
@@ -223,6 +169,7 @@ def compute_policy_gradient_bundle(
     G=4,
     device="cpu",
     enable_vllm=False,
+    generation_backend=None,
     max_new_tokens=256,
     temperature=0.7,
     top_p=0.9,
@@ -234,9 +181,15 @@ def compute_policy_gradient_bundle(
     advantage_eps=1e-4,
     objective_mode=GradientObjective.GRPO_TRAIN,
     geometry_feature_mode=GeometryFeatureMode.NONE,
+    vllm_config=None,
+    adapter_path=None,
+    model_id=None,
 ):
     objective_mode = GradientObjective.parse(objective_mode)
     geometry_feature_mode = GeometryFeatureMode.parse(geometry_feature_mode)
+    generation_backend = _resolve_generation_backend(enable_vllm, generation_backend)
+    if vllm_config is None:
+        vllm_config = VLLMConfig()
 
     peft_model.eval()
     peft_model.zero_grad()
@@ -248,28 +201,34 @@ def compute_policy_gradient_bundle(
         ref_model.eval()
 
     prompt_text, prompt_ids, prompt_attention_mask = tokenize_prompt(tokenizer, prompt, device)
-
-    if enable_vllm:
+    if generation_backend == GenerationBackend.VLLM and old_peft_model is not None:
         raise NotImplementedError(
-            "vLLM generation backend is not yet implemented. "
-            "Set enable_vllm=False to use standard HF generate()."
+            "vLLM sampling with old_peft_model is not supported yet."
         )
 
-    _set_generation_seed(seed)
-    response_texts = _generate_response_texts(
+    if generation_backend == GenerationBackend.HF:
+        _set_generation_seed(seed)
+    rollout = generate_rollout_batch(
         sampling_model,
         tokenizer,
         prompt_ids,
         prompt_attention_mask,
-        G=G,
+        backend=generation_backend,
+        num_samples=G,
         max_new_tokens=max_new_tokens,
+        do_sample=True,
         temperature=temperature,
         top_p=top_p,
+        seed=seed,
+        vllm_config=vllm_config,
+        adapter_path=adapter_path,
+        model_id=model_id,
     )
-    completions_trl = [[{"role": "assistant", "content": text}] for text in response_texts]
+    completions_trl = rollout_to_completions(rollout)
     total_rewards, reward_breakdown = _evaluate_rewards(reward_funcs, completions_trl, device)
 
-    response_ids, response_mask = _tokenize_responses(tokenizer, response_texts, device)
+    response_ids = rollout.token_ids
+    response_mask = rollout.response_mask
     per_token_logps = _compute_per_token_logps(
         peft_model,
         prompt_ids,
@@ -355,18 +314,20 @@ def compute_policy_gradient_bundle(
 
     debug_info = {
         "prompt_text": prompt_text,
-        "responses": response_texts,
+        "responses": rollout.texts,
         "reward_breakdown": reward_breakdown,
         "total_rewards": total_rewards.detach().cpu().tolist(),
         "advantages": advantages.detach().cpu().tolist(),
         "log_probs": sequence_log_probs.detach().float().cpu().tolist(),
         "sequence_log_probs": sequence_log_probs.detach().float().cpu().tolist(),
         "mean_sequence_log_probs": mean_sequence_log_probs.detach().float().cpu().tolist(),
+        "response_lengths": response_mask.sum(dim=1).detach().cpu().tolist(),
         "policy_loss": float(objective.detach().float().cpu()),
         "mean_kl": float(((per_token_kl * token_mask).sum(dim=1) / token_counts).mean().detach().cpu()),
         "epsilon": epsilon,
         "beta": beta,
         "seed": seed,
+        "generation_backend": generation_backend,
         "objective_mode": objective_mode,
         "objective_name": objective_name,
         "geometry_feature_mode": geometry_feature_mode,
@@ -479,6 +440,7 @@ def compute_sft_gradient(peft_model, tokenizer, prompt, target, device):
 def compute_rlvr_gradient(
     peft_model, tokenizer, prompt, reward_funcs,
     G=4, device="cpu", enable_vllm=False,
+    generation_backend=None,
     max_new_tokens=256, temperature=0.7, top_p=0.9,
     return_debug=False,
     seed=None,
@@ -487,6 +449,9 @@ def compute_rlvr_gradient(
     old_peft_model=None,
     ref_model=None,
     advantage_eps=1e-4,
+    vllm_config=None,
+    adapter_path=None,
+    model_id=None,
 ):
     result = compute_policy_gradient_bundle(
         peft_model,
@@ -496,6 +461,7 @@ def compute_rlvr_gradient(
         G=G,
         device=device,
         enable_vllm=enable_vllm,
+        generation_backend=generation_backend,
         max_new_tokens=max_new_tokens,
         temperature=temperature,
         top_p=top_p,
@@ -507,6 +473,9 @@ def compute_rlvr_gradient(
         advantage_eps=advantage_eps,
         objective_mode=GradientObjective.GRPO_TRAIN,
         geometry_feature_mode=GeometryFeatureMode.NONE,
+        vllm_config=vllm_config,
+        adapter_path=adapter_path,
+        model_id=model_id,
     )
     if return_debug:
         return result["grad"], result["debug"]

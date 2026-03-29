@@ -3,8 +3,21 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+from .generation import generate_rollout_batch, rollout_to_completions
+from .modes import GenerationBackend, VLLMConfig
 from .rewards import accuracy_reward_func, format_reward_func, mbpp_execution_reward_func
 from .utils import tokenize_prompt
+
+
+def _resolve_generation_backend(enable_vllm, generation_backend):
+    if generation_backend is None:
+        return GenerationBackend.VLLM if enable_vllm else GenerationBackend.HF
+    backend = GenerationBackend.parse(generation_backend)
+    if enable_vllm and backend != GenerationBackend.VLLM:
+        raise ValueError(
+            "Received enable_vllm=True with generation_backend set to a non-vLLM backend."
+        )
+    return backend
 
 
 def _generate_completions(
@@ -18,41 +31,32 @@ def _generate_completions(
     temperature=0.6,
     top_p=0.95,
     num_samples=1,
+    enable_vllm=False,
+    generation_backend=None,
+    vllm_config=None,
+    adapter_path=None,
+    model_id=None,
 ):
-    if num_samples < 1:
-        raise ValueError(f"num_samples must be >= 1, got {num_samples}.")
-    if not do_sample and num_samples != 1:
-        raise ValueError(
-            "Greedy evaluation only supports num_samples=1. "
-            "Set do_sample=True to evaluate multiple completions."
-        )
-
-    peft_model.eval()
+    if peft_model is not None:
+        peft_model.eval()
+    backend = _resolve_generation_backend(enable_vllm, generation_backend)
     _, prompt_ids, prompt_attention_mask = tokenize_prompt(tokenizer, prompt, device)
-    with torch.inference_mode():
-        generate_kwargs = {
-            "input_ids": prompt_ids,
-            "attention_mask": prompt_attention_mask,
-            "max_new_tokens": max_new_tokens,
-            "do_sample": do_sample,
-            "pad_token_id": tokenizer.pad_token_id,
-            "eos_token_id": tokenizer.eos_token_id,
-        }
-        if do_sample:
-            generate_kwargs.update({
-                "temperature": temperature,
-                "top_p": top_p,
-                "num_return_sequences": num_samples,
-            })
-        generated = peft_model.generate(
-            **generate_kwargs,
-        )
-    completions = []
-    for sequence in generated[:num_samples]:
-        completion_ids = sequence[prompt_ids.shape[1]:]
-        completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True)
-        completions.append([{"role": "assistant", "content": completion_text}])
-    return completions
+    rollout = generate_rollout_batch(
+        peft_model,
+        tokenizer,
+        prompt_ids,
+        prompt_attention_mask,
+        backend=backend,
+        num_samples=num_samples,
+        max_new_tokens=max_new_tokens,
+        do_sample=do_sample,
+        temperature=temperature,
+        top_p=top_p,
+        vllm_config=VLLMConfig() if vllm_config is None else vllm_config,
+        adapter_path=adapter_path,
+        model_id=model_id,
+    )
+    return rollout_to_completions(rollout)
 
 
 def evaluate_math_dataset(
@@ -64,6 +68,11 @@ def evaluate_math_dataset(
     max_new_tokens=256,
     progress=False,
     progress_prefix="",
+    enable_vllm=False,
+    generation_backend=None,
+    vllm_config=None,
+    adapter_path=None,
+    model_id=None,
 ):
     count = len(dataset) if limit is None else min(limit, len(dataset))
     format_scores = []
@@ -78,6 +87,11 @@ def evaluate_math_dataset(
             sample["prompt"],
             device,
             max_new_tokens=max_new_tokens,
+            enable_vllm=enable_vllm,
+            generation_backend=generation_backend,
+            vllm_config=vllm_config,
+            adapter_path=adapter_path,
+            model_id=model_id,
         )
         format_score = float(format_reward_func(completions)[0])
         accuracy_score = float(accuracy_reward_func(completions, [sample["solution"]])[0])
@@ -112,6 +126,11 @@ def evaluate_code_dataset(
     temperature=0.6,
     top_p=0.95,
     num_samples=1,
+    enable_vllm=False,
+    generation_backend=None,
+    vllm_config=None,
+    adapter_path=None,
+    model_id=None,
 ):
     count = len(dataset) if limit is None else min(limit, len(dataset))
     rewards = []
@@ -130,6 +149,11 @@ def evaluate_code_dataset(
             temperature=temperature,
             top_p=top_p,
             num_samples=num_samples,
+            enable_vllm=enable_vllm,
+            generation_backend=generation_backend,
+            vllm_config=vllm_config,
+            adapter_path=adapter_path,
+            model_id=model_id,
         )
         completion_rewards = [
             float(score)

@@ -18,11 +18,13 @@ from .gradients import (
 from .modes import (
     CodeEvalConfig,
     ExperimentMode,
+    GenerationBackend,
     GeometryFeatureMode,
     GradientObjective,
     InfluenceMode,
     ReplayGradientConfig,
     SecondOrderGeometry,
+    VLLMConfig,
 )
 from .eval import evaluate_math_dataset, evaluate_code_dataset
 from .rewards import (
@@ -59,11 +61,13 @@ __all__ = [
     "RepSimInfluence",
     "InfluenceMode",
     "ExperimentMode",
+    "GenerationBackend",
     "GradientObjective",
     "GeometryFeatureMode",
     "SecondOrderGeometry",
     "ReplayGradientConfig",
     "CodeEvalConfig",
+    "VLLMConfig",
     "compute_policy_gradient_bundle",
     "compute_sft_gradient",
     "compute_rlvr_gradient",
