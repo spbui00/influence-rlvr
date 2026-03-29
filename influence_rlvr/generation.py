@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import hashlib
 import sys
 from dataclasses import dataclass
@@ -24,8 +25,26 @@ def rollout_to_completions(rollout: RolloutBatch) -> list[list[dict[str, str]]]:
     return [[{"role": "assistant", "content": text}] for text in rollout.texts]
 
 
+def _shutdown_vllm_llm_instance(engine: object) -> None:
+    llm_engine = getattr(engine, "llm_engine", None)
+    if llm_engine is None:
+        return
+    core = getattr(llm_engine, "engine_core", None)
+    shutdown = getattr(core, "shutdown", None) if core is not None else None
+    if callable(shutdown):
+        shutdown()
+
+
 def clear_vllm_engine_cache() -> None:
+    for llm in list(_VLLM_ENGINE_CACHE.values()):
+        try:
+            _shutdown_vllm_llm_instance(llm)
+        except Exception:
+            pass
     _VLLM_ENGINE_CACHE.clear()
+
+
+atexit.register(clear_vllm_engine_cache)
 
 
 def _normalize_device(device: str | torch.device) -> torch.device:
