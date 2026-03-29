@@ -17,6 +17,11 @@ dependencies = [
     "matplotlib>=3.9",
 ]
 
+[project.optional-dependencies]
+vllm = [
+    "vllm",
+]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["influence_rlvr*", "analysis*"]
