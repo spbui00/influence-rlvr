@@ -6,6 +6,8 @@ Training data attribution for RLVR (GRPO). Uses influence functions adapted from
 
 ```bash
 uv sync          # Python 3.10+, CUDA GPU recommended
+# Optional vLLM backend (Linux/CUDA only)
+uv sync --extra vllm
 ```
 
 ## Run
@@ -31,7 +33,10 @@ Key settings in `main_pipeline.py`:
 - `INFLUENCE_MODE` — `"historical"` (default) or `"dense"`
 - `SKIP_TRAINING` — reuse existing checkpoints
 - `RESULTS_REUSE_POLICY` — `"ask"` (default), `"reuse"`, or `"new"`
+- `GENERATION_BACKEND` — `GenerationBackend.HF` (default) or `GenerationBackend.VLLM`
+- `VLLM_CONFIG` — runtime settings for replay/eval vLLM plus optional `training_use_vllm`
 - `CODE_EVAL_NUM_SAMPLES` / `CODE_EVAL_TEMPERATURE` / `CODE_EVAL_TOP_P` — sampled code-eval settings for pass@k-style benchmarking
+- `REPLAY_GRADIENT_CONFIG.max_new_tokens` / `.temperature` / `.top_p` — replay rollout sampling settings used for `g_train` / `g_test`
 
 Math training now follows a DeepSeek-R1-style prompt/reward setup:
 
@@ -49,6 +54,44 @@ The intended comparison is:
 3. `EXPERIMENT_MODE="code_grpo"` as a matched direct-code baseline under the same GRPO budget.
 
 Evidence of positive math-to-code transfer is a held-out code gain in the `math_grpo` run relative to checkpoint 0, ideally with math also improving at the same time. The `code_grpo` run is the direct-code upper bound for that budget and helps separate cross-domain transfer from the effect of RL on the target domain itself.
+
+## vLLM Backend
+
+The repo now supports a phased vLLM path for replay gradients, held-out eval, smoke runs, and the probe scripts.
+
+- HF scoring remains the source of truth for log-probs, KL, and gradients.
+- vLLM is used only for sampling/generation when `GENERATION_BACKEND=GenerationBackend.VLLM`.
+- Phase 1 training stays on HF/TRL unless you also set `VLLM_CONFIG.training_use_vllm=True` and run on a machine that satisfies TRL/vLLM training requirements.
+
+Smoke test:
+
+```bash
+uv run python main_pipeline_smoke.py
+```
+
+Math probe with HF:
+
+```bash
+uv run python scripts/probe_max_new_tokens.py \
+  --run-dir outputs/run6 --checkpoint-step 200 \
+  --backend hf
+```
+
+Math probe with vLLM:
+
+```bash
+uv run python scripts/probe_max_new_tokens.py \
+  --run-dir outputs/run6 --checkpoint-step 200 \
+  --backend vllm
+```
+
+Code probe with vLLM:
+
+```bash
+uv run python scripts/probe_code_max_new_tokens.py \
+  --run-dir outputs/run6 --checkpoint-step 200 \
+  --backend vllm
+```
 
 ## Analyze
 
