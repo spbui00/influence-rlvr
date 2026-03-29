@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import hashlib
+import importlib
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,14 +26,47 @@ def rollout_to_completions(rollout: RolloutBatch) -> list[list[dict[str, str]]]:
     return [[{"role": "assistant", "content": text}] for text in rollout.texts]
 
 
+def _destroy_vllm_process_group(llm_engine: object) -> None:
+    dp_group = getattr(llm_engine, "dp_group", None)
+    if dp_group is None or getattr(llm_engine, "external_launcher_dp", False):
+        return
+    try:
+        dist_utils = importlib.import_module("vllm.distributed.utils")
+        destroy_pg = getattr(
+            dist_utils,
+            "stateless_destroy_torch_distributed_process_group",
+        )
+    except Exception:
+        shutdown = getattr(dp_group, "shutdown", None)
+        if callable(shutdown):
+            shutdown()
+        else:
+            destroy = getattr(torch.distributed, "destroy_process_group", None)
+            if callable(destroy):
+                destroy(dp_group)
+    else:
+        destroy_pg(dp_group)
+    try:
+        llm_engine.dp_group = None
+    except Exception:
+        pass
+
+
 def _shutdown_vllm_llm_instance(engine: object) -> None:
     llm_engine = getattr(engine, "llm_engine", None)
     if llm_engine is None:
         return
     core = getattr(llm_engine, "engine_core", None)
     shutdown = getattr(core, "shutdown", None) if core is not None else None
-    if callable(shutdown):
-        shutdown()
+    try:
+        if callable(shutdown):
+            shutdown()
+    finally:
+        try:
+            llm_engine.engine_core = None
+        except Exception:
+            pass
+        _destroy_vllm_process_group(llm_engine)
 
 
 def clear_vllm_engine_cache() -> None:
