@@ -10,6 +10,8 @@ from datasets import load_dataset
 from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from influence_rlvr.generation import generate_rollout_batch
+from influence_rlvr.modes import GenerationBackend, VLLMConfig
 from influence_rlvr.prompts import build_code_prompt
 from influence_rlvr.rewards import _extract_python_code, mbpp_execution_reward_func
 from influence_rlvr.trajectory import load_adapter_checkpoint
@@ -26,13 +28,20 @@ def _resolve_checkpoint(run_dir: Path | None, step: int | None, explicit: Path |
     return cand if cand.exists() else None
 
 
-def _build_model(model_id: str, device: torch.device):
+def _build_tokenizer(model_id: str):
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
+    return tokenizer
 
+
+def _build_model(model_id: str, device: torch.device):
+    tokenizer = _build_tokenizer(model_id)
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
-    base = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=dtype).to(device)
+    try:
+        base = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype).to(device)
+    except TypeError:
+        base = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=dtype).to(device)
     lora = LoraConfig(
         r=8,
         lora_alpha=16,
@@ -72,31 +81,35 @@ def _generate_batch_code(
     do_sample: bool,
     temperature: float,
     top_p: float,
+    generation_backend: GenerationBackend,
+    vllm_config: VLLMConfig,
+    checkpoint_path: Path | None,
+    model_id: str,
+    seed: int | None,
 ):
+    if generation_backend == GenerationBackend.HF and seed is not None:
+        torch.manual_seed(seed)
+        if device.type == "cuda":
+            torch.cuda.manual_seed_all(seed)
     _, input_ids, attention_mask = tokenize_prompt(tokenizer, prompt_messages, device)
-    plen = int(input_ids.shape[1])
-    input_ids = input_ids.expand(num_samples, -1)
-    attention_mask = attention_mask.expand(num_samples, -1)
-
-    kwargs = {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "max_new_tokens": max_new_tokens,
-        "pad_token_id": tokenizer.pad_token_id,
-        "eos_token_id": tokenizer.eos_token_id,
-        "do_sample": do_sample,
-    }
-    if do_sample:
-        kwargs["temperature"] = temperature
-        kwargs["top_p"] = top_p
-
-    out = model.generate(**kwargs)
-    texts = []
-    lens = []
-    for row in out:
-        cids = row[plen:]
-        lens.append(int(cids.shape[0]))
-        texts.append(tokenizer.decode(cids, skip_special_tokens=True))
+    rollout = generate_rollout_batch(
+        model,
+        tokenizer,
+        input_ids,
+        attention_mask,
+        backend=generation_backend,
+        num_samples=num_samples,
+        max_new_tokens=max_new_tokens,
+        do_sample=do_sample,
+        temperature=temperature,
+        top_p=top_p,
+        seed=seed,
+        vllm_config=vllm_config,
+        adapter_path=checkpoint_path,
+        model_id=model_id,
+    )
+    texts = rollout.texts
+    lens = rollout.response_mask.sum(dim=1).detach().cpu().tolist()
     return texts, lens
 
 
@@ -129,6 +142,16 @@ def main():
     p.add_argument("--top-p", type=float, default=0.95)
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument(
+        "--backend",
+        choices=[str(GenerationBackend.HF), str(GenerationBackend.VLLM)],
+        default=str(GenerationBackend.HF),
+    )
+    p.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.9)
+    p.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
+    p.add_argument("--vllm-max-model-len", type=int, default=None)
+    p.add_argument("--vllm-max-num-seqs", type=int, default=None)
+    p.add_argument("--vllm-enforce-eager", action="store_true")
+    p.add_argument(
         "--show-prompts",
         type=int,
         nargs="+",
@@ -151,27 +174,35 @@ def main():
     args = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    generation_backend = GenerationBackend.parse(args.backend)
     ckpt = args.checkpoint or _resolve_checkpoint(args.run_dir, args.checkpoint_step, None)
     if args.run_dir is not None and args.checkpoint_step is not None and ckpt is None:
         raise SystemExit(
             f"No checkpoint-{args.checkpoint_step} under {args.run_dir} (tried rlvr-output/)."
         )
 
-    torch.manual_seed(args.seed)
-    if device.type == "cuda":
-        torch.cuda.manual_seed_all(args.seed)
-
     raw = load_dataset("mbpp", split=args.split)
     n = min(args.num_prompts, len(raw))
     rows = [_code_row_to_sample(raw[i]) for i in range(n)]
 
-    model, tokenizer = _build_model(args.model_id, device)
-    if ckpt is not None:
+    vllm_config = VLLMConfig(
+        gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+        tensor_parallel_size=args.vllm_tensor_parallel_size,
+        max_model_len=args.vllm_max_model_len,
+        max_num_seqs=args.vllm_max_num_seqs,
+        enforce_eager=args.vllm_enforce_eager,
+    )
+    if generation_backend == GenerationBackend.HF:
+        model, tokenizer = _build_model(args.model_id, device)
+    else:
+        model = None
+        tokenizer = _build_tokenizer(args.model_id)
+    if ckpt is not None and model is not None:
         load_adapter_checkpoint(model, ckpt)
         model.eval()
 
     do_sample = not args.greedy
-    print(f"device={device} checkpoint={ckpt}")
+    print(f"device={device} checkpoint={ckpt} backend={generation_backend}")
     print(f"split={args.split!r} prompts={n} samples_per_prompt={args.num_samples}")
     print(f"do_sample={do_sample} temperature={args.temperature if do_sample else None} top_p={args.top_p if do_sample else None}")
     print()
@@ -193,7 +224,7 @@ def main():
         rew_sum = 0.0
         total = 0
 
-        for sample in rows:
+        for sample_idx, sample in enumerate(rows):
             texts, lens = _generate_batch_code(
                 model,
                 tokenizer,
@@ -204,6 +235,11 @@ def main():
                 do_sample=do_sample,
                 temperature=args.temperature,
                 top_p=args.top_p,
+                generation_backend=generation_backend,
+                vllm_config=vllm_config,
+                checkpoint_path=ckpt,
+                model_id=args.model_id,
+                seed=args.seed + budget * 1000 + sample_idx,
             )
             completions = [[{"role": "assistant", "content": t}] for t in texts]
             rewards = mbpp_execution_reward_func(
@@ -248,7 +284,8 @@ def main():
         "cap% = fraction of rollouts with completion length == max_new_tokens (length stop).\n"
         "code% = fraction with extractable Python (fenced or bare def/import block).\n"
         "cmp% / pass% = fraction with MBPP reward > 0 / >= 0.999 (same spirit as evaluate_code_dataset).\n"
-        "If cap% is high and code%/cmp% jump at larger budgets, generation was likely truncating."
+        "If cap% is high and code%/cmp% jump at larger budgets, generation was likely truncating.\n"
+        "Run the same sweep with --backend hf and --backend vllm to compare sampler behavior directly."
     )
 
     if args.show_prompts is not None:
@@ -275,6 +312,11 @@ def main():
                 do_sample=do_sample,
                 temperature=args.temperature,
                 top_p=args.top_p,
+                generation_backend=generation_backend,
+                vllm_config=vllm_config,
+                checkpoint_path=ckpt,
+                model_id=args.model_id,
+                seed=args.seed + show_budget * 1000 + pi,
             )
             for si, (text, li) in enumerate(zip(texts, lens)):
                 completions = [[{"role": "assistant", "content": text}]]
