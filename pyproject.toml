@@ -7,8 +7,10 @@ name = "influence-rlvr"
 version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
-    "torch>=2.4",
-    "transformers>=4.50",
+    "torch==2.9.0",
+    "torchvision==0.24.0",
+    "torchaudio==2.9.0",
+    "transformers>=4.56,<5",
     "peft>=0.14",
     "trl>=0.17",
     "datasets>=3.0",
@@ -19,8 +21,18 @@ dependencies = [
 
 [project.optional-dependencies]
 vllm = [
-    "vllm",
+    "vllm==0.11.2",
 ]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128", marker = "sys_platform == 'linux'" }
+torchvision = { index = "pytorch-cu128", marker = "sys_platform == 'linux'" }
+torchaudio = { index = "pytorch-cu128", marker = "sys_platform == 'linux'" }
 
 [tool.setuptools.packages.find]
 where = ["."]
