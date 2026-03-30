@@ -202,7 +202,11 @@ def parse_args():
             "Use --hf to use transformers generate only."
         ),
     )
-    p.add_argument("--model-id", default="Qwen/Qwen2.5-Math-1.5B")
+    p.add_argument(
+        "--model-id",
+        default="Qwen/Qwen2.5-Math-1.5B-Instruct",
+        help="HF model id (Instruct recommended for GRPO + chat prompts).",
+    )
     p.add_argument(
         "--output-dir",
         type=Path,
@@ -224,7 +228,12 @@ def parse_args():
     )
     p.add_argument("--grpo-beta", type=float, default=0.04)
     p.add_argument("--grpo-epsilon", type=float, default=0.2)
-    p.add_argument("--max-completion-length", type=int, default=256)
+    p.add_argument(
+        "--max-completion-length",
+        type=int,
+        default=512,
+        help="Max new tokens per GRPO rollout (vLLM/HF).",
+    )
     p.add_argument(
         "--hf",
         action="store_true",
@@ -274,7 +283,7 @@ def parse_args():
     p.add_argument(
         "--eval-max-new-tokens",
         type=int,
-        default=256,
+        default=512,
         help="Max new tokens for greedy post-train generation.",
     )
     return p.parse_args()
