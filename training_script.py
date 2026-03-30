@@ -248,7 +248,16 @@ def parse_args():
         default="colocate",
         help="TRL vLLM integration mode (default: colocate on training GPU).",
     )
-    p.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.45)
+    p.add_argument(
+        "--vllm-gpu-memory-utilization",
+        type=float,
+        default=0.45,
+        help=(
+            "vLLM GPU memory fraction in colocate mode. GRPO also runs a large PyTorch forward for "
+            "per-token log-probs on the same GPU; 0.85–0.95 almost always OOM. Use ~0.35–0.55 here, "
+            "or add --vllm-enable-sleep-mode and you can try slightly higher."
+        ),
+    )
     p.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
     p.add_argument(
         "--vllm-max-model-length",
@@ -259,7 +268,10 @@ def parse_args():
     p.add_argument(
         "--vllm-enable-sleep-mode",
         action="store_true",
-        help="Let TRL put colocated vLLM to sleep during optimizer steps (less VRAM, some latency).",
+        help=(
+            "Colocate only: let TRL idle vLLM during train/logprob phases so more VRAM is free "
+            "for PyTorch (avoids OOM when generation batches are large)."
+        ),
     )
     p.add_argument(
         "--vllm-server-base-url",
