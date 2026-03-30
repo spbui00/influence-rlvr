@@ -19,6 +19,120 @@ from influence_rlvr import (
     format_reward_func,
 )
 from influence_rlvr.prompts import build_r1_math_prompt, extract_gsm8k_target
+from influence_rlvr.rewards import extract_math_final_answer
+
+
+def _as_completion(text: str):
+    return [[{"role": "assistant", "content": text}]]
+
+
+@torch.inference_mode()
+def _generate_completion(
+    model,
+    tokenizer,
+    messages: list[dict],
+    *,
+    device: torch.device,
+    max_new_tokens: int,
+) -> str:
+    model.eval()
+    enc = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_tensors="pt",
+    )
+    input_ids = enc["input_ids"] if not isinstance(enc, torch.Tensor) else enc
+    if input_ids.dim() == 1:
+        input_ids = input_ids.unsqueeze(0)
+    input_ids = input_ids.to(device)
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
+    out = model.generate(
+        input_ids,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        pad_token_id=pad_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
+    new_tokens = out[0, input_ids.shape[1] :]
+    return tokenizer.decode(new_tokens.tolist(), skip_special_tokens=True)
+
+
+def run_post_training_eval(model, tokenizer, device, args) -> None:
+    n = args.eval_examples
+    if n <= 0:
+        return
+    split = f"test[:{n}]"
+    print("\n" + "=" * 80)
+    print(f"Post-training eval (GSM8K {split}, greedy HF generate)")
+    print("=" * 80)
+    eval_ds = load_dataset("openai/gsm8k", "main", split=split)
+    acc_scores = []
+    fmt_scores = []
+    rows = []
+    for i, ex in enumerate(eval_ds):
+        messages = build_r1_math_prompt(ex["question"])
+        gold = extract_gsm8k_target(ex["answer"])
+        text = _generate_completion(
+            model,
+            tokenizer,
+            messages,
+            device=device,
+            max_new_tokens=args.eval_max_new_tokens,
+        )
+        c = _as_completion(text)
+        a = accuracy_reward_func(c, [gold])[0]
+        f = format_reward_func(c)[0]
+        acc_scores.append(a)
+        fmt_scores.append(f)
+        pred = extract_math_final_answer(text)
+        rows.append({
+            "index": i,
+            "gold": gold,
+            "pred_parsed": pred,
+            "accuracy_reward": a,
+            "format_reward": f,
+            "response": text,
+            "question": ex["question"],
+        })
+
+    mean_acc = sum(acc_scores) / len(acc_scores)
+    mean_fmt = sum(fmt_scores) / len(fmt_scores)
+    print(f"  mean accuracy_reward: {mean_acc:.4f}  mean format_reward: {mean_fmt:.4f}")
+    summary_path = args.output_dir.resolve() / "eval_after_train.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "split": split,
+                "mean_accuracy_reward": mean_acc,
+                "mean_format_reward": mean_fmt,
+                "per_example": [
+                    {
+                        "index": r["index"],
+                        "gold": r["gold"],
+                        "pred_parsed": r["pred_parsed"],
+                        "accuracy_reward": r["accuracy_reward"],
+                        "format_reward": r["format_reward"],
+                    }
+                    for r in rows
+                ],
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    print(f"  Wrote {summary_path}")
+
+    k = min(args.inspect_examples, len(rows))
+    print("\n" + "-" * 80)
+    print(f"Sample responses (first {k} eval examples; full text)")
+    print("-" * 80)
+    for r in rows[:k]:
+        print(f"\n### [{r['index']}] accuracy={r['accuracy_reward']} format={r['format_reward']}")
+        print(f"gold={r['gold']!r} pred_parsed={r['pred_parsed']!r}")
+        print(f"--- question ---\n{r['question']}\n--- response ---\n{r['response']}\n")
 
 
 def save_base_checkpoint(peft_model, tokenizer_obj, output_dir: Path) -> Path:
@@ -109,6 +223,29 @@ def parse_args():
         "--vllm-server-base-url",
         default=None,
         help="When --vllm-mode=server, e.g. http://127.0.0.1:8000",
+    )
+    p.add_argument(
+        "--skip-eval",
+        action="store_true",
+        help="Skip GSM8K test eval and response dump after training.",
+    )
+    p.add_argument(
+        "--eval-examples",
+        type=int,
+        default=32,
+        help="Number of GSM8K test rows (from the start) for post-train metrics.",
+    )
+    p.add_argument(
+        "--inspect-examples",
+        type=int,
+        default=4,
+        help="Print full question/response for this many eval rows (subset of eval).",
+    )
+    p.add_argument(
+        "--eval-max-new-tokens",
+        type=int,
+        default=256,
+        help="Max new tokens for greedy post-train generation.",
     )
     return p.parse_args()
 
@@ -213,6 +350,9 @@ def main():
     trainer.train()
     print(f"\nTraining finished in {time.time() - t0:.1f}s")
     clear_cache(device)
+
+    if not args.skip_eval:
+        run_post_training_eval(model, tokenizer, device, args)
 
 
 if __name__ == "__main__":
