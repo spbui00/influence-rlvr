@@ -202,8 +202,8 @@ def parse_args():
     )
     p.add_argument(
         "--model-id",
-        default="Qwen/Qwen2.5-Math-1.5B-Instruct",
-        help="HF model id (Instruct recommended for GRPO + chat prompts).",
+        default="nvidia/Nemotron-Mini-4B-Instruct",
+        help="HF model id (default: Nemotron-Mini-4B-Instruct; 4k context).",
     )
     p.add_argument(
         "--output-dir",
