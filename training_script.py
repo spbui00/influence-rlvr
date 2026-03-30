@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import importlib
 import json
 import sys
 import time
@@ -17,13 +18,39 @@ from influence_rlvr import (
     clear_cache,
     detect_device,
     format_reward_func,
+    soft_format_reward_func,
 )
 from influence_rlvr.prompts import build_r1_math_prompt, extract_gsm8k_target
 from influence_rlvr.rewards import extract_math_final_answer
 
 
+FORMAT_SUFFIX = (
+    "Use exactly this structure:\n"
+    "<think>\n"
+    "step-by-step reasoning\n"
+    "</think>\n"
+    "\\boxed{final_answer}\n"
+    "Do not output Python code, markdown fences, or any text after the boxed answer."
+)
+
+
 def _as_completion(text: str):
     return [[{"role": "assistant", "content": text}]]
+
+
+def _build_training_script_math_prompt(question: str) -> list[dict[str, str]]:
+    messages = build_r1_math_prompt(question)
+    content = messages[0]["content"]
+    return [{"role": "user", "content": f"{content}\n\n{FORMAT_SUFFIX}"}]
+
+
+def _weighted_reward_func(reward_fn, weight: float, name: str):
+    def wrapped(*args, **kwargs):
+        scores = reward_fn(*args, **kwargs)
+        return [float(weight) * float(score) for score in scores]
+
+    wrapped.__name__ = f"{name}_x{weight:g}"
+    return wrapped
 
 
 @torch.inference_mode()
@@ -43,14 +70,18 @@ def _generate_completion(
         return_tensors="pt",
     )
     input_ids = enc["input_ids"] if not isinstance(enc, torch.Tensor) else enc
+    attention_mask = None if isinstance(enc, torch.Tensor) else enc.get("attention_mask")
     if input_ids.dim() == 1:
         input_ids = input_ids.unsqueeze(0)
     input_ids = input_ids.to(device)
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(device)
     pad_id = tokenizer.pad_token_id
     if pad_id is None:
         pad_id = tokenizer.eos_token_id
     out = model.generate(
         input_ids,
+        attention_mask=attention_mask,
         max_new_tokens=max_new_tokens,
         do_sample=False,
         pad_token_id=pad_id,
@@ -73,7 +104,7 @@ def run_post_training_eval(model, tokenizer, device, args) -> None:
     fmt_scores = []
     rows = []
     for i, ex in enumerate(eval_ds):
-        messages = build_r1_math_prompt(ex["question"])
+        messages = _build_training_script_math_prompt(ex["question"])
         gold = extract_gsm8k_target(ex["answer"])
         text = _generate_completion(
             model,
@@ -154,7 +185,7 @@ def save_base_checkpoint(peft_model, tokenizer_obj, output_dir: Path) -> Path:
 
 def format_math(example, idx):
     return {
-        "prompt": build_r1_math_prompt(example["question"]),
+        "prompt": _build_training_script_math_prompt(example["question"]),
         "solution": extract_gsm8k_target(example["answer"]),
         "train_index": idx,
     }
@@ -259,7 +290,7 @@ def main():
         if not torch.cuda.is_available():
             raise SystemExit("vLLM training requires CUDA.")
         try:
-            import vllm  # noqa: F401
+            importlib.import_module("vllm")
         except ImportError as exc:
             raise SystemExit(
                 "vLLM is not installed. Install with: uv sync --extra vllm"
@@ -333,10 +364,15 @@ def main():
             grpo_kw["vllm_server_base_url"] = args.vllm_server_base_url
 
     training_args = GRPOConfig(**grpo_kw)
+    reward_funcs = [
+        _weighted_reward_func(soft_format_reward_func, 1.0, "soft_format_reward"),
+        _weighted_reward_func(format_reward_func, 1.0, "format_reward"),
+        _weighted_reward_func(accuracy_reward_func, 1.0, "accuracy_reward"),
+    ]
 
     trainer = HistoricalBatchGRPOTrainer(
         model=model,
-        reward_funcs=[format_reward_func, accuracy_reward_func],
+        reward_funcs=reward_funcs,
         args=training_args,
         train_dataset=train_dataset,
         processing_class=tokenizer,
