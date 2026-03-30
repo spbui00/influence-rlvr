@@ -28,10 +28,8 @@ from .modes import (
 )
 from .eval import evaluate_math_dataset, evaluate_code_dataset
 from .rewards import (
-    format_reward_func,
     accuracy_reward_func,
     mbpp_execution_reward_func,
-    soft_format_reward_func,
     soft_accuracy_reward_func,
 )
 from .trajectory import (
@@ -81,10 +79,8 @@ __all__ = [
     "collect_test_infos",
     "collect_train_infos",
     "collect_checkpoint_infos",
-    "format_reward_func",
     "accuracy_reward_func",
     "mbpp_execution_reward_func",
-    "soft_format_reward_func",
     "soft_accuracy_reward_func",
     "collect_reward_infos",
     "HistoricalBatchGRPOTrainer",

@@ -5,7 +5,7 @@ import torch
 
 from .generation import generate_rollout_batch, rollout_to_completions
 from .modes import GenerationBackend, VLLMConfig
-from .rewards import accuracy_reward_func, format_reward_func, mbpp_execution_reward_func
+from .rewards import accuracy_reward_func, mbpp_execution_reward_func
 from .utils import tokenize_prompt
 
 
@@ -75,9 +75,7 @@ def evaluate_math_dataset(
     model_id=None,
 ):
     count = len(dataset) if limit is None else min(limit, len(dataset))
-    format_scores = []
     accuracy_scores = []
-    total_scores = []
 
     for idx in range(count):
         sample = dataset[idx]
@@ -93,23 +91,20 @@ def evaluate_math_dataset(
             adapter_path=adapter_path,
             model_id=model_id,
         )
-        format_score = float(format_reward_func(completions)[0])
         accuracy_score = float(accuracy_reward_func(completions, [sample["solution"]])[0])
-        format_scores.append(format_score)
         accuracy_scores.append(accuracy_score)
-        total_scores.append(format_score + accuracy_score)
         if progress:
             print(
                 f"{progress_prefix} math eval sample {idx + 1}/{count} "
-                f"| format={format_score:.1f} acc={accuracy_score:.1f}",
+                f"| acc={accuracy_score:.1f}",
                 flush=True,
             )
 
+    mean_acc = float(np.mean(accuracy_scores)) if accuracy_scores else 0.0
     return {
         "count": count,
-        "format_rate": float(np.mean(format_scores)) if format_scores else 0.0,
-        "accuracy_rate": float(np.mean(accuracy_scores)) if accuracy_scores else 0.0,
-        "mean_reward": float(np.mean(total_scores)) if total_scores else 0.0,
+        "accuracy_rate": mean_acc,
+        "mean_reward": mean_acc,
     }
 
 
