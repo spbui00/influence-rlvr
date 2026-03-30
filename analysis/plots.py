@@ -183,11 +183,6 @@ def eval_performance_figure(checkpoints: list[dict[str, object]]):
         if checkpoint.get("math_eval") is not None else np.nan
         for checkpoint in checkpoints
     ]
-    math_format = [
-        checkpoint.get("math_eval", {}).get("format_rate", np.nan)
-        if checkpoint.get("math_eval") is not None else np.nan
-        for checkpoint in checkpoints
-    ]
     code_pass = [
         checkpoint.get("code_eval", {}).get("pass_rate", np.nan)
         if checkpoint.get("code_eval") is not None else np.nan
@@ -209,7 +204,6 @@ def eval_performance_figure(checkpoints: list[dict[str, object]]):
         compile_label = str(latest_code_eval.get("compile_metric", compile_label)).replace("_", " ")
 
     axis_math.plot(steps, math_accuracy, marker="o", linewidth=1.5, label="Math exact")
-    axis_math.plot(steps, math_format, marker="s", linewidth=1.5, label="Math format")
     axis_math.set_ylim(-0.02, 1.02)
     axis_math.set_xlabel("Checkpoint step")
     axis_math.set_ylabel("Rate")
@@ -226,20 +220,10 @@ def eval_performance_figure(checkpoints: list[dict[str, object]]):
 
     if len(steps) > 1 and np.isfinite(math_accuracy[0]) and np.isfinite(math_accuracy[-1]):
         math_delta = math_accuracy[-1] - math_accuracy[0]
-        format_delta = (
-            math_format[-1] - math_format[0]
-            if np.isfinite(math_format[0]) and np.isfinite(math_format[-1])
-            else np.nan
-        )
         axis_math.text(
             0.02,
             0.04,
-            (
-                f"Delta exact: {math_delta:+.3f}\n"
-                f"Delta format: {format_delta:+.3f}"
-                if np.isfinite(format_delta)
-                else f"Delta exact: {math_delta:+.3f}"
-            ),
+            f"Delta exact: {math_delta:+.3f}",
             transform=axis_math.transAxes,
             fontsize=8,
             va="bottom",

@@ -389,7 +389,6 @@ class InfluenceAnalyzer:
                 lines.append(
                     "  math: "
                     f"exact={latest.math_eval.get('accuracy_rate', 0.0):.3f}, "
-                    f"format={latest.math_eval.get('format_rate', 0.0):.3f}, "
                     f"reward={latest.math_eval.get('mean_reward', 0.0):.3f}, "
                     f"count={latest.math_eval.get('count', 0)}"
                 )
@@ -409,10 +408,6 @@ class InfluenceAnalyzer:
                     delta_lines.append(
                         "math exact="
                         f"{latest.math_eval.get('accuracy_rate', 0.0) - base.math_eval.get('accuracy_rate', 0.0):+.3f}"
-                    )
-                    delta_lines.append(
-                        "math format="
-                        f"{latest.math_eval.get('format_rate', 0.0) - base.math_eval.get('format_rate', 0.0):+.3f}"
                     )
                 if base.code_eval is not None and latest.code_eval is not None:
                     delta_lines.append(
