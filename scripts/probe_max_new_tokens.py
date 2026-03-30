@@ -16,7 +16,6 @@ from influence_rlvr.prompts import build_r1_math_prompt, extract_gsm8k_target
 from influence_rlvr.rewards import (
     accuracy_reward_func,
     extract_math_final_answer,
-    format_reward_func,
 )
 from influence_rlvr.trajectory import load_adapter_checkpoint
 from influence_rlvr.utils import tokenize_prompt
@@ -195,7 +194,7 @@ def main():
 
     header = (
         f"{'budget':>6}  {'cap%':>6}  {'tok_mean':>8}  {'tok_p95':>8}  "
-        f"{'fmt%':>6}  {'acc%':>6}  {'fmt+acc':>8}  {'secs':>6}"
+        f"{'acc%':>6}  {'secs':>6}"
     )
     print(header)
     print("-" * len(header))
@@ -204,9 +203,7 @@ def main():
         t0 = time.perf_counter()
         all_lens = []
         cap_hits = 0
-        fmt_sum = 0.0
         acc_sum = 0.0
-        pair_sum = 0.0
         total = 0
 
         for ex_idx, ex in enumerate(rows):
@@ -229,22 +226,17 @@ def main():
                 seed=args.seed + budget * 1000 + ex_idx,
             )
             completions = [[{"role": "assistant", "content": t}] for t in texts]
-            fmt = format_reward_func(completions)
             acc = accuracy_reward_func(completions, [gold] * len(texts))
-            for li, f, a in zip(lens, fmt, acc):
+            for li, a in zip(lens, acc):
                 all_lens.append(li)
                 if li >= budget:
                     cap_hits += 1
-                fmt_sum += float(f)
                 acc_sum += float(a)
-                pair_sum += float(f) + float(a)
                 total += 1
 
         elapsed = time.perf_counter() - t0
         cap_pct = 100.0 * cap_hits / max(total, 1)
-        fmt_pct = 100.0 * fmt_sum / max(total, 1)
         acc_pct = 100.0 * acc_sum / max(total, 1)
-        pair_mean = pair_sum / max(total, 1)
         mean_len = statistics.mean(all_lens) if all_lens else 0.0
         if not all_lens:
             p95_len = 0.0
@@ -254,14 +246,14 @@ def main():
 
         print(
             f"{budget:6d}  {cap_pct:5.1f}%  {mean_len:8.1f}  {p95_len:8.1f}  "
-            f"{fmt_pct:5.1f}%  {acc_pct:5.1f}%  {pair_mean:8.3f}  {elapsed:6.1f}"
+            f"{acc_pct:5.1f}%  {elapsed:6.1f}"
         )
 
     print()
     print(
         "cap% = share of rollouts whose completion length equals max_new_tokens (length stop).\n"
-        "fmt% / acc% = mean format_reward_func / accuracy_reward_func over all rollouts.\n"
-        "Pick the smallest budget where cap% drops (e.g. under ~20-30%) and fmt% / acc% stop improving much."
+        "acc% = mean accuracy_reward over all rollouts.\n"
+        "Pick the smallest budget where cap% drops (e.g. under ~20-30%) and acc% stops improving much."
     )
     print(
         "If cap% stays ~100% even at 768–1024, raising the limit further usually will not fix training: "
@@ -307,7 +299,6 @@ def main():
             )
             for si, (text, li) in enumerate(zip(texts, lens)):
                 completions = [[{"role": "assistant", "content": text}]]
-                fr = float(format_reward_func(completions)[0])
                 ar = float(accuracy_reward_func(completions, [gold])[0])
                 parsed = extract_math_final_answer(text)
                 cap_hit = li >= show_budget
@@ -315,7 +306,7 @@ def main():
                 print(
                     f"\n{'#' * 80}\n"
                     f"prompt_index={pi} sample={si} new_tokens={li} cap_hit={cap_hit} "
-                    f"format_reward={fr} accuracy_reward={ar} parsed={parsed!r} gold={gold!r}\n"
+                    f"accuracy_reward={ar} parsed={parsed!r} gold={gold!r}\n"
                 )
                 print("--- question ---")
                 print(question)
