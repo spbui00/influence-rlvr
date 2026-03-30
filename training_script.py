@@ -25,12 +25,9 @@ from influence_rlvr.rewards import extract_math_final_answer
 
 
 FORMAT_SUFFIX = (
-    "Use exactly this structure:\n"
-    "<think>\n"
-    "step-by-step reasoning\n"
-    "</think>\n"
-    "\\boxed{final_answer}\n"
-    "Do not output Python code, markdown fences, or any text after the boxed answer."
+    "After </think>, the last line must contain only the final numeric GSM8K answer in "
+    "\\boxed{...} (digits / fraction / decimal). Do not write placeholders, "
+    "do not repeat this instruction block, and do not use code fences."
 )
 
 
@@ -74,7 +71,9 @@ def _generate_completion(
     if input_ids.dim() == 1:
         input_ids = input_ids.unsqueeze(0)
     input_ids = input_ids.to(device)
-    if attention_mask is not None:
+    if attention_mask is None:
+        attention_mask = torch.ones_like(input_ids, dtype=torch.long, device=device)
+    else:
         attention_mask = attention_mask.to(device)
     pad_id = tokenizer.pad_token_id
     if pad_id is None:
