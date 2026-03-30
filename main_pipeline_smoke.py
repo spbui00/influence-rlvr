@@ -30,7 +30,6 @@ from influence_rlvr import (
     clear_cache,
     collect_checkpoint_infos,
     detect_device,
-    format_reward_func,
     mbpp_execution_reward_func,
 )
 from influence_rlvr.modes import (
@@ -241,7 +240,6 @@ def format_code(example, idx=None):
 def build_math_reward_fns(sample, num_generations):
     solution = sample["solution"]
     return [
-        format_reward_func,
         partial(accuracy_reward_func, solution=[solution] * num_generations),
     ]
 
@@ -341,7 +339,7 @@ if EXPERIMENT_MODE == ExperimentMode.CODE_GRPO:
 else:
     training_domain = "Math"
     training_dataset = math_train_dataset
-    training_reward_funcs = [format_reward_func, accuracy_reward_func]
+    training_reward_funcs = [accuracy_reward_func]
 
 replay_train_dataset = training_dataset
 test_domain = "Code"
@@ -540,8 +538,7 @@ if checkpoint_infos:
     if latest.get("math_eval") is not None:
         print(
             "Final math eval: "
-            f"exact={latest['math_eval']['accuracy_rate']:.3f}, "
-            f"format={latest['math_eval']['format_rate']:.3f}"
+            f"exact={latest['math_eval']['accuracy_rate']:.3f}"
         )
     if latest.get("code_eval") is not None:
         print(

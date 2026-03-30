@@ -17,8 +17,6 @@ from influence_rlvr import (
     accuracy_reward_func,
     clear_cache,
     detect_device,
-    format_reward_func,
-    soft_format_reward_func,
 )
 from influence_rlvr.prompts import build_r1_math_prompt, extract_gsm8k_target
 from influence_rlvr.rewards import extract_math_final_answer
@@ -39,15 +37,6 @@ def _build_training_script_math_prompt(question: str) -> list[dict[str, str]]:
     messages = build_r1_math_prompt(question)
     content = messages[0]["content"]
     return [{"role": "user", "content": f"{content}\n\n{FORMAT_SUFFIX}"}]
-
-
-def _weighted_reward_func(reward_fn, weight: float, name: str):
-    def wrapped(*args, **kwargs):
-        scores = reward_fn(*args, **kwargs)
-        return [float(weight) * float(score) for score in scores]
-
-    wrapped.__name__ = f"{name}_x{weight:g}"
-    return wrapped
 
 
 @torch.inference_mode()
@@ -100,7 +89,6 @@ def run_post_training_eval(model, tokenizer, device, args) -> None:
     print("=" * 80)
     eval_ds = load_dataset("openai/gsm8k", "main", split=split)
     acc_scores = []
-    fmt_scores = []
     rows = []
     for i, ex in enumerate(eval_ds):
         messages = _build_training_script_math_prompt(ex["question"])
@@ -114,37 +102,31 @@ def run_post_training_eval(model, tokenizer, device, args) -> None:
         )
         c = _as_completion(text)
         a = accuracy_reward_func(c, [gold])[0]
-        f = format_reward_func(c)[0]
         acc_scores.append(a)
-        fmt_scores.append(f)
         pred = extract_math_final_answer(text)
         rows.append({
             "index": i,
             "gold": gold,
             "pred_parsed": pred,
             "accuracy_reward": a,
-            "format_reward": f,
             "response": text,
             "question": ex["question"],
         })
 
     mean_acc = sum(acc_scores) / len(acc_scores)
-    mean_fmt = sum(fmt_scores) / len(fmt_scores)
-    print(f"  mean accuracy_reward: {mean_acc:.4f}  mean format_reward: {mean_fmt:.4f}")
+    print(f"  mean accuracy_reward: {mean_acc:.4f}")
     summary_path = args.output_dir.resolve() / "eval_after_train.json"
     summary_path.write_text(
         json.dumps(
             {
                 "split": split,
                 "mean_accuracy_reward": mean_acc,
-                "mean_format_reward": mean_fmt,
                 "per_example": [
                     {
                         "index": r["index"],
                         "gold": r["gold"],
                         "pred_parsed": r["pred_parsed"],
                         "accuracy_reward": r["accuracy_reward"],
-                        "format_reward": r["format_reward"],
                     }
                     for r in rows
                 ],
@@ -160,7 +142,7 @@ def run_post_training_eval(model, tokenizer, device, args) -> None:
     print(f"Sample responses (first {k} eval examples; full text)")
     print("-" * 80)
     for r in rows[:k]:
-        print(f"\n### [{r['index']}] accuracy={r['accuracy_reward']} format={r['format_reward']}")
+        print(f"\n### [{r['index']}] accuracy={r['accuracy_reward']}")
         print(f"gold={r['gold']!r} pred_parsed={r['pred_parsed']!r}")
         print(f"--- question ---\n{r['question']}\n--- response ---\n{r['response']}\n")
 
@@ -372,11 +354,7 @@ def main():
             grpo_kw["vllm_server_base_url"] = args.vllm_server_base_url
 
     training_args = GRPOConfig(**grpo_kw)
-    reward_funcs = [
-        _weighted_reward_func(soft_format_reward_func, 1.0, "soft_format_reward"),
-        _weighted_reward_func(format_reward_func, 1.0, "format_reward"),
-        _weighted_reward_func(accuracy_reward_func, 1.0, "accuracy_reward"),
-    ]
+    reward_funcs = [accuracy_reward_func]
 
     trainer = HistoricalBatchGRPOTrainer(
         model=model,
