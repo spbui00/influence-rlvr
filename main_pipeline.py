@@ -287,7 +287,16 @@ def save_base_checkpoint(peft_model, tokenizer_obj, output_dir):
     return checkpoint_dir
 
 
-save_base_checkpoint(model, tokenizer, OUTPUT_DIR)
+_will_run_phase1_training = (
+    not SKIP_TRAINING and EXPERIMENT_MODE != ExperimentMode.BASE_EVAL
+)
+if _will_run_phase1_training:
+    save_base_checkpoint(model, tokenizer, OUTPUT_DIR)
+else:
+    print(
+        "Skipping save_base_checkpoint (Phase 1 training disabled); "
+        "existing checkpoints under OUTPUT_DIR are left unchanged."
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
