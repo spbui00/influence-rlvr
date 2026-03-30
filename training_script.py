@@ -79,13 +79,26 @@ def _generate_completion(
     return tokenizer.decode(new_tokens.tolist(), skip_special_tokens=True)
 
 
-def run_post_training_eval(model, tokenizer, device, args) -> None:
+def run_gsm8k_eval(
+    model,
+    tokenizer,
+    device,
+    args,
+    *,
+    phase: str,
+    summary_filename: str,
+) -> None:
     n = args.eval_examples
     if n <= 0:
         return
     split = f"test[:{n}]"
+    title = (
+        "Baseline eval (before GRPO)"
+        if phase == "baseline"
+        else "Post-training eval"
+    )
     print("\n" + "=" * 80)
-    print(f"Post-training eval (GSM8K {split}, greedy HF generate)")
+    print(f"{title} — GSM8K {split}, greedy HF generate")
     print("=" * 80)
     eval_ds = load_dataset("openai/gsm8k", "main", split=split)
     acc_scores = []
@@ -115,10 +128,11 @@ def run_post_training_eval(model, tokenizer, device, args) -> None:
 
     mean_acc = sum(acc_scores) / len(acc_scores)
     print(f"  mean accuracy_reward: {mean_acc:.4f}")
-    summary_path = args.output_dir.resolve() / "eval_after_train.json"
+    summary_path = args.output_dir.resolve() / summary_filename
     summary_path.write_text(
         json.dumps(
             {
+                "phase": phase,
                 "split": split,
                 "mean_accuracy_reward": mean_acc,
                 "per_example": [
@@ -138,6 +152,8 @@ def run_post_training_eval(model, tokenizer, device, args) -> None:
     print(f"  Wrote {summary_path}")
 
     k = min(args.inspect_examples, len(rows))
+    if k <= 0:
+        return
     print("\n" + "-" * 80)
     print(f"Sample responses (first {k} eval examples; full text)")
     print("-" * 80)
@@ -195,7 +211,12 @@ def parse_args():
         default=Path("./outputs/train_script/rlvr-output"),
         help="Checkpoints and batch history are written here.",
     )
-    p.add_argument("--n-math", type=int, default=128, help="GSM8K train rows [:N]")
+    p.add_argument(
+        "--n-math",
+        type=int,
+        default=0,
+        help="GSM8K train examples: first N rows, or 0 (default) for the full train split (~7.5k).",
+    )
     p.add_argument("--max-steps", type=int, default=30)
     p.add_argument("--save-steps", type=int, default=10)
     p.add_argument("--learning-rate", type=float, default=1e-4)
@@ -248,13 +269,13 @@ def parse_args():
     p.add_argument(
         "--skip-eval",
         action="store_true",
-        help="Skip GSM8K test eval and response dump after training.",
+        help="Skip GSM8K test eval (no baseline before train, no eval after train).",
     )
     p.add_argument(
         "--eval-examples",
         type=int,
         default=32,
-        help="Number of GSM8K test rows (from the start) for post-train metrics.",
+        help="GSM8K test rows (from the start) for baseline + post-train metrics.",
     )
     p.add_argument(
         "--inspect-examples",
@@ -266,7 +287,7 @@ def parse_args():
         "--eval-max-new-tokens",
         type=int,
         default=512,
-        help="Max new tokens for greedy post-train generation.",
+        help="Max new tokens for greedy baseline/post-train generation.",
     )
     return p.parse_args()
 
@@ -316,8 +337,21 @@ def main():
 
     save_base_checkpoint(model, tokenizer, out)
 
+    if not args.skip_eval:
+        run_gsm8k_eval(
+            model,
+            tokenizer,
+            device,
+            args,
+            phase="baseline",
+            summary_filename="eval_baseline.json",
+        )
+
     print("\nLoading GSM8K train slice...")
-    raw = load_dataset("openai/gsm8k", "main", split=f"train[:{args.n_math}]")
+    train_split = (
+        "train" if args.n_math <= 0 else f"train[:{args.n_math}]"
+    )
+    raw = load_dataset("openai/gsm8k", "main", split=train_split)
     train_dataset = raw.map(format_math, with_indices=True)
     print(f"  Train rows: {len(train_dataset)}")
 
@@ -374,7 +408,14 @@ def main():
     clear_cache(device)
 
     if not args.skip_eval:
-        run_post_training_eval(model, tokenizer, device, args)
+        run_gsm8k_eval(
+            model,
+            tokenizer,
+            device,
+            args,
+            phase="after_train",
+            summary_filename="eval_after_train.json",
+        )
 
 
 if __name__ == "__main__":
