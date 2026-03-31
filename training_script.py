@@ -409,6 +409,7 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
     tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
 
     base_model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
