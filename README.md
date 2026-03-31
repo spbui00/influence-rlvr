@@ -17,6 +17,21 @@ uv sync --extra vllm
 PYTHONUNBUFFERED=1 uv run python -u main_pipeline.py 2>&1 | tee outputs/run1/run.log
 ```
 
+### Standalone GRPO + eval statistics (`training_script.py`)
+
+From the repo root (with `uv run` or your env that has TRL/vLLM as needed):
+
+- Writes `run_config.json`, `eval_baseline.json`, and `eval_after_train.json` under `--output-dir` (eval JSON includes `metadata`: seed, model, LoRA).
+- Use `--seed`, `--lora-r`, `--lora-alpha`, and comma-separated `--lora-target-modules` for reproducibility and capacity.
+- See `python training_script.py --help` epilog for a multi-seed shell loop and suggested hyperparameters.
+
+After one or more runs, compare accuracy and paired significance (Wilson CIs, bootstrap on mean paired delta, McNemar):
+
+```bash
+uv run python scripts/compare_gsm8k_eval.py --run-dir outputs/your_run/rlvr-output
+uv run python scripts/compare_gsm8k_eval.py --multi-run 'outputs/nemotron_math_s*/rlvr-output'
+```
+
 All artifacts land in a single folder: `outputs/<RUN_NAME>/`.
 
 - `rlvr-output/` holds the training checkpoints and batch history.
