@@ -4,6 +4,22 @@ R1_MATH_INSTRUCTION = (
 )
 
 
+def append_suffix_to_last_user_message(
+    messages: list[dict[str, str]], suffix: str
+) -> list[dict[str, str]]:
+    if not messages:
+        raise ValueError("messages must be non-empty")
+    out: list[dict[str, str]] = [
+        {"role": m["role"], "content": m["content"]} for m in messages
+    ]
+    for i in range(len(out) - 1, -1, -1):
+        if out[i].get("role") == "user":
+            c = out[i]["content"]
+            out[i] = {"role": "user", "content": f"{c}\n\n{suffix}"}
+            return out
+    raise ValueError("No user message in messages")
+
+
 def build_r1_math_prompt(question):
     return [{
         "role": "user",
