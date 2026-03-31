@@ -19,7 +19,11 @@ from influence_rlvr import (
     clear_cache,
     detect_device,
 )
-from influence_rlvr.prompts import build_r1_math_prompt, extract_gsm8k_target
+from influence_rlvr.prompts import (
+    append_suffix_to_last_user_message,
+    build_r1_math_prompt,
+    extract_gsm8k_target,
+)
 from influence_rlvr.rewards import extract_math_final_answer
 
 
@@ -35,9 +39,9 @@ def _as_completion(text: str):
 
 
 def _build_training_script_math_prompt(question: str) -> list[dict[str, str]]:
-    messages = build_r1_math_prompt(question)
-    content = messages[0]["content"]
-    return [{"role": "user", "content": f"{content}\n\n{FORMAT_SUFFIX}"}]
+    return append_suffix_to_last_user_message(
+        build_r1_math_prompt(question), FORMAT_SUFFIX
+    )
 
 
 @torch.inference_mode()
