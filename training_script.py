@@ -290,7 +290,7 @@ def parse_args():
     )
     p.add_argument("--max-steps", type=int, default=30)
     p.add_argument("--save-steps", type=int, default=10)
-    p.add_argument("--learning-rate", type=float, default=1e-4)
+    p.add_argument("--learning-rate", type=float, default=1e-6)
     p.add_argument("--per-device-batch", type=int, default=4)
     p.add_argument("--grad-accum", type=int, default=2)
     p.add_argument("--g-train", type=int, default=4, help="GRPO num_generations")
@@ -300,7 +300,7 @@ def parse_args():
         default=32,
         help="Must be divisible by num_generations where required by TRL.",
     )
-    p.add_argument("--grpo-beta", type=float, default=0.04)
+    p.add_argument("--grpo-beta", type=float, default=0.0)
     p.add_argument("--grpo-epsilon", type=float, default=0.2)
     p.add_argument(
         "--max-completion-length",
