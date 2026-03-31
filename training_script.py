@@ -462,7 +462,6 @@ def main():
         "use_vllm": use_vllm,
         "num_generations": args.g_train,
         "generation_batch_size": args.generation_batch_size,
-        "loss_type": "grpo",
         "beta": args.grpo_beta,
         "epsilon": args.grpo_epsilon,
         "importance_sampling_level": "token",
