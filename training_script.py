@@ -2,6 +2,7 @@
 import argparse
 import importlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -9,7 +10,7 @@ from pathlib import Path
 import torch
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 from trl import GRPOConfig
 
 from influence_rlvr import (
@@ -79,6 +80,19 @@ def _generate_completion(
     return tokenizer.decode(new_tokens.tolist(), skip_special_tokens=True)
 
 
+def _eval_metadata(args, split: str) -> dict:
+    return {
+        "seed": args.seed,
+        "model_id": args.model_id,
+        "eval_split": split,
+        "lora": {
+            "r": args.lora_r,
+            "lora_alpha": args.lora_alpha,
+            "target_modules": _parse_lora_target_modules(args.lora_target_modules),
+        },
+    }
+
+
 def run_gsm8k_eval(
     model,
     tokenizer,
@@ -129,26 +143,22 @@ def run_gsm8k_eval(
     mean_acc = sum(acc_scores) / len(acc_scores)
     print(f"  mean accuracy_reward: {mean_acc:.4f}")
     summary_path = args.output_dir.resolve() / summary_filename
-    summary_path.write_text(
-        json.dumps(
+    payload = {
+        "phase": phase,
+        "split": split,
+        "mean_accuracy_reward": mean_acc,
+        "metadata": _eval_metadata(args, split),
+        "per_example": [
             {
-                "phase": phase,
-                "split": split,
-                "mean_accuracy_reward": mean_acc,
-                "per_example": [
-                    {
-                        "index": r["index"],
-                        "gold": r["gold"],
-                        "pred_parsed": r["pred_parsed"],
-                        "accuracy_reward": r["accuracy_reward"],
-                    }
-                    for r in rows
-                ],
-            },
-            indent=2,
-        )
-        + "\n"
-    )
+                "index": r["index"],
+                "gold": r["gold"],
+                "pred_parsed": r["pred_parsed"],
+                "accuracy_reward": r["accuracy_reward"],
+            }
+            for r in rows
+        ],
+    }
+    summary_path.write_text(json.dumps(payload, indent=2) + "\n")
     print(f"  Wrote {summary_path}")
 
     k = min(args.inspect_examples, len(rows))
@@ -188,17 +198,78 @@ def format_math(example, idx):
     }
 
 
+def _parse_lora_target_modules(s: str) -> list[str]:
+    parts = [p.strip() for p in s.split(",")]
+    return [p for p in parts if p]
+
+
+def _args_to_jsonable(args: argparse.Namespace) -> dict:
+    d = {}
+    for k, v in vars(args).items():
+        if isinstance(v, Path):
+            d[k] = str(v)
+        elif isinstance(v, (list, tuple)):
+            d[k] = list(v)
+        else:
+            d[k] = v
+    return d
+
+
+_TRAINING_SCRIPT_EPILOG = """
+vLLM modes: 'colocate' runs vLLM in-process on the training GPU(s).
+'server' expects a TRL vLLM server (see `trl vllm-serve`).
+Use --hf to use transformers generate only.
+
+Multi-seed + significance: use different --seed and --output-dir per run, full test
+eval (--eval-examples 1319), then aggregate:
+  python scripts/compare_gsm8k_eval.py --run-dir outputs/your_run/rlvr-output
+  python scripts/compare_gsm8k_eval.py --multi-run 'outputs/nemotron_math_s*/rlvr-output'
+
+Stronger GSM8K GRPO (tune batch / vLLM if OOM on your GPU):
+  for s in 42 43 44; do
+    env -u LD_LIBRARY_PATH PYTHONHASHSEED=$s python training_script.py \\
+      --output-dir ./outputs/nemotron_math_s${s}/rlvr-output --seed $s \\
+      --max-steps 2500 --save-steps 250 \\
+      --lora-r 16 --lora-target-modules q_proj,k_proj,v_proj,o_proj \\
+      --eval-examples 1319 \\
+      --g-train 8 --generation-batch-size 64 \\
+      --per-device-batch 4 --grad-accum 2 \\
+      --vllm-gpu-memory-utilization 0.45 --vllm-enable-sleep-mode
+  done
+"""
+
+
 def parse_args():
     p = argparse.ArgumentParser(
         description=(
             "Standalone GRPO training (GSM8K math) matching main_pipeline Phase 1. "
             "Default: vLLM colocated generation via TRL (requires Linux + CUDA + vllm extra)."
         ),
-        epilog=(
-            "vLLM modes: 'colocate' runs vLLM in-process on the training GPU(s). "
-            "'server' expects a TRL vLLM server (see `trl vllm-serve`). "
-            "Use --hf to use transformers generate only."
-        ),
+        epilog=_TRAINING_SCRIPT_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="RNG seed (torch/numpy/random; also passed to GRPOConfig).",
+    )
+    p.add_argument(
+        "--lora-r",
+        type=int,
+        default=8,
+        help="LoRA rank (default 8).",
+    )
+    p.add_argument(
+        "--lora-alpha",
+        type=int,
+        default=16,
+        help="LoRA alpha (default 16).",
+    )
+    p.add_argument(
+        "--lora-target-modules",
+        default="q_proj,v_proj",
+        help="Comma-separated PEFT target module names (default: q_proj,v_proj).",
     )
     p.add_argument(
         "--model-id",
@@ -306,6 +377,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    os.environ["PYTHONHASHSEED"] = str(args.seed)
+    set_seed(args.seed)
     use_vllm = not args.hf
     if use_vllm:
         if sys.platform != "linux":
@@ -326,7 +399,12 @@ def main():
     out = args.output_dir.resolve()
     out.mkdir(parents=True, exist_ok=True)
 
+    (out / "run_config.json").write_text(
+        json.dumps(_args_to_jsonable(args), indent=2) + "\n"
+    )
+
     print(f"Device: {device} | use_vllm={use_vllm} | vllm_mode={args.vllm_mode if use_vllm else 'n/a'}")
+    print(f"Seed: {args.seed}")
     print(f"Output: {out}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
@@ -337,10 +415,11 @@ def main():
         torch_dtype=torch.bfloat16,
     ).to(device)
 
+    lora_targets = _parse_lora_target_modules(args.lora_target_modules)
     lora_config = LoraConfig(
-        r=8,
-        lora_alpha=16,
-        target_modules=["q_proj", "v_proj"],
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        target_modules=lora_targets,
         bias="none",
         task_type="CAUSAL_LM",
     )
@@ -369,6 +448,7 @@ def main():
 
     grpo_kw: dict = {
         "output_dir": str(out),
+        "seed": args.seed,
         "learning_rate": args.learning_rate,
         "per_device_train_batch_size": args.per_device_batch,
         "gradient_accumulation_steps": args.grad_accum,
