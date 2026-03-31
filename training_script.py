@@ -301,8 +301,11 @@ def parse_args():
     p.add_argument(
         "--generation-batch-size",
         type=int,
-        default=32,
-        help="Must be divisible by num_generations where required by TRL.",
+        default=None,
+        help=(
+            "TRL generation batch size; if omitted, TRL sets it to "
+            "per_device_train_batch_size × world_size × gradient_accumulation_steps."
+        ),
     )
     p.add_argument("--grpo-beta", type=float, default=0.0)
     p.add_argument("--grpo-epsilon", type=float, default=0.2)
@@ -465,13 +468,15 @@ def main():
         "bf16": device.type == "cuda",
         "use_vllm": use_vllm,
         "num_generations": args.g_train,
-        "generation_batch_size": args.generation_batch_size,
+        "loss_type": "dapo",
         "beta": args.grpo_beta,
         "epsilon": args.grpo_epsilon,
         "importance_sampling_level": "token",
         "scale_rewards": "group",
         "max_completion_length": args.max_completion_length,
     }
+    if args.generation_batch_size is not None:
+        grpo_kw["generation_batch_size"] = args.generation_batch_size
 
     if use_vllm:
         grpo_kw["vllm_mode"] = args.vllm_mode
