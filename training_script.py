@@ -272,8 +272,10 @@ def parse_args():
     )
     p.add_argument(
         "--lora-target-modules",
-        default="q_proj,v_proj",
-        help="Comma-separated PEFT target module names (default: q_proj,v_proj).",
+        default="q_proj,k_proj,v_proj,o_proj,up_proj,down_proj",
+        help=(
+            "Comma-separated PEFT target module names (default: attention + MLP for Llama/Nemotron-style)."
+        ),
     )
     p.add_argument(
         "--model-id",

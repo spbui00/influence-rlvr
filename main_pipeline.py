@@ -270,7 +270,14 @@ base_model = AutoModelForCausalLM.from_pretrained(
 lora_config = LoraConfig(
     r=8,
     lora_alpha=16,
-    target_modules=["q_proj", "v_proj"],
+    target_modules=[
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "up_proj",
+        "down_proj",
+    ],
     bias="none",
     task_type="CAUSAL_LM",
 )
