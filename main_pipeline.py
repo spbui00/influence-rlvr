@@ -70,7 +70,8 @@ GRPO_BETA = 0.0
 GRPO_EPSILON = 0.2
 G_TRAIN = 8
 G_TEST = 8
-GENERATION_BATCH_SIZE = None
+_TRAINING_WORLD_SIZE = max(1, int(os.environ.get("WORLD_SIZE", "1")))
+GENERATION_BATCH_SIZE = PER_DEVICE_BATCH * GRAD_ACCUM_STEPS * _TRAINING_WORLD_SIZE
 TRAIN_GRAD_SEED = 1234
 LAMBDA_DAMP = 0.1
 N_MATH = 300
@@ -219,18 +220,11 @@ def finalize_results_dir(
 RESULTS_REUSE_POLICY = normalize_results_reuse_policy(RESULTS_REUSE_POLICY)
 
 optimizer_step_rows = PER_DEVICE_BATCH * GRAD_ACCUM_STEPS
-_effective_generation_batch = (
-    GENERATION_BATCH_SIZE
-    if GENERATION_BATCH_SIZE is not None
-    else PER_DEVICE_BATCH * GRAD_ACCUM_STEPS
-)
-generation_prompt_pool = _effective_generation_batch // max(G_TRAIN, 1)
+generation_prompt_pool = GENERATION_BATCH_SIZE // max(G_TRAIN, 1)
 print(
     "Historical coverage target: "
     f"{optimizer_step_rows} prompt rows/optimizer step, "
-    f"{generation_prompt_pool} unique prompts/generation cycle "
-    f"(effective_generation_batch≈{_effective_generation_batch}; "
-    "None uses TRL per_device×world×grad_accum)"
+    f"{generation_prompt_pool} unique prompts/generation cycle"
 )
 if generation_prompt_pool < optimizer_step_rows:
     print(
@@ -261,6 +255,7 @@ if GENERATION_BACKEND == GenerationBackend.VLLM and not VLLM_CONFIG.training_use
 print(f"\nLoading model: {MODEL_ID}")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "left"
 
 base_model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
@@ -392,7 +387,7 @@ def run_training():
     print("PHASE 1: GRPO Training")
     print("=" * 80)
 
-    grpo_training_kw = dict(
+    training_args = GRPOConfig(
         output_dir=OUTPUT_DIR,
         learning_rate=LEARNING_RATE,
         per_device_train_batch_size=PER_DEVICE_BATCH,
@@ -413,9 +408,6 @@ def run_training():
         importance_sampling_level="token",
         scale_rewards="group",
     )
-    if GENERATION_BATCH_SIZE is not None:
-        grpo_training_kw["generation_batch_size"] = GENERATION_BATCH_SIZE
-    training_args = GRPOConfig(**grpo_training_kw)
 
     trainer = HistoricalBatchGRPOTrainer(
         model=model,

@@ -371,7 +371,7 @@ if not SKIP_TRAINING:
         ),
         num_generations=G_TRAIN,
         generation_batch_size=GENERATION_BATCH_SIZE,
-        loss_type="dapo",
+        loss_type="grpo",
         beta=GRPO_BETA,
         epsilon=GRPO_EPSILON,
         importance_sampling_level="token",

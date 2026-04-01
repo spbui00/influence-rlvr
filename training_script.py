@@ -20,7 +20,7 @@ from influence_rlvr import (
     detect_device,
 )
 from influence_rlvr.prompts import (
-    append_suffix_to_last_user_message,
+    append_suffix_to_final_user_message,
     build_r1_math_prompt,
     extract_gsm8k_target,
 )
@@ -39,9 +39,8 @@ def _as_completion(text: str):
 
 
 def _build_training_script_math_prompt(question: str) -> list[dict[str, str]]:
-    return append_suffix_to_last_user_message(
-        build_r1_math_prompt(question), FORMAT_SUFFIX
-    )
+    messages = build_r1_math_prompt(question)
+    return append_suffix_to_final_user_message(messages, FORMAT_SUFFIX)
 
 
 @torch.inference_mode()
@@ -234,10 +233,10 @@ Stronger GSM8K GRPO (tune batch / vLLM if OOM on your GPU):
     env -u LD_LIBRARY_PATH PYTHONHASHSEED=$s python training_script.py \\
       --output-dir ./outputs/nemotron_math_s${s}/rlvr-output --seed $s \\
       --max-steps 2500 --save-steps 250 \\
-      --lora-r 16 --lora-target-modules q_proj,k_proj,v_proj,o_proj \\
+      --lora-r 16 \\
+      --lora-target-modules q_proj,k_proj,v_proj,o_proj,up_proj,down_proj \\
       --eval-examples 1319 \\
-      --g-train 8 --generation-batch-size 64 \\
-      --per-device-batch 4 --grad-accum 2 \\
+      --g-train 8 --per-device-batch 4 --grad-accum 2 \\
       --vllm-gpu-memory-utilization 0.45 --vllm-enable-sleep-mode
   done
 """
@@ -273,9 +272,7 @@ def parse_args():
     p.add_argument(
         "--lora-target-modules",
         default="q_proj,k_proj,v_proj,o_proj,up_proj,down_proj",
-        help=(
-            "Comma-separated PEFT target module names (default: attention + MLP for Llama/Nemotron-style)."
-        ),
+        help="Comma-separated PEFT target module names.",
     )
     p.add_argument(
         "--model-id",
@@ -305,8 +302,8 @@ def parse_args():
         type=int,
         default=None,
         help=(
-            "TRL generation batch size; if omitted, TRL sets it to "
-            "per_device_train_batch_size × world_size × gradient_accumulation_steps."
+            "Optional TRL generation batch size. If omitted, TRL uses "
+            "per_device_batch * world_size * grad_accum (one fresh generation batch per optimizer step)."
         ),
     )
     p.add_argument("--grpo-beta", type=float, default=0.0)
