@@ -470,7 +470,6 @@ def main():
         "bf16": device.type == "cuda",
         "use_vllm": use_vllm,
         "num_generations": args.g_train,
-        "loss_type": "dapo",
         "beta": args.grpo_beta,
         "epsilon": args.grpo_epsilon,
         "importance_sampling_level": "token",

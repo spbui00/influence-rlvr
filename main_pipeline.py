@@ -408,7 +408,6 @@ def run_training():
             and VLLM_CONFIG.training_use_vllm
         ),
         num_generations=G_TRAIN,
-        loss_type="dapo",
         beta=GRPO_BETA,
         epsilon=GRPO_EPSILON,
         importance_sampling_level="token",
