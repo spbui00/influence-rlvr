@@ -236,7 +236,7 @@ Stronger GSM8K GRPO (tune batch / vLLM if OOM on your GPU):
       --lora-r 16 \\
       --lora-target-modules q_proj,k_proj,v_proj,o_proj,up_proj,down_proj \\
       --eval-examples 1319 \\
-      --g-train 8 --per-device-batch 4 --grad-accum 2 \\
+      --g-train 16 --per-device-batch 8 --grad-accum 2 \\
       --vllm-gpu-memory-utilization 0.45 --vllm-enable-sleep-mode
   done
 """
@@ -294,9 +294,9 @@ def parse_args():
     p.add_argument("--max-steps", type=int, default=2500)
     p.add_argument("--save-steps", type=int, default=10)
     p.add_argument("--learning-rate", type=float, default=1e-6)
-    p.add_argument("--per-device-batch", type=int, default=4)
+    p.add_argument("--per-device-batch", type=int, default=8)
     p.add_argument("--grad-accum", type=int, default=2)
-    p.add_argument("--g-train", type=int, default=4, help="GRPO num_generations")
+    p.add_argument("--g-train", type=int, default=16, help="GRPO num_generations")
     p.add_argument(
         "--generation-batch-size",
         type=int,
