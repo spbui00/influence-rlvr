@@ -276,8 +276,8 @@ def parse_args():
     )
     p.add_argument(
         "--model-id",
-        default="nvidia/Nemotron-Mini-4B-Instruct",
-        help="HF model id (default: Nemotron-Mini-4B-Instruct; 4k context).",
+        default="HuggingFaceTB/SmolLM2-1.7B-Instruct",
+        help="HF model id (default: SmolLM2-1.7B-Instruct).",
     )
     p.add_argument(
         "--output-dir",

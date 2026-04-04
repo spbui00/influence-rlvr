@@ -56,8 +56,8 @@ from influence_rlvr.prompts import (
 # ═══════════════════════════════════════════════════════════════════════════════
 # Configuration — edit these before launching
 # ═══════════════════════════════════════════════════════════════════════════════
-MODEL_ID = "Qwen/Qwen2.5-Math-1.5B"
-RUN_NAME = "run6"
+MODEL_ID = "HuggingFaceTB/SmolLM2-1.7B-Instruct"
+RUN_NAME = "train_script"
 RUN_DIR = f"./outputs/{RUN_NAME}"
 OUTPUT_DIR = f"{RUN_DIR}/rlvr-output"
 
