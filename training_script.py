@@ -260,14 +260,14 @@ def parse_args():
     p.add_argument(
         "--lora-r",
         type=int,
-        default=8,
-        help="LoRA rank (default 8).",
+        default=64,
+        help="LoRA rank (default 64).",
     )
     p.add_argument(
         "--lora-alpha",
         type=int,
-        default=16,
-        help="LoRA alpha (default 16).",
+        default=128,
+        help="LoRA alpha (default 128).",
     )
     p.add_argument(
         "--lora-target-modules",
@@ -291,7 +291,7 @@ def parse_args():
         default=0,
         help="GSM8K train examples: first N rows, or 0 (default) for the full train split (~7.5k).",
     )
-    p.add_argument("--max-steps", type=int, default=30)
+    p.add_argument("--max-steps", type=int, default=2500)
     p.add_argument("--save-steps", type=int, default=10)
     p.add_argument("--learning-rate", type=float, default=1e-6)
     p.add_argument("--per-device-batch", type=int, default=4)
@@ -306,12 +306,12 @@ def parse_args():
             "per_device_batch * world_size * grad_accum (one fresh generation batch per optimizer step)."
         ),
     )
-    p.add_argument("--grpo-beta", type=float, default=0.0)
+    p.add_argument("--grpo-beta", type=float, default=0.01)
     p.add_argument("--grpo-epsilon", type=float, default=0.2)
     p.add_argument(
         "--max-completion-length",
         type=int,
-        default=512,
+        default=1024,
         help="Max new tokens per GRPO rollout (vLLM/HF).",
     )
     p.add_argument(
@@ -375,7 +375,7 @@ def parse_args():
     p.add_argument(
         "--eval-max-new-tokens",
         type=int,
-        default=512,
+        default=1024,
         help="Max new tokens for greedy baseline/post-train generation.",
     )
     return p.parse_args()
