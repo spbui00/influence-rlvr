@@ -56,22 +56,21 @@ from influence_rlvr.prompts import (
 # ═══════════════════════════════════════════════════════════════════════════════
 # Configuration — edit these before launching
 # ═══════════════════════════════════════════════════════════════════════════════
-MODEL_ID = "HuggingFaceTB/SmolLM2-1.7B-Instruct"
-RUN_NAME = "train_script"
+MODEL_ID = "Qwen/Qwen2.5-Math-1.5B"
+RUN_NAME = "run6"
 RUN_DIR = f"./outputs/{RUN_NAME}"
 OUTPUT_DIR = f"{RUN_DIR}/rlvr-output"
 
-LEARNING_RATE = 1e-6
+LEARNING_RATE = 1e-4
 MAX_STEPS = 200
 SAVE_STEPS = 5
 PER_DEVICE_BATCH = 8
 GRAD_ACCUM_STEPS = 2
-GRPO_BETA = 0.0
+GRPO_BETA = 0.04
 GRPO_EPSILON = 0.2
 G_TRAIN = 8
 G_TEST = 8
-_TRAINING_WORLD_SIZE = max(1, int(os.environ.get("WORLD_SIZE", "1")))
-GENERATION_BATCH_SIZE = PER_DEVICE_BATCH * GRAD_ACCUM_STEPS * _TRAINING_WORLD_SIZE
+GENERATION_BATCH_SIZE = 128
 TRAIN_GRAD_SEED = 1234
 LAMBDA_DAMP = 0.1
 N_MATH = 300
@@ -255,7 +254,6 @@ if GENERATION_BACKEND == GenerationBackend.VLLM and not VLLM_CONFIG.training_use
 print(f"\nLoading model: {MODEL_ID}")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 tokenizer.pad_token = tokenizer.eos_token
-tokenizer.padding_side = "left"
 
 base_model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
@@ -265,14 +263,7 @@ base_model = AutoModelForCausalLM.from_pretrained(
 lora_config = LoraConfig(
     r=8,
     lora_alpha=16,
-    target_modules=[
-        "q_proj",
-        "k_proj",
-        "v_proj",
-        "o_proj",
-        "up_proj",
-        "down_proj",
-    ],
+    target_modules=["q_proj", "v_proj"],
     bias="none",
     task_type="CAUSAL_LM",
 )
@@ -389,6 +380,7 @@ def run_training():
 
     training_args = GRPOConfig(
         output_dir=OUTPUT_DIR,
+        report_to="wandb",
         learning_rate=LEARNING_RATE,
         per_device_train_batch_size=PER_DEVICE_BATCH,
         gradient_accumulation_steps=GRAD_ACCUM_STEPS,
@@ -403,6 +395,8 @@ def run_training():
             and VLLM_CONFIG.training_use_vllm
         ),
         num_generations=G_TRAIN,
+        generation_batch_size=GENERATION_BATCH_SIZE,
+        loss_type="grpo",
         beta=GRPO_BETA,
         epsilon=GRPO_EPSILON,
         importance_sampling_level="token",

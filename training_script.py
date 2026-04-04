@@ -383,6 +383,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    os.environ["WANDB_PROJECT"] = "influence-rlvr-math"
+    os.environ["WANDB_NAME"] = f"smollm2-run-seed{args.seed}"
     os.environ["PYTHONHASHSEED"] = str(args.seed)
     set_seed(args.seed)
     use_vllm = not args.hf
@@ -456,6 +458,7 @@ def main():
     grpo_kw: dict = {
         "output_dir": str(out),
         "seed": args.seed,
+        "report_to": "wandb",
         "learning_rate": args.learning_rate,
         "per_device_train_batch_size": args.per_device_batch,
         "gradient_accumulation_steps": args.grad_accum,
