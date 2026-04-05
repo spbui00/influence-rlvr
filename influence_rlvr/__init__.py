@@ -30,7 +30,6 @@ from .eval import evaluate_math_dataset, evaluate_code_dataset
 from .rewards import (
     accuracy_reward_func,
     mbpp_execution_reward_func,
-    soft_accuracy_reward_func,
 )
 from .trajectory import (
     checkpoint_step,
@@ -81,7 +80,6 @@ __all__ = [
     "collect_checkpoint_infos",
     "accuracy_reward_func",
     "mbpp_execution_reward_func",
-    "soft_accuracy_reward_func",
     "collect_reward_infos",
     "HistoricalBatchGRPOTrainer",
     "detect_device",

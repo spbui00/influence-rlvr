@@ -10,7 +10,6 @@ _ANSWER_TAG_PATTERN = re.compile(
     r"<answer>(.*?)</answer>",
     re.DOTALL | re.IGNORECASE,
 )
-_NUMBER_PATTERN = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?(?:/\d[\d,]*(?:\.\d+)?)?")
 _ASSIGNMENT_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]*=(.+)$")
 _LATEX_FRAC_PATTERN = re.compile(r"\\(?:d?frac)\{([^{}]+)\}\{([^{}]+)\}")
 _CODE_BLOCK_PATTERN = re.compile(
@@ -296,6 +295,18 @@ def format_reward_func(completions, **kwargs):
     ]
 
 
+def format_guardrail_reward_func(completions, **kwargs):
+    rewards = []
+    for response in _extract_responses(completions):
+        tl = response.lower()
+        boxed = r"\boxed{" in response or "boxed{" in response
+        if "<redacted_thinking>" in tl and "</redacted_thinking>" in tl and boxed:
+            rewards.append(0.1)
+        else:
+            rewards.append(0.0)
+    return rewards
+
+
 def accuracy_reward_func(completions, solution, **kwargs):
     rewards = []
     for response, true_answer in zip(_extract_responses(completions), solution):
@@ -341,40 +352,4 @@ def mbpp_execution_reward_func(
         except Exception:
             rewards.append(0.0)
 
-    return rewards
-
-
-def soft_format_reward_func(completions, **kwargs):
-    rewards = []
-    for response in _extract_responses(completions):
-        stripped = response.strip()
-        score = 0.0
-        if _THINK_OPEN_PATTERN.match(stripped):
-            score += 0.25
-        if _THINK_CLOSE_PATTERN.search(stripped) is not None:
-            score += 0.25
-        answer_region = _answer_region_after_think(stripped)
-        if _extract_boxed_answer(answer_region) is not None:
-            score += 0.5
-        rewards.append(score)
-    return rewards
-
-
-def soft_accuracy_reward_func(completions, solution, **kwargs):
-    rewards = []
-    for response, true_answer in zip(_extract_responses(completions), solution):
-        model_answer = extract_math_final_answer(response)
-        if _answers_match(model_answer, true_answer):
-            rewards.append(1.0)
-            continue
-
-        answer_nums = set(_NUMBER_PATTERN.findall(_clean_math_answer_text(true_answer)))
-        response_nums = set(_NUMBER_PATTERN.findall(_clean_math_answer_text(model_answer or response)))
-
-        if answer_nums and answer_nums.issubset(response_nums):
-            rewards.append(0.5)
-        elif answer_nums & response_nums:
-            rewards.append(0.2)
-        else:
-            rewards.append(0.0)
     return rewards

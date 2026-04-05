@@ -24,7 +24,7 @@ from influence_rlvr.prompts import (
     build_r1_math_prompt,
     extract_gsm8k_target,
 )
-from influence_rlvr.rewards import extract_math_final_answer
+from influence_rlvr.rewards import extract_math_final_answer, format_guardrail_reward_func
 
 
 FORMAT_SUFFIX = (
@@ -293,7 +293,7 @@ def parse_args():
     )
     p.add_argument("--max-steps", type=int, default=2500)
     p.add_argument("--save-steps", type=int, default=10)
-    p.add_argument("--learning-rate", type=float, default=1e-6)
+    p.add_argument("--learning-rate", type=float, default=5e-5)
     p.add_argument("--per-device-batch", type=int, default=8)
     p.add_argument("--grad-accum", type=int, default=2)
     p.add_argument("--g-train", type=int, default=16, help="GRPO num_generations")
@@ -490,7 +490,7 @@ def main():
             grpo_kw["vllm_server_base_url"] = args.vllm_server_base_url
 
     training_args = GRPOConfig(**grpo_kw)
-    reward_funcs = [accuracy_reward_func]
+    reward_funcs = [format_guardrail_reward_func, accuracy_reward_func]
 
     trainer = HistoricalBatchGRPOTrainer(
         model=model,
