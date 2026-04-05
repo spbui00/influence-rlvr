@@ -300,7 +300,7 @@ def format_guardrail_reward_func(completions, **kwargs):
     for response in _extract_responses(completions):
         tl = response.lower()
         boxed = r"\boxed{" in response or "boxed{" in response
-        if "<redacted_thinking>" in tl and "</redacted_thinking>" in tl and boxed:
+        if "<think>" in tl and "</think>" in tl and boxed:
             rewards.append(0.1)
         else:
             rewards.append(0.0)
