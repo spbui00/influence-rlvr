@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 import torch
@@ -24,7 +25,11 @@ from influence_rlvr.prompts import (
     build_r1_math_prompt,
     extract_gsm8k_target,
 )
-from influence_rlvr.rewards import extract_math_final_answer, format_guardrail_reward_func
+from influence_rlvr.rewards import (
+    extract_math_final_answer,
+    format_guardrail_reward_func,
+    math_answer_equivalence_key,
+)
 
 
 FORMAT_SUFFIX = (
@@ -44,14 +49,18 @@ def _build_training_script_math_prompt(question: str) -> list[dict[str, str]]:
 
 
 @torch.inference_mode()
-def _generate_completion(
+def _generate_eval_completions(
     model,
     tokenizer,
     messages: list[dict],
     *,
     device: torch.device,
     max_new_tokens: int,
-) -> str:
+    num_sequences: int,
+    temperature: float,
+    top_p: float,
+    generator: torch.Generator | None,
+) -> list[str]:
     model.eval()
     enc = tokenizer.apply_chat_template(
         messages,
@@ -71,20 +80,40 @@ def _generate_completion(
     pad_id = tokenizer.pad_token_id
     if pad_id is None:
         pad_id = tokenizer.eos_token_id
-    out = model.generate(
-        input_ids,
-        attention_mask=attention_mask,
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-        pad_token_id=pad_id,
-        eos_token_id=tokenizer.eos_token_id,
-    )
-    new_tokens = out[0, input_ids.shape[1] :]
-    return tokenizer.decode(new_tokens.tolist(), skip_special_tokens=True)
+    prompt_len = int(input_ids.shape[1])
+    if num_sequences <= 1:
+        seqs = model.generate(
+            input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=pad_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+    else:
+        seqs = model.generate(
+            input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=temperature,
+            top_p=top_p,
+            num_return_sequences=num_sequences,
+            pad_token_id=pad_id,
+            eos_token_id=tokenizer.eos_token_id,
+            generator=generator,
+        )
+    texts = []
+    for row in range(seqs.shape[0]):
+        new_tokens = seqs[row, prompt_len:]
+        texts.append(
+            tokenizer.decode(new_tokens.tolist(), skip_special_tokens=True)
+        )
+    return texts
 
 
 def _eval_metadata(args, split: str) -> dict:
-    return {
+    md = {
         "seed": args.seed,
         "model_id": args.model_id,
         "eval_split": split,
@@ -93,7 +122,33 @@ def _eval_metadata(args, split: str) -> dict:
             "lora_alpha": args.lora_alpha,
             "target_modules": _parse_lora_target_modules(args.lora_target_modules),
         },
+        "eval_majority_votes": args.eval_majority_votes,
+        "eval_temperature": args.eval_temperature,
+        "eval_top_p": args.eval_top_p,
     }
+    return md
+
+
+def _majority_vote_parsed(
+    completion_texts: list[str],
+) -> tuple[str | None, str, dict[str, int], list[str | None]]:
+    parsed_list = [extract_math_final_answer(t) for t in completion_texts]
+    keys = [math_answer_equivalence_key(p) for p in parsed_list]
+    counts = Counter(keys)
+    max_votes = max(counts.values())
+    winners = sorted(k for k, v in counts.items() if v == max_votes)
+    chosen_key = winners[0]
+    rep_text = completion_texts[0]
+    rep_parsed = parsed_list[0]
+    for t, p, k in zip(completion_texts, parsed_list, keys):
+        if k == chosen_key:
+            rep_text = t
+            rep_parsed = p
+            break
+    if chosen_key == "__none__":
+        rep_parsed = None
+    hist = {k: int(counts[k]) for k in sorted(counts.keys())}
+    return rep_parsed, rep_text, hist, parsed_list
 
 
 def run_gsm8k_eval(
@@ -114,34 +169,55 @@ def run_gsm8k_eval(
         if phase == "baseline"
         else "Post-training eval"
     )
+    n_votes = args.eval_majority_votes
+    dec = (
+        f"greedy (1 sequence)"
+        if n_votes <= 1
+        else f"majority vote ({n_votes} samples, T={args.eval_temperature}, top_p={args.eval_top_p})"
+    )
     print("\n" + "=" * 80)
-    print(f"{title} — GSM8K {split}, greedy HF generate")
+    print(f"{title} — GSM8K {split}, {dec}")
     print("=" * 80)
     eval_ds = load_dataset("openai/gsm8k", "main", split=split)
+    if device.type == "cuda":
+        eval_generator = torch.Generator(device=device)
+    else:
+        eval_generator = torch.Generator()
+    eval_generator.manual_seed(int(args.seed))
     acc_scores = []
     rows = []
     for i, ex in enumerate(eval_ds):
         messages = _build_training_script_math_prompt(ex["question"])
         gold = extract_gsm8k_target(ex["answer"])
-        text = _generate_completion(
+        completion_texts = _generate_eval_completions(
             model,
             tokenizer,
             messages,
             device=device,
             max_new_tokens=args.eval_max_new_tokens,
+            num_sequences=max(1, n_votes),
+            temperature=args.eval_temperature,
+            top_p=args.eval_top_p,
+            generator=eval_generator if n_votes > 1 else None,
         )
-        c = _as_completion(text)
+        pred, rep_text, vote_hist, parsed_per_sample = _majority_vote_parsed(
+            completion_texts
+        )
+        c = _as_completion(rep_text)
         a = accuracy_reward_func(c, [gold])[0]
         acc_scores.append(a)
-        pred = extract_math_final_answer(text)
-        rows.append({
+        row = {
             "index": i,
             "gold": gold,
             "pred_parsed": pred,
             "accuracy_reward": a,
-            "response": text,
+            "response": rep_text,
             "question": ex["question"],
-        })
+        }
+        if n_votes > 1:
+            row["majority_vote_counts"] = vote_hist
+            row["parsed_per_sample"] = parsed_per_sample
+        rows.append(row)
 
     mean_acc = sum(acc_scores) / len(acc_scores)
     print(f"  mean accuracy_reward: {mean_acc:.4f}")
@@ -173,6 +249,8 @@ def run_gsm8k_eval(
     for r in rows[:k]:
         print(f"\n### [{r['index']}] accuracy={r['accuracy_reward']}")
         print(f"gold={r['gold']!r} pred_parsed={r['pred_parsed']!r}")
+        if n_votes > 1 and r.get("majority_vote_counts") is not None:
+            print(f"majority_vote_counts={r['majority_vote_counts']}")
         print(f"--- question ---\n{r['question']}\n--- response ---\n{r['response']}\n")
 
 
@@ -376,13 +454,36 @@ def parse_args():
         "--eval-max-new-tokens",
         type=int,
         default=1024,
-        help="Max new tokens for greedy baseline/post-train generation.",
+        help="Max new tokens per GSM8K eval completion.",
+    )
+    p.add_argument(
+        "--eval-majority-votes",
+        type=int,
+        default=16,
+        help=(
+            "GSM8K eval: number of sampled completions per question (self-consistency / majority vote). "
+            "Use 1 for single greedy decode (legacy)."
+        ),
+    )
+    p.add_argument(
+        "--eval-temperature",
+        type=float,
+        default=0.7,
+        help="Sampling temperature when --eval-majority-votes > 1.",
+    )
+    p.add_argument(
+        "--eval-top-p",
+        type=float,
+        default=0.95,
+        help="Nucleus top_p when --eval-majority-votes > 1.",
     )
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.eval_majority_votes < 1:
+        raise SystemExit("--eval-majority-votes must be >= 1")
     os.environ["WANDB_PROJECT"] = "influence-rlvr-math"
     os.environ["WANDB_NAME"] = f"smollm2-run-seed{args.seed}"
     os.environ["PYTHONHASHSEED"] = str(args.seed)
