@@ -222,6 +222,15 @@ def _answers_match(model_answer, true_answer):
     return _normalize_symbolic_answer(model_answer) == _normalize_symbolic_answer(true_answer)
 
 
+def math_answer_equivalence_key(model_answer):
+    if model_answer is None:
+        return "__none__"
+    model_numeric = _parse_numeric_answer(model_answer)
+    if model_numeric is not None:
+        return str(model_numeric)
+    return _normalize_symbolic_answer(model_answer)
+
+
 def _has_r1_reasoning_format(text):
     stripped = text.strip()
     if not _THINK_OPEN_PATTERN.match(stripped):

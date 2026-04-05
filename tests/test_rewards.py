@@ -3,6 +3,7 @@ import unittest
 from influence_rlvr.rewards import (
     accuracy_reward_func,
     extract_math_final_answer,
+    math_answer_equivalence_key,
 )
 
 
@@ -30,6 +31,10 @@ class RewardParsingTests(unittest.TestCase):
             extract_math_final_answer("<think>legacy output</think><answer>18</answer>"),
             "18",
         )
+
+    def test_math_answer_equivalence_key_unifies_numeric_forms(self):
+        self.assertEqual(math_answer_equivalence_key("72."), math_answer_equivalence_key("72"))
+        self.assertEqual(math_answer_equivalence_key(None), "__none__")
 
 
 if __name__ == "__main__":
