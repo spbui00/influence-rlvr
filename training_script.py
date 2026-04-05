@@ -59,7 +59,6 @@ def _generate_eval_completions(
     num_sequences: int,
     temperature: float,
     top_p: float,
-    generator: torch.Generator | None,
 ) -> list[str]:
     model.eval()
     enc = tokenizer.apply_chat_template(
@@ -101,7 +100,6 @@ def _generate_eval_completions(
             num_return_sequences=num_sequences,
             pad_token_id=pad_id,
             eos_token_id=tokenizer.eos_token_id,
-            generator=generator,
         )
     texts = []
     for row in range(seqs.shape[0]):
@@ -179,11 +177,6 @@ def run_gsm8k_eval(
     print(f"{title} — GSM8K {split}, {dec}")
     print("=" * 80)
     eval_ds = load_dataset("openai/gsm8k", "main", split=split)
-    if device.type == "cuda":
-        eval_generator = torch.Generator(device=device)
-    else:
-        eval_generator = torch.Generator()
-    eval_generator.manual_seed(int(args.seed))
     acc_scores = []
     rows = []
     for i, ex in enumerate(eval_ds):
@@ -198,7 +191,6 @@ def run_gsm8k_eval(
             num_sequences=max(1, n_votes),
             temperature=args.eval_temperature,
             top_p=args.eval_top_p,
-            generator=eval_generator if n_votes > 1 else None,
         )
         pred, rep_text, vote_hist, parsed_per_sample = _majority_vote_parsed(
             completion_texts
