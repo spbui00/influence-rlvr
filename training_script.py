@@ -312,7 +312,7 @@ Stronger GSM8K GRPO (tune batch / vLLM if OOM on your GPU):
       --output-dir ./outputs/nemotron_math_s${s}/rlvr-output --seed $s \\
       --max-steps 2500 --save-steps 250 \\
       --lora-r 16 \\
-      --lora-target-modules q_proj,k_proj,v_proj,o_proj,up_proj,down_proj \\
+      --lora-target-modules q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj \\
       --eval-examples 1319 \\
       --g-train 16 --per-device-batch 8 --grad-accum 2 \\
       --vllm-gpu-memory-utilization 0.45 --vllm-enable-sleep-mode
@@ -338,18 +338,18 @@ def parse_args():
     p.add_argument(
         "--lora-r",
         type=int,
-        default=64,
-        help="LoRA rank (default 64).",
+        default=128,
+        help="LoRA rank (default 128).",
     )
     p.add_argument(
         "--lora-alpha",
         type=int,
-        default=128,
-        help="LoRA alpha (default 128).",
+        default=256,
+        help="LoRA alpha (default 256).",
     )
     p.add_argument(
         "--lora-target-modules",
-        default="q_proj,k_proj,v_proj,o_proj,up_proj,down_proj",
+        default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
         help="Comma-separated PEFT target module names.",
     )
     p.add_argument(
