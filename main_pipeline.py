@@ -60,7 +60,7 @@ from influence_rlvr.rewards import format_guardrail_reward_func
 # Configuration — edit these before launching
 # ═══════════════════════════════════════════════════════════════════════════════
 MODEL_ID = "HuggingFaceTB/SmolLM2-1.7B-Instruct"
-RUN_NAME = "training_script1"
+RUN_NAME = "train_script1"
 RUN_DIR = f"./outputs/{RUN_NAME}"
 OUTPUT_DIR = f"{RUN_DIR}/rlvr-output"
 RUN_CONFIG_PATH = None  
