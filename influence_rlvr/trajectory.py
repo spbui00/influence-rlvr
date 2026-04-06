@@ -6,6 +6,7 @@ import time
 from peft import load_peft_weights, set_peft_model_state_dict
 
 from .eval import evaluate_code_dataset, evaluate_math_dataset
+from .generation import clear_vllm_engine_cache
 from .gradients import (
     compute_policy_gradient_bundle,
     compute_sft_gradient,
@@ -431,6 +432,14 @@ def collect_checkpoint_infos(
                 adapter_path=checkpoint["path"],
                 model_id=model_id,
             )
+
+        if (
+            enable_vllm
+            and generation_backend == GenerationBackend.VLLM
+            and (math_eval_dataset is not None or code_eval_dataset is not None)
+        ):
+            clear_vllm_engine_cache()
+            clear_cache(device)
 
         train_seed_base = None
         test_seed_base = None

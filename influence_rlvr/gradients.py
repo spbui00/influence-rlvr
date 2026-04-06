@@ -4,9 +4,9 @@ from contextlib import contextmanager
 import torch
 import torch.nn.functional as F
 
-from .generation import generate_rollout_batch, rollout_to_completions
+from .generation import clear_vllm_engine_cache, generate_rollout_batch, rollout_to_completions
 from .modes import GenerationBackend, GeometryFeatureMode, GradientObjective, VLLMConfig
-from .utils import tokenize_prompt, extract_lora_gradients, get_reward_name
+from .utils import clear_cache, tokenize_prompt, extract_lora_gradients, get_reward_name
 
 
 def _set_generation_seed(seed):
@@ -224,6 +224,9 @@ def compute_policy_gradient_bundle(
         adapter_path=adapter_path,
         model_id=model_id,
     )
+    if generation_backend == GenerationBackend.VLLM:
+        clear_vllm_engine_cache()
+        clear_cache(device)
     completions_trl = rollout_to_completions(rollout)
     total_rewards, reward_breakdown = _evaluate_rewards(reward_funcs, completions_trl, device)
 
