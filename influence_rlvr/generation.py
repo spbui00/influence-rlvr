@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import atexit
+import gc
 import hashlib
 import importlib
 import sys
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -13,6 +15,7 @@ import torch
 from .modes import GenerationBackend, VLLMConfig
 
 _VLLM_ENGINE_CACHE: dict[tuple[Any, ...], object] = {}
+_VLLM_UTIL_CLAMP_WARNED = False
 
 
 @dataclass
@@ -76,9 +79,44 @@ def clear_vllm_engine_cache() -> None:
         except Exception:
             pass
     _VLLM_ENGINE_CACHE.clear()
+    _reclaim_cuda_memory()
 
 
 atexit.register(clear_vllm_engine_cache)
+
+
+def _reclaim_cuda_memory() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+
+def _effective_vllm_gpu_memory_utilization(config: VLLMConfig) -> float:
+    u = float(config.gpu_memory_utilization)
+    if not torch.cuda.is_available():
+        return u
+    free_b, total_b = torch.cuda.mem_get_info()
+    if total_b <= 0:
+        return u
+    free_frac = float(free_b) / float(total_b)
+    cap = 0.92 * free_frac
+    if u <= cap:
+        return u
+    eff = max(cap, 0.05)
+    global _VLLM_UTIL_CLAMP_WARNED
+    if not _VLLM_UTIL_CLAMP_WARNED and eff + 1e-6 < u:
+        _VLLM_UTIL_CLAMP_WARNED = True
+        warnings.warn(
+            (
+                f"vLLM gpu_memory_utilization reduced from {u} to {eff:.3f} "
+                f"(only {100.0 * free_frac:.1f}% of GPU memory is free for vLLM startup; "
+                "PyTorch holds the rest). Consider lowering run_config "
+                "`vllm_gpu_memory_utilization` for replay, or using generation backend `hf`."
+            ),
+            stacklevel=3,
+        )
+    return eff
 
 
 def _normalize_device(device: str | torch.device) -> torch.device:
@@ -291,12 +329,14 @@ def _get_vllm_engine(
     if engine is not None:
         return engine
 
+    _reclaim_cuda_memory()
+    util = _effective_vllm_gpu_memory_utilization(config)
     LLM, _, _ = _load_vllm_types()
     kwargs = {
         "model": model_id,
         "tokenizer": getattr(tokenizer, "name_or_path", model_id),
         "tensor_parallel_size": config.tensor_parallel_size,
-        "gpu_memory_utilization": config.gpu_memory_utilization,
+        "gpu_memory_utilization": util,
         "enable_lora": True,
         "max_lora_rank": config.max_lora_rank,
         "enforce_eager": config.enforce_eager,
