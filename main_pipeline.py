@@ -192,6 +192,7 @@ def _apply_training_run_config(cfg: dict, path: Path) -> None:
         GENERATION_BACKEND = GenerationBackend.VLLM
 
     vmlm = cfg.get("vllm_max_model_length")
+    vmxlr = cfg.get("vllm_max_lora_rank")
     VLLM_CONFIG = VLLMConfig(
         gpu_memory_utilization=float(
             cfg.get("vllm_gpu_memory_utilization", VLLM_CONFIG.gpu_memory_utilization)
@@ -201,6 +202,7 @@ def _apply_training_run_config(cfg: dict, path: Path) -> None:
         ),
         max_model_len=int(vmlm) if vmlm is not None else VLLM_CONFIG.max_model_len,
         max_num_seqs=VLLM_CONFIG.max_num_seqs,
+        max_lora_rank=int(vmxlr) if vmxlr is not None else LORA_R,
         enforce_eager=VLLM_CONFIG.enforce_eager,
         training_use_vllm=not bool(cfg.get("hf")),
     )

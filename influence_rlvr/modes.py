@@ -79,6 +79,7 @@ class VLLMConfig:
     tensor_parallel_size: int = 1
     max_model_len: int | None = None
     max_num_seqs: int | None = None
+    max_lora_rank: int = 16
     enforce_eager: bool = False
     training_use_vllm: bool = False
 
@@ -88,6 +89,7 @@ class VLLMConfig:
             "vllm_tensor_parallel_size": self.tensor_parallel_size,
             "vllm_max_model_len": self.max_model_len,
             "vllm_max_num_seqs": self.max_num_seqs,
+            "vllm_max_lora_rank": self.max_lora_rank,
             "vllm_enforce_eager": self.enforce_eager,
         }
 

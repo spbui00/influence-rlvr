@@ -371,6 +371,7 @@ class InfluenceAnalyzer:
             "vllm_tensor_parallel_size",
             "vllm_max_model_len",
             "vllm_max_num_seqs",
+            "vllm_max_lora_rank",
             "vllm_enforce_eager",
             "vllm_training_use_vllm",
             "train_domain",

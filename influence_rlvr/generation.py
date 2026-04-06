@@ -264,6 +264,7 @@ def _vllm_engine_key(
         int(config.tensor_parallel_size),
         config.max_model_len,
         config.max_num_seqs,
+        int(config.max_lora_rank),
         bool(config.enforce_eager),
     )
 
@@ -297,6 +298,7 @@ def _get_vllm_engine(
         "tensor_parallel_size": config.tensor_parallel_size,
         "gpu_memory_utilization": config.gpu_memory_utilization,
         "enable_lora": True,
+        "max_lora_rank": config.max_lora_rank,
         "enforce_eager": config.enforce_eager,
     }
     if config.max_model_len is not None:
