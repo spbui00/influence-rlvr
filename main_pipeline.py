@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import time
+from dataclasses import replace
 from functools import partial
 from pathlib import Path
 
@@ -48,18 +49,21 @@ from influence_rlvr.modes import (
     VLLMConfig,
 )
 from influence_rlvr.prompts import (
+    append_suffix_to_final_user_message,
     build_code_prompt,
     build_r1_math_prompt,
     extract_gsm8k_target,
 )
+from influence_rlvr.rewards import format_guardrail_reward_func
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Configuration — edit these before launching
 # ═══════════════════════════════════════════════════════════════════════════════
-MODEL_ID = "Qwen/Qwen2.5-Math-1.5B"
-RUN_NAME = "run6"
+MODEL_ID = "HuggingFaceTB/SmolLM2-1.7B-Instruct"
+RUN_NAME = "training_script1"
 RUN_DIR = f"./outputs/{RUN_NAME}"
 OUTPUT_DIR = f"{RUN_DIR}/rlvr-output"
+RUN_CONFIG_PATH = None  
 
 LEARNING_RATE = 1e-4
 MAX_STEPS = 200
@@ -71,12 +75,19 @@ GRPO_EPSILON = 0.2
 G_TRAIN = 16
 G_TEST = 8
 GENERATION_BATCH_SIZE = 128
+MAX_COMPLETION_LENGTH = None
 TRAIN_GRAD_SEED = 1234
 LAMBDA_DAMP = 0.1
 N_MATH = 300
 N_CODE = 10
 N_TRAIN_REPLAY = N_MATH
 N_CODE_TRAIN = N_MATH
+LORA_R = 8
+LORA_ALPHA = 16
+LORA_TARGET_MODULES = ["q_proj", "v_proj"]
+_MATH_PROMPT_MATCHES_TRAINING_SCRIPT = False
+TRAINING_RUN_CONFIG = None
+TRAINING_RUN_CONFIG_PATH = None
 MATH_EVAL_SPLIT = "test"
 MATH_EVAL_PERCENT = 10
 CODE_TRAIN_SPLIT = "train"
@@ -104,9 +115,125 @@ REPLAY_GRADIENT_CONFIG = ReplayGradientConfig(
     top_p=0.9,
 )
 
-SKIP_TRAINING = False
-ENABLE_GRAD_CACHE = False
+SKIP_TRAINING = True
+ENABLE_GRAD_CACHE = True
 RESULTS_REUSE_POLICY = "ask"
+
+_TRAINING_SCRIPT_MATH_FORMAT_SUFFIX = (
+    "After </think>, the last line must contain only the final numeric GSM8K answer in "
+    "\\boxed{...} (digits / fraction / decimal). Do not write placeholders, "
+    "do not repeat this instruction block, and do not use code fences."
+)
+
+
+def _parse_lora_target_modules(s: str) -> list[str]:
+    return [p.strip() for p in s.split(",") if p.strip()]
+
+
+def _run_config_json_path() -> Path:
+    if RUN_CONFIG_PATH:
+        return Path(RUN_CONFIG_PATH).expanduser().resolve()
+    return Path(OUTPUT_DIR).expanduser().resolve() / "run_config.json"
+
+
+def _apply_training_run_config(cfg: dict, path: Path) -> None:
+    global MODEL_ID, LEARNING_RATE, MAX_STEPS, SAVE_STEPS, PER_DEVICE_BATCH, GRAD_ACCUM_STEPS
+    global GRPO_BETA, GRPO_EPSILON, G_TRAIN, GENERATION_BATCH_SIZE, TRAIN_GRAD_SEED
+    global N_MATH, N_TRAIN_REPLAY, LORA_R, LORA_ALPHA, LORA_TARGET_MODULES
+    global GENERATION_BACKEND, VLLM_CONFIG, REPLAY_GRADIENT_CONFIG, EVAL_MAX_NEW_TOKENS
+    global MAX_COMPLETION_LENGTH, _MATH_PROMPT_MATCHES_TRAINING_SCRIPT
+    global TRAINING_RUN_CONFIG, TRAINING_RUN_CONFIG_PATH
+
+    TRAINING_RUN_CONFIG = cfg
+    TRAINING_RUN_CONFIG_PATH = str(path)
+    _MATH_PROMPT_MATCHES_TRAINING_SCRIPT = True
+
+    MODEL_ID = cfg.get("model_id", MODEL_ID)
+    LEARNING_RATE = float(cfg.get("learning_rate", LEARNING_RATE))
+    MAX_STEPS = int(cfg.get("max_steps", MAX_STEPS))
+    SAVE_STEPS = int(cfg.get("save_steps", SAVE_STEPS))
+    PER_DEVICE_BATCH = int(cfg.get("per_device_batch", PER_DEVICE_BATCH))
+    GRAD_ACCUM_STEPS = int(cfg.get("grad_accum", GRAD_ACCUM_STEPS))
+    GRPO_BETA = float(cfg.get("grpo_beta", GRPO_BETA))
+    GRPO_EPSILON = float(cfg.get("grpo_epsilon", GRPO_EPSILON))
+    G_TRAIN = int(cfg.get("g_train", G_TRAIN))
+    TRAIN_GRAD_SEED = int(cfg.get("seed", TRAIN_GRAD_SEED))
+
+    gbs = cfg.get("generation_batch_size")
+    GENERATION_BATCH_SIZE = int(gbs) if gbs is not None else None
+
+    mcl = cfg.get("max_completion_length")
+    MAX_COMPLETION_LENGTH = int(mcl) if mcl is not None else None
+    if MAX_COMPLETION_LENGTH is not None:
+        REPLAY_GRADIENT_CONFIG = replace(
+            REPLAY_GRADIENT_CONFIG,
+            max_new_tokens=MAX_COMPLETION_LENGTH,
+        )
+
+    ev = cfg.get("eval_max_new_tokens")
+    if ev is not None:
+        EVAL_MAX_NEW_TOKENS = int(ev)
+
+    N_MATH = int(cfg.get("n_math", N_MATH))
+    if N_MATH <= 0:
+        N_TRAIN_REPLAY = 10**9
+    else:
+        N_TRAIN_REPLAY = N_MATH
+
+    LORA_R = int(cfg.get("lora_r", LORA_R))
+    LORA_ALPHA = int(cfg.get("lora_alpha", LORA_ALPHA))
+    lt = cfg.get("lora_target_modules")
+    if isinstance(lt, str) and lt.strip():
+        LORA_TARGET_MODULES = _parse_lora_target_modules(lt)
+
+    if cfg.get("hf"):
+        GENERATION_BACKEND = GenerationBackend.HF
+    else:
+        GENERATION_BACKEND = GenerationBackend.VLLM
+
+    vmlm = cfg.get("vllm_max_model_length")
+    VLLM_CONFIG = VLLMConfig(
+        gpu_memory_utilization=float(
+            cfg.get("vllm_gpu_memory_utilization", VLLM_CONFIG.gpu_memory_utilization)
+        ),
+        tensor_parallel_size=int(
+            cfg.get("vllm_tensor_parallel_size", VLLM_CONFIG.tensor_parallel_size)
+        ),
+        max_model_len=int(vmlm) if vmlm is not None else VLLM_CONFIG.max_model_len,
+        max_num_seqs=VLLM_CONFIG.max_num_seqs,
+        enforce_eager=VLLM_CONFIG.enforce_eager,
+        training_use_vllm=not bool(cfg.get("hf")),
+    )
+
+    out_cfg = cfg.get("output_dir")
+    if out_cfg is not None:
+        resolved_cfg = Path(str(out_cfg)).expanduser().resolve()
+        resolved_out = Path(OUTPUT_DIR).expanduser().resolve()
+        if resolved_cfg != resolved_out:
+            print(
+                "Warning: run_config.json output_dir does not match OUTPUT_DIR:\n"
+                f"  run_config: {resolved_cfg}\n"
+                f"  OUTPUT_DIR: {resolved_out}"
+            )
+
+    print(f"Loaded training run_config.json — applied settings from {path}")
+
+
+_run_config_path = _run_config_json_path()
+if _run_config_path.is_file():
+    try:
+        _run_data = json.loads(_run_config_path.read_text())
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Invalid run_config.json at {_run_config_path}: {exc}"
+        ) from exc
+    if EXPERIMENT_MODE != ExperimentMode.MATH_GRPO:
+        print(
+            "Ignoring run_config.json: EXPERIMENT_MODE must be MATH_GRPO "
+            f"(got {EXPERIMENT_MODE!r})."
+        )
+    else:
+        _apply_training_run_config(_run_data, _run_config_path)
 
 
 def normalize_influence_mode(mode):
@@ -219,7 +346,12 @@ def finalize_results_dir(
 RESULTS_REUSE_POLICY = normalize_results_reuse_policy(RESULTS_REUSE_POLICY)
 
 optimizer_step_rows = PER_DEVICE_BATCH * GRAD_ACCUM_STEPS
-generation_prompt_pool = GENERATION_BATCH_SIZE // max(G_TRAIN, 1)
+_effective_generation_batch_size = (
+    GENERATION_BATCH_SIZE
+    if GENERATION_BATCH_SIZE is not None
+    else (PER_DEVICE_BATCH * GRAD_ACCUM_STEPS)
+)
+generation_prompt_pool = _effective_generation_batch_size // max(G_TRAIN, 1)
 print(
     "Historical coverage target: "
     f"{optimizer_step_rows} prompt rows/optimizer step, "
@@ -254,6 +386,8 @@ if GENERATION_BACKEND == GenerationBackend.VLLM and not VLLM_CONFIG.training_use
 print(f"\nLoading model: {MODEL_ID}")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 tokenizer.pad_token = tokenizer.eos_token
+if _MATH_PROMPT_MATCHES_TRAINING_SCRIPT:
+    tokenizer.padding_side = "left"
 
 base_model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
@@ -261,9 +395,9 @@ base_model = AutoModelForCausalLM.from_pretrained(
 ).to(DEVICE)
 
 lora_config = LoraConfig(
-    r=8,
-    lora_alpha=16,
-    target_modules=["q_proj", "v_proj"],
+    r=LORA_R,
+    lora_alpha=LORA_ALPHA,
+    target_modules=LORA_TARGET_MODULES,
     bias="none",
     task_type="CAUSAL_LM",
 )
@@ -303,8 +437,15 @@ else:
 # Datasets
 # ═══════════════════════════════════════════════════════════════════════════════
 def format_math(example, idx):
+    if _MATH_PROMPT_MATCHES_TRAINING_SCRIPT:
+        prompt = append_suffix_to_final_user_message(
+            build_r1_math_prompt(example["question"]),
+            _TRAINING_SCRIPT_MATH_FORMAT_SUFFIX,
+        )
+    else:
+        prompt = build_r1_math_prompt(example["question"])
     return {
-        "prompt": build_r1_math_prompt(example["question"]),
+        "prompt": prompt,
         "solution": extract_gsm8k_target(example["answer"]),
         "train_index": idx,
     }
@@ -332,7 +473,8 @@ def percent_slice(split_name, percent):
 
 
 print("\nLoading datasets...")
-math_train_data = load_dataset("openai/gsm8k", "main", split=f"train[:{N_MATH}]")
+_math_train_split = "train" if N_MATH <= 0 else f"train[:{N_MATH}]"
+math_train_data = load_dataset("openai/gsm8k", "main", split=_math_train_split)
 math_train_dataset = math_train_data.map(format_math, with_indices=True)
 code_train_data = load_dataset("mbpp", split=f"{CODE_TRAIN_SPLIT}[:{N_CODE_TRAIN}]")
 code_train_dataset = code_train_data.map(format_code, with_indices=True)
@@ -356,7 +498,10 @@ if EXPERIMENT_MODE == ExperimentMode.CODE_GRPO:
 else:
     training_domain = "Math"
     training_dataset = math_train_dataset
-    training_reward_funcs = [accuracy_reward_func]
+    if _MATH_PROMPT_MATCHES_TRAINING_SCRIPT:
+        training_reward_funcs = [format_guardrail_reward_func, accuracy_reward_func]
+    else:
+        training_reward_funcs = [accuracy_reward_func]
 
 replay_train_dataset = training_dataset
 test_domain = "Code"
@@ -378,30 +523,36 @@ def run_training():
     print("PHASE 1: GRPO Training")
     print("=" * 80)
 
-    training_args = GRPOConfig(
-        output_dir=OUTPUT_DIR,
-        report_to="wandb",
-        learning_rate=LEARNING_RATE,
-        per_device_train_batch_size=PER_DEVICE_BATCH,
-        gradient_accumulation_steps=GRAD_ACCUM_STEPS,
-        max_steps=MAX_STEPS,
-        logging_steps=1,
-        save_strategy="steps",
-        save_steps=SAVE_STEPS,
-        save_total_limit=None,
-        bf16=True,
-        use_vllm=(
+    _grpo_kw = {
+        "output_dir": OUTPUT_DIR,
+        "report_to": "wandb",
+        "learning_rate": LEARNING_RATE,
+        "per_device_train_batch_size": PER_DEVICE_BATCH,
+        "gradient_accumulation_steps": GRAD_ACCUM_STEPS,
+        "max_steps": MAX_STEPS,
+        "logging_steps": 1,
+        "save_strategy": "steps",
+        "save_steps": SAVE_STEPS,
+        "save_total_limit": None,
+        "bf16": True,
+        "use_vllm": (
             GENERATION_BACKEND == GenerationBackend.VLLM
             and VLLM_CONFIG.training_use_vllm
         ),
-        num_generations=G_TRAIN,
-        generation_batch_size=GENERATION_BATCH_SIZE,
-        loss_type="grpo",
-        beta=GRPO_BETA,
-        epsilon=GRPO_EPSILON,
-        importance_sampling_level="token",
-        scale_rewards="group",
-    )
+        "num_generations": G_TRAIN,
+        "loss_type": "grpo",
+        "beta": GRPO_BETA,
+        "epsilon": GRPO_EPSILON,
+        "importance_sampling_level": "token",
+        "scale_rewards": "group",
+    }
+    if TRAINING_RUN_CONFIG is not None:
+        _grpo_kw["seed"] = TRAIN_GRAD_SEED
+    if GENERATION_BATCH_SIZE is not None:
+        _grpo_kw["generation_batch_size"] = GENERATION_BATCH_SIZE
+    if MAX_COMPLETION_LENGTH is not None:
+        _grpo_kw["max_completion_length"] = MAX_COMPLETION_LENGTH
+    training_args = GRPOConfig(**_grpo_kw)
 
     trainer = HistoricalBatchGRPOTrainer(
         model=model,
@@ -491,9 +642,10 @@ else:
 
 def build_math_reward_fns(sample, num_generations):
     solution = sample["solution"]
-    return [
-        partial(accuracy_reward_func, solution=[solution] * num_generations),
-    ]
+    acc = partial(accuracy_reward_func, solution=[solution] * num_generations)
+    if _MATH_PROMPT_MATCHES_TRAINING_SCRIPT:
+        return [format_guardrail_reward_func, acc]
+    return [acc]
 
 
 def build_code_reward_fns(sample, num_generations):
@@ -517,6 +669,8 @@ RESULTS_CONFIG = {
     "model_id": MODEL_ID,
     "run_name": RUN_NAME,
     "output_dir": OUTPUT_DIR,
+    "training_run_config_path": TRAINING_RUN_CONFIG_PATH,
+    "max_completion_length": MAX_COMPLETION_LENGTH,
     "influence_mode": effective_influence_mode,
     "experiment_mode": EXPERIMENT_MODE,
     "enable_grad_cache": ENABLE_GRAD_CACHE,
@@ -571,6 +725,8 @@ RESULTS_CONFIG["results_config_fingerprint"] = results_config_fingerprint
 CACHE_CONFIG = {
     "model_id": MODEL_ID,
     "output_dir": os.path.abspath(OUTPUT_DIR),
+    "training_run_config_path": TRAINING_RUN_CONFIG_PATH,
+    "max_completion_length": MAX_COMPLETION_LENGTH,
     "influence_mode": effective_influence_mode,
     "experiment_mode": EXPERIMENT_MODE,
     "enable_grad_cache": ENABLE_GRAD_CACHE,
