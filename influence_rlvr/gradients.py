@@ -48,29 +48,54 @@ def _use_adapter(model, adapter_name):
             model.set_adapter(previous_adapter)
 
 
-def _compute_per_token_logps(model, prompt_ids, prompt_attention_mask, response_ids, response_mask):
+def _compute_per_token_logps(
+    model,
+    prompt_ids,
+    prompt_attention_mask,
+    response_ids,
+    response_mask,
+    micro_batch_size=4,
+):
     n_p = prompt_ids.shape[0]
     n_r = response_ids.shape[0]
-    if n_p == 1 and n_r > 1:
-        prompt_batch = prompt_ids.repeat(n_r, 1)
-        prompt_mask_batch = prompt_attention_mask.repeat(n_r, 1)
-    elif n_p == n_r:
-        prompt_batch = prompt_ids
-        prompt_mask_batch = prompt_attention_mask
-    else:
+    if n_p not in (1, n_r):
         raise ValueError(
             f"prompt batch {n_p} incompatible with response batch {n_r} "
             "(expected 1 or equal batch sizes)."
         )
-    input_ids = torch.cat([prompt_batch, response_ids], dim=1)
-    attention_mask = torch.cat([prompt_mask_batch, response_mask], dim=1)
+    if n_r == 0:
+        return response_ids.new_zeros((0, response_ids.shape[1]))
+    if micro_batch_size < 1:
+        raise ValueError(f"micro_batch_size must be >= 1, got {micro_batch_size}")
 
-    outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
     prompt_len = prompt_ids.shape[1]
-    completion_logits = outputs.logits[:, prompt_len - 1:prompt_len - 1 + response_ids.shape[1], :]
-    log_probs = F.log_softmax(completion_logits, dim=-1)
-    per_token_logps = log_probs.gather(2, response_ids.unsqueeze(-1)).squeeze(-1)
-    return per_token_logps
+    res_len = response_ids.shape[1]
+    all_logps = []
+
+    for i in range(0, n_r, micro_batch_size):
+        end = min(i + micro_batch_size, n_r)
+        curr_res_ids = response_ids[i:end]
+        curr_res_mask = response_mask[i:end]
+
+        if n_p == 1:
+            b = curr_res_ids.shape[0]
+            curr_prompt_ids = prompt_ids.repeat(b, 1)
+            curr_prompt_mask = prompt_attention_mask.repeat(b, 1)
+        else:
+            curr_prompt_ids = prompt_ids[i:end]
+            curr_prompt_mask = prompt_attention_mask[i:end]
+
+        input_ids = torch.cat([curr_prompt_ids, curr_res_ids], dim=1)
+        attention_mask = torch.cat([curr_prompt_mask, curr_res_mask], dim=1)
+
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+        logits = outputs.logits[:, prompt_len - 1 : prompt_len - 1 + res_len, :]
+        log_probs = F.log_softmax(logits, dim=-1)
+        per_token_logps = log_probs.gather(2, curr_res_ids.unsqueeze(-1)).squeeze(-1)
+        all_logps.append(per_token_logps)
+        del outputs, logits, log_probs
+
+    return torch.cat(all_logps, dim=0)
 
 
 def _lora_trainable_params(peft_model):
