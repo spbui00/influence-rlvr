@@ -1,11 +1,18 @@
+import gc
 import json
 import os
 import re
 import time
+from pathlib import Path
 
 import numpy as np
 from peft import load_peft_weights, set_peft_model_state_dict
 
+from analysis.loader import append_grad_cache_checkpoint
+
+from .attribution.datainf import DataInfInfluence
+from .attribution.fisher import FisherInfluence
+from .attribution.tracin import tracin_base_matrix_from_infos
 from .eval import evaluate_code_dataset, evaluate_math_dataset
 from .generation import clear_vllm_engine_cache
 from .gradients import (
@@ -25,6 +32,7 @@ from .modes import (
     VLLMConfig,
 )
 from .utils import clear_cache
+import torch
 
 
 _CHECKPOINT_RE = re.compile(r"checkpoint-(\d+)$")
@@ -628,6 +636,16 @@ def collect_checkpoint_infos(
     vllm_config=None,
     model_id=None,
     progress=True,
+    results_dir=None,
+    tracin_normalize=False,
+    lambda_damp=0.1,
+    datainf_normalize=False,
+    fisher_lambda_damp=None,
+    fisher_normalize=False,
+    enable_grad_cache=False,
+    grad_cache_dir=None,
+    cache_fingerprint="",
+    cache_config=None,
 ):
     influence_mode = InfluenceMode.parse(influence_mode)
     generation_backend = (
@@ -654,6 +672,8 @@ def collect_checkpoint_infos(
     )
     if vllm_config is None:
         vllm_config = VLLMConfig()
+
+    fisher_ld = fisher_lambda_damp if fisher_lambda_damp is not None else lambda_damp
 
     checkpoint_infos = []
     checkpoint_count = len(checkpoint_schedule)
@@ -801,6 +821,92 @@ def collect_checkpoint_infos(
             replay_gradient_batch_size=replay_gradient_config.replay_gradient_batch_size,
         )
 
+        n_test = len(test_infos)
+        n_train = len(train_infos)
+        test_norms = [info["grad"].norm().item() for info in test_infos]
+        train_norms = [info["grad"].norm().item() for info in train_infos]
+        mean_test_grad_norm = float(np.mean(test_norms)) if test_norms else 0.0
+        mean_train_grad_norm = float(np.mean(train_norms)) if train_norms else 0.0
+
+        if n_test == 0 or n_train == 0:
+            checkpoint_matrix = np.zeros((n_test, n_train), dtype=np.float32)
+            datainf_checkpoint_matrix = np.zeros((n_test, n_train), dtype=np.float32)
+            fisher_checkpoint_matrix = np.zeros((n_test, n_train), dtype=np.float32)
+        else:
+            checkpoint_matrix = tracin_base_matrix_from_infos(
+                test_infos, train_infos, tracin_normalize
+            )
+            g_train_list = [info["grad"] for info in train_infos]
+            datainf = DataInfInfluence(
+                g_train_list,
+                lambda_damp=lambda_damp,
+                normalize=datainf_normalize,
+            )
+            datainf_checkpoint_matrix = np.zeros((n_test, n_train), dtype=np.float32)
+            for idx, test_info in enumerate(test_infos):
+                datainf_checkpoint_matrix[idx] = datainf.compute_all_scores(test_info)
+            del datainf
+
+            fisher = FisherInfluence(
+                train_infos,
+                lambda_damp=fisher_ld,
+                normalize=fisher_normalize,
+            )
+            fisher_checkpoint_matrix = np.zeros((n_test, n_train), dtype=np.float32)
+            for idx, test_info in enumerate(test_infos):
+                fisher_checkpoint_matrix[idx] = fisher.compute_all_scores(test_info)
+            del fisher
+
+        historical_total_rows = (
+            None
+            if step_weight_info is None
+            else step_weight_info.get("total_rows")
+        )
+
+        if results_dir is not None:
+            intermediate_dir = Path(results_dir) / "intermediate_results"
+            intermediate_dir.mkdir(parents=True, exist_ok=True)
+            step = int(checkpoint["step"])
+            np.save(
+                intermediate_dir / f"tracin_matrix_step_{step}.npy",
+                checkpoint_matrix,
+            )
+            np.save(
+                intermediate_dir / f"datainf_matrix_step_{step}.npy",
+                datainf_checkpoint_matrix,
+            )
+            np.save(
+                intermediate_dir / f"fisher_matrix_step_{step}.npy",
+                fisher_checkpoint_matrix,
+            )
+
+        if enable_grad_cache and grad_cache_dir:
+            append_grad_cache_checkpoint(
+                {
+                    "step": checkpoint["step"],
+                    "learning_rate": checkpoint["learning_rate"],
+                    "test_infos": test_infos,
+                    "train_infos": train_infos,
+                    "zero_test_cases": zero_test_cases,
+                    "zero_train_cases": zero_train_cases,
+                    "math_eval": math_eval,
+                    "code_eval": code_eval,
+                    "historical_total_rows": historical_total_rows,
+                },
+                grad_cache_dir,
+                cache_fingerprint,
+                cache_config if cache_config is not None else {},
+            )
+
+        for info in test_infos:
+            info.pop("grad", None)
+        for info in train_infos:
+            info.pop("grad", None)
+            info.pop("geometry_feature", None)
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
         checkpoint_infos.append({
             "step": checkpoint["step"],
             "path": checkpoint["path"],
@@ -811,11 +917,12 @@ def collect_checkpoint_infos(
             "zero_train_cases": zero_train_cases,
             "math_eval": math_eval,
             "code_eval": code_eval,
-            "historical_total_rows": (
-                None
-                if step_weight_info is None
-                else step_weight_info.get("total_rows")
-            ),
+            "historical_total_rows": historical_total_rows,
+            "checkpoint_matrix": checkpoint_matrix,
+            "datainf_checkpoint_matrix": datainf_checkpoint_matrix,
+            "fisher_checkpoint_matrix": fisher_checkpoint_matrix,
+            "mean_test_grad_norm": mean_test_grad_norm,
+            "mean_train_grad_norm": mean_train_grad_norm,
         })
         checkpoint_elapsed = time.time() - checkpoint_start
         _progress_print(

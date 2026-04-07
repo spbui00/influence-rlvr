@@ -173,8 +173,14 @@ def build_batch_weight_lookup(
 def build_checkpoint_summaries(checkpoint_infos: list[dict[str, Any]]) -> list[CheckpointSummary]:
     summaries = []
     for checkpoint in checkpoint_infos:
-        test_norms = [info["grad"].norm().item() for info in checkpoint["test_infos"]]
-        train_norms = [info["grad"].norm().item() for info in checkpoint["train_infos"]]
+        if "mean_test_grad_norm" in checkpoint and "mean_train_grad_norm" in checkpoint:
+            mean_test = float(checkpoint["mean_test_grad_norm"])
+            mean_train = float(checkpoint["mean_train_grad_norm"])
+        else:
+            test_norms = [info["grad"].norm().item() for info in checkpoint["test_infos"]]
+            train_norms = [info["grad"].norm().item() for info in checkpoint["train_infos"]]
+            mean_test = float(np.mean(test_norms)) if test_norms else 0.0
+            mean_train = float(np.mean(train_norms)) if train_norms else 0.0
         historical_nonzero_train = None
         if any("historical_weight" in info for info in checkpoint["train_infos"]):
             historical_nonzero_train = sum(
@@ -186,8 +192,8 @@ def build_checkpoint_summaries(checkpoint_infos: list[dict[str, Any]]) -> list[C
             CheckpointSummary(
                 step=int(checkpoint["step"]),
                 learning_rate=float(checkpoint["learning_rate"]),
-                mean_test_grad_norm=float(np.mean(test_norms)) if test_norms else 0.0,
-                mean_train_grad_norm=float(np.mean(train_norms)) if train_norms else 0.0,
+                mean_test_grad_norm=mean_test,
+                mean_train_grad_norm=mean_train,
                 zero_test_cases=list(checkpoint.get("zero_test_cases", [])),
                 zero_train_cases=list(checkpoint.get("zero_train_cases", [])),
                 math_eval=checkpoint.get("math_eval"),
@@ -574,6 +580,105 @@ def load_results_bundle(results_dir: str | Path) -> LoadedResults:
     )
 
 
+def _grad_cache_serialize_one_checkpoint(
+    checkpoint: dict[str, Any],
+    cache_path: Path,
+) -> GradCacheCheckpoint:
+    step = int(checkpoint["step"])
+    test_infos = []
+    for index, info in enumerate(checkpoint["test_infos"]):
+        grad_file = f"step{step}_test_{index}.npy"
+        np.save(cache_path / grad_file, info["grad"].numpy())
+        geometry_feature_file = None
+        if info.get("geometry_feature") is not None:
+            geometry_feature_file = f"step{step}_test_{index}_geometry.npy"
+            np.save(
+                cache_path / geometry_feature_file,
+                info["geometry_feature"].numpy(),
+            )
+        test_infos.append(
+            GradCacheSample(
+                grad_file=grad_file,
+                prompt=info.get("prompt"),
+                solution=info.get("solution"),
+                train_index=info.get("train_index"),
+                historical_weight=info.get("historical_weight"),
+                geometry_feature_file=geometry_feature_file,
+            )
+        )
+    train_infos = []
+    for index, info in enumerate(checkpoint["train_infos"]):
+        grad_file = f"step{step}_train_{index}.npy"
+        np.save(cache_path / grad_file, info["grad"].numpy())
+        geometry_feature_file = None
+        if info.get("geometry_feature") is not None:
+            geometry_feature_file = f"step{step}_train_{index}_geometry.npy"
+            np.save(
+                cache_path / geometry_feature_file,
+                info["geometry_feature"].numpy(),
+            )
+        train_infos.append(
+            GradCacheSample(
+                grad_file=grad_file,
+                prompt=info.get("prompt"),
+                solution=info.get("solution"),
+                train_index=info.get("train_index"),
+                historical_weight=info.get("historical_weight"),
+                geometry_feature_file=geometry_feature_file,
+            )
+        )
+    return GradCacheCheckpoint(
+        step=step,
+        learning_rate=float(checkpoint["learning_rate"]),
+        zero_test_cases=list(checkpoint.get("zero_test_cases", [])),
+        zero_train_cases=list(checkpoint.get("zero_train_cases", [])),
+        test_infos=test_infos,
+        train_infos=train_infos,
+        math_eval=checkpoint.get("math_eval"),
+        code_eval=checkpoint.get("code_eval"),
+        historical_total_rows=checkpoint.get("historical_total_rows"),
+    )
+
+
+def append_grad_cache_checkpoint(
+    checkpoint: dict[str, Any],
+    cache_dir: str | Path,
+    fingerprint: str,
+    config: dict[str, Any],
+) -> GradCacheManifest:
+    cache_path = Path(cache_dir)
+    cache_path.mkdir(parents=True, exist_ok=True)
+    manifest_path = cache_path / GRAD_CACHE_MANIFEST_FILE
+    serialized = _grad_cache_serialize_one_checkpoint(checkpoint, cache_path)
+
+    if manifest_path.exists():
+        manifest = _load_grad_cache_manifest(cache_dir)
+        if manifest.fingerprint != fingerprint:
+            raise ValueError(
+                "Grad cache fingerprint mismatch; refusing to append checkpoint "
+                f"(cached={manifest.fingerprint!r}, expected={fingerprint!r})."
+            )
+        updated = GradCacheManifest(
+            schema_version=manifest.schema_version,
+            kind=manifest.kind,
+            fingerprint=manifest.fingerprint,
+            config=manifest.config,
+            checkpoints=[*manifest.checkpoints, serialized],
+        )
+        _write_json(manifest_path, updated.to_dict())
+        return updated
+
+    manifest = GradCacheManifest(
+        schema_version=GRAD_CACHE_SCHEMA_VERSION,
+        kind="grad_cache",
+        fingerprint=fingerprint,
+        config=dict(config),
+        checkpoints=[serialized],
+    )
+    _write_json(manifest_path, manifest.to_dict())
+    return manifest
+
+
 def save_grad_cache(
     checkpoint_infos: list[dict[str, Any]],
     cache_dir: str | Path,
@@ -583,58 +688,10 @@ def save_grad_cache(
     cache_path = Path(cache_dir)
     cache_path.mkdir(parents=True, exist_ok=True)
 
-    checkpoints: list[GradCacheCheckpoint] = []
-    for checkpoint in checkpoint_infos:
-        step = int(checkpoint["step"])
-        test_infos = []
-        for index, info in enumerate(checkpoint["test_infos"]):
-            grad_file = f"step{step}_test_{index}.npy"
-            np.save(cache_path / grad_file, info["grad"].numpy())
-            geometry_feature_file = None
-            if info.get("geometry_feature") is not None:
-                geometry_feature_file = f"step{step}_test_{index}_geometry.npy"
-                np.save(cache_path / geometry_feature_file, info["geometry_feature"].numpy())
-            test_infos.append(
-                GradCacheSample(
-                    grad_file=grad_file,
-                    prompt=info.get("prompt"),
-                    solution=info.get("solution"),
-                    train_index=info.get("train_index"),
-                    historical_weight=info.get("historical_weight"),
-                    geometry_feature_file=geometry_feature_file,
-                )
-            )
-        train_infos = []
-        for index, info in enumerate(checkpoint["train_infos"]):
-            grad_file = f"step{step}_train_{index}.npy"
-            np.save(cache_path / grad_file, info["grad"].numpy())
-            geometry_feature_file = None
-            if info.get("geometry_feature") is not None:
-                geometry_feature_file = f"step{step}_train_{index}_geometry.npy"
-                np.save(cache_path / geometry_feature_file, info["geometry_feature"].numpy())
-            train_infos.append(
-                GradCacheSample(
-                    grad_file=grad_file,
-                    prompt=info.get("prompt"),
-                    solution=info.get("solution"),
-                    train_index=info.get("train_index"),
-                    historical_weight=info.get("historical_weight"),
-                    geometry_feature_file=geometry_feature_file,
-                )
-            )
-        checkpoints.append(
-            GradCacheCheckpoint(
-                step=step,
-                learning_rate=float(checkpoint["learning_rate"]),
-                zero_test_cases=list(checkpoint.get("zero_test_cases", [])),
-                zero_train_cases=list(checkpoint.get("zero_train_cases", [])),
-                test_infos=test_infos,
-                train_infos=train_infos,
-                math_eval=checkpoint.get("math_eval"),
-                code_eval=checkpoint.get("code_eval"),
-                historical_total_rows=checkpoint.get("historical_total_rows"),
-            )
-        )
+    checkpoints = [
+        _grad_cache_serialize_one_checkpoint(cp, cache_path)
+        for cp in checkpoint_infos
+    ]
 
     manifest = GradCacheManifest(
         schema_version=GRAD_CACHE_SCHEMA_VERSION,

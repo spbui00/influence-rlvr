@@ -1,5 +1,6 @@
 from .analyzer import InfluenceAnalyzer
 from .loader import (
+    append_grad_cache_checkpoint,
     build_batch_history_fingerprint,
     build_batch_weight_lookup,
     build_cache_fingerprint,
@@ -17,6 +18,7 @@ from .loader import (
 
 __all__ = [
     "InfluenceAnalyzer",
+    "append_grad_cache_checkpoint",
     "build_batch_history_fingerprint",
     "build_batch_weight_lookup",
     "build_cache_fingerprint",

@@ -92,17 +92,22 @@ class TrajectoryFisherInfluence:
         breakdown = []
 
         for checkpoint in checkpoint_infos:
-            fisher = FisherInfluence(
-                checkpoint["train_infos"],
-                lambda_damp=self.lambda_damp,
-                normalize=self.normalize,
-            )
-
             n_test = len(checkpoint["test_infos"])
             n_train = len(checkpoint["train_infos"])
-            matrix = np.zeros((n_test, n_train), dtype=np.float32)
-            for idx, test_info in enumerate(checkpoint["test_infos"]):
-                matrix[idx] = fisher.compute_all_scores(test_info)
+            if checkpoint.get("fisher_checkpoint_matrix") is not None:
+                matrix = np.asarray(
+                    checkpoint["fisher_checkpoint_matrix"],
+                    dtype=np.float32,
+                )
+            else:
+                fisher = FisherInfluence(
+                    checkpoint["train_infos"],
+                    lambda_damp=self.lambda_damp,
+                    normalize=self.normalize,
+                )
+                matrix = np.zeros((n_test, n_train), dtype=np.float32)
+                for idx, test_info in enumerate(checkpoint["test_infos"]):
+                    matrix[idx] = fisher.compute_all_scores(test_info)
 
             train_weights = _stack_train_weights(checkpoint["train_infos"]).numpy()
             learning_rate = float(checkpoint.get("learning_rate", 1.0))

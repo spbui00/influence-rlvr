@@ -22,7 +22,6 @@ from analysis import (
     load_grad_cache,
     next_results_dir,
     resolve_results_dir,
-    save_grad_cache,
     save_results_bundle,
 )
 from influence_rlvr import (
@@ -842,12 +841,24 @@ def _pipeline_main():
             model_id=MODEL_ID,
             **CODE_EVAL_CONFIG.to_kwargs(),
             **REPLAY_GRADIENT_CONFIG.to_kwargs(),
+            results_dir=RESULTS_DIR,
+            tracin_normalize=False,
+            lambda_damp=LAMBDA_DAMP,
+            datainf_normalize=False,
+            fisher_lambda_damp=LAMBDA_DAMP,
+            fisher_normalize=REPLAY_GRADIENT_CONFIG.fisher_normalize,
+            enable_grad_cache=ENABLE_GRAD_CACHE,
+            grad_cache_dir=GRAD_CACHE_DIR if ENABLE_GRAD_CACHE else None,
+            cache_fingerprint=CACHE_FINGERPRINT,
+            cache_config=CACHE_CONFIG,
         )
         elapsed = time.time() - t0
         print(f"\nTrajectory replay completed in {elapsed:.1f}s")
         if ENABLE_GRAD_CACHE:
-            save_grad_cache(infos, GRAD_CACHE_DIR, CACHE_FINGERPRINT, CACHE_CONFIG)
-            print(f"Gradient cache saved to {Path(GRAD_CACHE_DIR).resolve()}/")
+            print(
+                "Gradient cache written incrementally to "
+                f"{Path(GRAD_CACHE_DIR).resolve()}/"
+            )
             print(f"  config fingerprint: {CACHE_FINGERPRINT}")
         else:
             print("Gradient cache disabled; skipping grad_cache save.")
@@ -879,8 +890,14 @@ def _pipeline_main():
 
     print("\nCheckpoint gradient summary:")
     for cp in checkpoint_infos:
-        test_norms = [info["grad"].norm().item() for info in cp["test_infos"]]
-        train_norms = [info["grad"].norm().item() for info in cp["train_infos"]]
+        if "mean_test_grad_norm" in cp:
+            mean_test_norm = cp["mean_test_grad_norm"]
+            mean_train_norm = cp["mean_train_grad_norm"]
+        else:
+            test_norms = [info["grad"].norm().item() for info in cp["test_infos"]]
+            train_norms = [info["grad"].norm().item() for info in cp["train_infos"]]
+            mean_test_norm = float(np.mean(test_norms)) if test_norms else 0.0
+            mean_train_norm = float(np.mean(train_norms)) if train_norms else 0.0
         nonzero_train_weights = None
         if any("historical_weight" in info for info in cp["train_infos"]):
             nonzero_train_weights = sum(
@@ -891,8 +908,8 @@ def _pipeline_main():
         print(
             f"  step {cp['step']:>3d}: "
             f"lr={cp['learning_rate']:.6e}, "
-            f"mean ||g_test||={np.mean(test_norms):.6f}, "
-            f"mean ||g_train||={np.mean(train_norms):.6f}, "
+            f"mean ||g_test||={mean_test_norm:.6f}, "
+            f"mean ||g_train||={mean_train_norm:.6f}, "
             f"zero-test={cp['zero_test_cases']}, "
             f"zero-train={cp['zero_train_cases']}"
             + (

@@ -12,6 +12,19 @@ def _stack_grads(infos, normalize):
     return grads
 
 
+def tracin_base_matrix_from_infos(test_infos, train_infos, normalize: bool) -> np.ndarray:
+    if not test_infos or not train_infos:
+        return np.zeros(
+            (len(test_infos), len(train_infos)),
+            dtype=np.float32,
+        )
+    test_grads = _stack_grads(test_infos, normalize)
+    train_grads = _stack_grads(train_infos, normalize)
+    matrix = (test_grads @ train_grads.T).cpu().numpy().astype(np.float32, copy=False)
+    del test_grads, train_grads
+    return matrix
+
+
 def _stack_train_weights(infos):
     return torch.tensor(
         [float(info.get("historical_weight", 1.0)) for info in infos],
@@ -58,10 +71,16 @@ class TrajectoryTracInInfluence:
         breakdown = []
 
         for checkpoint in checkpoint_infos:
-            test_grads = _stack_grads(checkpoint["test_infos"], self.normalize)
-            train_grads = _stack_grads(checkpoint["train_infos"], self.normalize)
             train_weights = _stack_train_weights(checkpoint["train_infos"])
-            matrix = (test_grads @ train_grads.T).cpu().numpy()
+            if checkpoint.get("checkpoint_matrix") is not None:
+                matrix = np.asarray(
+                    checkpoint["checkpoint_matrix"],
+                    dtype=np.float32,
+                )
+            else:
+                test_grads = _stack_grads(checkpoint["test_infos"], self.normalize)
+                train_grads = _stack_grads(checkpoint["train_infos"], self.normalize)
+                matrix = (test_grads @ train_grads.T).cpu().numpy()
             learning_rate = float(checkpoint.get("learning_rate", 1.0))
             weighted_matrix = learning_rate * matrix * train_weights.numpy()[None, :]
 

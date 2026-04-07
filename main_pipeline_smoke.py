@@ -418,49 +418,6 @@ if effective_influence_mode == InfluenceMode.HISTORICAL:
         "weights": {},
     }
 
-checkpoint_infos = collect_checkpoint_infos(
-    model,
-    tokenizer,
-    checkpoint_schedule,
-    test_dataset,
-    replay_train_dataset,
-    DEVICE,
-    reward_fn_builder=replay_reward_fn_builder,
-    G=G_TRAIN,
-    enable_vllm=GENERATION_BACKEND == GenerationBackend.VLLM,
-    generation_backend=GENERATION_BACKEND,
-    test_limit=len(test_dataset),
-    train_limit=min(N_TRAIN_REPLAY, len(replay_train_dataset)),
-    include_debug=False,
-    base_seed=TRAIN_GRAD_SEED,
-    test_reward_fn_builder=build_code_reward_fns,
-    test_G=G_TEST,
-    epsilon=GRPO_EPSILON,
-    beta=GRPO_BETA,
-    influence_mode=effective_influence_mode,
-    train_step_weight_lookup=batch_weight_lookup,
-    math_eval_dataset=math_eval_dataset,
-    code_eval_dataset=code_eval_dataset,
-    eval_max_new_tokens=EVAL_MAX_NEW_TOKENS,
-    vllm_config=VLLM_CONFIG,
-    model_id=MODEL_ID,
-    **CODE_EVAL_CONFIG.to_kwargs(),
-    **REPLAY_GRADIENT_CONFIG.to_kwargs(),
-)
-
-print("\n" + "=" * 80)
-print("PHASE 3: Influence")
-print("=" * 80)
-trajectory_tracin = TrajectoryTracInInfluence(normalize=False)
-tracin_matrix, tracin_breakdown = trajectory_tracin.compute_matrix(checkpoint_infos, return_breakdown=True)
-trajectory_datainf = TrajectoryDataInfInfluence(lambda_damp=LAMBDA_DAMP, normalize=False)
-datainf_matrix, datainf_breakdown = trajectory_datainf.compute_matrix(checkpoint_infos, return_breakdown=True)
-trajectory_fisher = TrajectoryFisherInfluence(
-    lambda_damp=LAMBDA_DAMP,
-    normalize=REPLAY_GRADIENT_CONFIG.fisher_normalize,
-)
-fisher_matrix, fisher_breakdown = trajectory_fisher.compute_matrix(checkpoint_infos, return_breakdown=True)
-
 results_config = {
     "model_id": MODEL_ID,
     "run_name": RUN_NAME,
@@ -511,6 +468,55 @@ results_path, reusing_results_dir, results_config_fingerprint = finalize_results
 results_config["results_name"] = results_path.name
 results_config["results_dir"] = str(results_path)
 results_config["results_config_fingerprint"] = results_config_fingerprint
+
+checkpoint_infos = collect_checkpoint_infos(
+    model,
+    tokenizer,
+    checkpoint_schedule,
+    test_dataset,
+    replay_train_dataset,
+    DEVICE,
+    reward_fn_builder=replay_reward_fn_builder,
+    G=G_TRAIN,
+    enable_vllm=GENERATION_BACKEND == GenerationBackend.VLLM,
+    generation_backend=GENERATION_BACKEND,
+    test_limit=len(test_dataset),
+    train_limit=min(N_TRAIN_REPLAY, len(replay_train_dataset)),
+    include_debug=False,
+    base_seed=TRAIN_GRAD_SEED,
+    test_reward_fn_builder=build_code_reward_fns,
+    test_G=G_TEST,
+    epsilon=GRPO_EPSILON,
+    beta=GRPO_BETA,
+    influence_mode=effective_influence_mode,
+    train_step_weight_lookup=batch_weight_lookup,
+    math_eval_dataset=math_eval_dataset,
+    code_eval_dataset=code_eval_dataset,
+    eval_max_new_tokens=EVAL_MAX_NEW_TOKENS,
+    vllm_config=VLLM_CONFIG,
+    model_id=MODEL_ID,
+    **CODE_EVAL_CONFIG.to_kwargs(),
+    **REPLAY_GRADIENT_CONFIG.to_kwargs(),
+    results_dir=str(results_path),
+    tracin_normalize=False,
+    lambda_damp=LAMBDA_DAMP,
+    datainf_normalize=False,
+    fisher_lambda_damp=LAMBDA_DAMP,
+    fisher_normalize=REPLAY_GRADIENT_CONFIG.fisher_normalize,
+)
+
+print("\n" + "=" * 80)
+print("PHASE 3: Influence")
+print("=" * 80)
+trajectory_tracin = TrajectoryTracInInfluence(normalize=False)
+tracin_matrix, tracin_breakdown = trajectory_tracin.compute_matrix(checkpoint_infos, return_breakdown=True)
+trajectory_datainf = TrajectoryDataInfInfluence(lambda_damp=LAMBDA_DAMP, normalize=False)
+datainf_matrix, datainf_breakdown = trajectory_datainf.compute_matrix(checkpoint_infos, return_breakdown=True)
+trajectory_fisher = TrajectoryFisherInfluence(
+    lambda_damp=LAMBDA_DAMP,
+    normalize=REPLAY_GRADIENT_CONFIG.fisher_normalize,
+)
+fisher_matrix, fisher_breakdown = trajectory_fisher.compute_matrix(checkpoint_infos, return_breakdown=True)
 
 save_results_bundle(
     results_path,
