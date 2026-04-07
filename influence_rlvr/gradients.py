@@ -252,6 +252,7 @@ def _forward_per_token_logps_functional(
         state_dict,
         (),
         {"input_ids": inp, "attention_mask": am, "use_cache": False},
+        tie_weights=False
     )
     logits = out.logits if hasattr(out, "logits") else out[0]
     completion_logits = logits[:, pl - 1 : pl - 1 + rt, :]

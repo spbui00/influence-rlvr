@@ -404,6 +404,9 @@ def _pipeline_main():
         dtype=torch.bfloat16,
     ).to(DEVICE)
 
+    base_model.config.use_cache = False
+    base_model.gradient_checkpointing_enable()
+
     lora_config = LoraConfig(
         r=LORA_R,
         lora_alpha=LORA_ALPHA,
