@@ -98,7 +98,7 @@ CODE_TRAIN_SPLIT = "train"
 CODE_EVAL_SPLIT = "validation"
 CODE_EVAL_PERCENT = 0
 EVAL_MAX_NEW_TOKENS = 1024
-VLLM_GPU_MEMORY_UTILIZATION = 0.35
+VLLM_GPU_MEMORY_UTILIZATION = 0.3
 INFLUENCE_MODE = InfluenceMode.HISTORICAL
 EXPERIMENT_MODE = ExperimentMode.MATH_GRPO
 GENERATION_BACKEND = GenerationBackend.VLLM
@@ -118,7 +118,7 @@ REPLAY_GRADIENT_CONFIG = ReplayGradientConfig(
     max_new_tokens=EVAL_MAX_NEW_TOKENS,
     temperature=0.7,
     top_p=0.9,
-    replay_gradient_batch_size=2,
+    replay_gradient_batch_size=1,
 )
 
 SKIP_TRAINING = True
@@ -127,7 +127,7 @@ RESULTS_REUSE_POLICY = "ask"
 
 CHECKPOINT_THINNING = CheckpointThinningConfig(
     mode=CheckpointThinningMode.LEARNING_RATE,
-    target_count=100
+    target_count=50
 )
 
 _TRAINING_SCRIPT_MATH_FORMAT_SUFFIX = (
