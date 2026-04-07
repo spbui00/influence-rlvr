@@ -552,165 +552,111 @@ def compute_policy_gradient_bundle_batch(
     if rollout.num_prompts * rollout.num_samples != len(rollout.texts):
         raise RuntimeError("Rollout layout does not match num_prompts * num_samples.")
 
-    total_reward_rows = []
-    reward_breakdown_batch = []
+    grad_rows = []
+    geometry_rows = [] if geometry_feature_mode != GeometryFeatureMode.NONE else None
+    debug_rows = []
+
     for bi in range(bsz):
+        start_idx = bi * G
+        end_idx = (bi + 1) * G
+
+        # Extract data for this single prompt
+        single_prompt_text = prompt_texts[bi]
+        single_prompt_ids = prompt_ids[bi : bi + 1]
+        single_prompt_mask = prompt_attention_mask[bi : bi + 1]
+        
+        single_texts = rollout.texts[start_idx:end_idx]
+        single_token_ids = rollout.token_ids[start_idx:end_idx]
+        single_response_mask = rollout.response_mask[start_idx:end_idx]
+
+        # Evaluate rewards for this single prompt
         slice_trl = rollout_to_completions(
             RolloutBatch(
-                texts=rollout.texts[bi * G : (bi + 1) * G],
-                token_ids=rollout.token_ids[bi * G : (bi + 1) * G],
-                response_mask=rollout.response_mask[bi * G : (bi + 1) * G],
+                texts=single_texts,
+                token_ids=single_token_ids,
+                response_mask=single_response_mask,
                 num_prompts=1,
                 num_samples=G,
             )
         )
-        tr, rb = _evaluate_rewards(reward_funcs_batch[bi], slice_trl, dev)
-        total_reward_rows.append(tr)
-        reward_breakdown_batch.append(rb)
-    total_rewards = torch.stack(total_reward_rows, dim=0)
+        total_rewards, reward_breakdown = _evaluate_rewards(reward_funcs_batch[bi], slice_trl, dev)
 
-    rl = rollout.token_ids.shape[1]
-    response_ids = rollout.token_ids.view(bsz, G, rl)
-    response_mask = rollout.response_mask.view(bsz, G, rl)
-
-    bg = bsz * G
-    pe = prompt_ids.unsqueeze(1).expand(bsz, G, prompt_ids.shape[1]).reshape(bg, prompt_ids.shape[1])
-    pme = prompt_attention_mask.unsqueeze(1).expand(bsz, G, prompt_attention_mask.shape[1]).reshape(
-        bg, prompt_attention_mask.shape[1],
-    )
-    rf = response_ids.reshape(bg, rl)
-    rm = response_mask.reshape(bg, rl)
-
-    per_token_logps_flat = _compute_per_token_logps(
-        peft_model,
-        pe,
-        pme,
-        rf,
-        rm,
-    )
-    tlen = per_token_logps_flat.shape[1]
-    per_token_logps = per_token_logps_flat.view(bsz, G, tlen)
-
-    if old_peft_model is None:
-        old_per_token_logps = per_token_logps.detach()
-    else:
-        old_flat = _compute_old_per_token_logps(
+        # Forward Pass (G sequences only - extremely safe for memory)
+        per_token_logps = _compute_per_token_logps(
             peft_model,
-            old_peft_model,
-            pe,
-            pme,
-            rf,
-            rm,
+            single_prompt_ids,
+            single_prompt_mask,
+            single_token_ids,
+            single_response_mask,
         )
-        old_per_token_logps = old_flat.view(bsz, G, tlen)
 
-    ref_per_token_logps = None
-    if beta != 0.0:
-        ref_flat = _compute_ref_per_token_logps(
-            peft_model,
-            ref_model,
-            pe,
-            pme,
-            rf,
-            rm,
-        )
-        ref_per_token_logps = ref_flat.view(bsz, G, tlen)
-
-    token_mask, token_counts, sequence_log_probs, mean_sequence_log_probs = (
-        _sequence_log_stats_batched(per_token_logps, response_mask)
-    )
-
-    if objective_mode == GradientObjective.GRPO_TRAIN:
-        loss_vec, advantages, per_token_kl = _compute_grpo_policy_loss_per_prompt(
-            total_rewards,
-            per_token_logps,
-            old_per_token_logps,
-            response_mask,
-            epsilon=epsilon,
-            beta=beta,
-            ref_per_token_logps=ref_per_token_logps,
-            advantage_eps=advantage_eps,
-        )
-        objective_name = "grpo_policy_loss"
-    elif objective_mode == GradientObjective.EXPECTED_REWARD_PG:
-        loss_vec = _compute_expected_reward_policy_loss_per_prompt(
-            total_rewards,
-            sequence_log_probs,
-        )
-        advantages = total_rewards.detach()
-        per_token_kl = torch.zeros_like(per_token_logps)
-        objective_name = "expected_reward_pg_loss"
-    else:
-        raise ValueError(f"Unsupported objective_mode={objective_mode!r}.")
-
-    names = _lora_trainable_param_names_tuple(peft_model)
-    if not names:
-        raise RuntimeError("No trainable parameters found for per-sample gradients.")
-
-    grad_rows = _per_sample_gradients_batch(
-        peft_model,
-        objective_mode,
-        names,
-        prompt_ids,
-        prompt_attention_mask,
-        response_ids,
-        response_mask,
-        total_rewards,
-        old_per_token_logps,
-        ref_per_token_logps,
-        epsilon=epsilon,
-        beta=beta,
-        advantage_eps=advantage_eps,
-    )
-    grad_rows = [
-        _sanitize_grad_vector(
-            g,
-            context=f"compute_policy_gradient_bundle_batch[{objective_mode}][{j}]",
-        )
-        for j, g in enumerate(grad_rows)
-    ]
-
-    geometry_rows = None
-    if geometry_feature_mode == GeometryFeatureMode.POLICY_SCORE:
-        geometry_rows = _per_sample_geometry_gradients_batch(
-            peft_model,
-            names,
-            prompt_ids,
-            prompt_attention_mask,
-            response_ids,
-            response_mask,
-        )
-        geometry_rows = [
-            _sanitize_grad_vector(
-                g,
-                context=f"compute_policy_gradient_bundle_batch[policy_score][{j}]",
+        if old_peft_model is None:
+            old_per_token_logps = per_token_logps.detach()
+        else:
+            old_per_token_logps = _compute_old_per_token_logps(
+                peft_model, old_peft_model, single_prompt_ids, single_prompt_mask, single_token_ids, single_response_mask
             )
-            for j, g in enumerate(geometry_rows)
-        ]
-    elif geometry_feature_mode != GeometryFeatureMode.NONE:
-        raise ValueError(
-            f"Unsupported geometry_feature_mode={geometry_feature_mode!r}."
+
+        ref_per_token_logps = None
+        if beta != 0.0:
+            ref_per_token_logps = _compute_ref_per_token_logps(
+                peft_model, ref_model, single_prompt_ids, single_prompt_mask, single_token_ids, single_response_mask
+            )
+
+        token_mask, token_counts, sequence_log_probs, mean_sequence_log_probs = _sequence_log_stats(
+            per_token_logps, single_response_mask
         )
 
-    debug_rows = []
-    for bi in range(bsz):
+        # Calculate Objective (Returns a single scalar loss for this prompt)
+        if objective_mode == GradientObjective.GRPO_TRAIN:
+            objective, advantages, per_token_kl = _compute_grpo_policy_loss(
+                total_rewards,
+                per_token_logps,
+                old_per_token_logps,
+                single_response_mask,
+                epsilon=epsilon,
+                beta=beta,
+                ref_per_token_logps=ref_per_token_logps,
+                advantage_eps=advantage_eps,
+            )
+            objective_name = "grpo_policy_loss"
+        elif objective_mode == GradientObjective.EXPECTED_REWARD_PG:
+            objective = _compute_expected_reward_policy_loss(total_rewards, sequence_log_probs)
+            advantages = total_rewards.detach()
+            per_token_kl = torch.zeros_like(per_token_logps)
+            objective_name = "expected_reward_pg_loss"
+        else:
+            raise ValueError(f"Unsupported objective_mode={objective_mode!r}.")
+
+        # 3. BACKWARD PASS: Standard PyTorch (No vmap required)
+        peft_model.zero_grad()
+        retain_graph = geometry_feature_mode != GeometryFeatureMode.NONE
+        
+        grad_vector = _grad_vector_from_scalar(peft_model, objective, retain_graph=retain_graph)
+        grad_vector = _sanitize_grad_vector(grad_vector, context=f"batch_idx_{bi}_{objective_mode}")
+        grad_rows.append(grad_vector)
+
+        # Geometry Feature Calculation (If applicable)
+        if geometry_feature_mode == GeometryFeatureMode.POLICY_SCORE:
+            peft_model.zero_grad()
+            geometry_scalar = sequence_log_probs.mean()
+            geometry_vector = _grad_vector_from_scalar(peft_model, geometry_scalar, retain_graph=False)
+            geometry_vector = _sanitize_grad_vector(geometry_vector, context=f"batch_idx_{bi}_policy_score")
+            geometry_rows.append(geometry_vector)
+
+        # Append Debug Info
         debug_rows.append({
-            "prompt_text": prompt_texts[bi],
-            "responses": rollout.texts[bi * G : (bi + 1) * G],
-            "reward_breakdown": reward_breakdown_batch[bi],
-            "total_rewards": total_rewards[bi].detach().cpu().tolist(),
-            "advantages": advantages[bi].detach().cpu().tolist(),
-            "log_probs": sequence_log_probs[bi].detach().float().cpu().tolist(),
-            "sequence_log_probs": sequence_log_probs[bi].detach().float().cpu().tolist(),
-            "mean_sequence_log_probs": float(mean_sequence_log_probs[bi].detach().cpu()),
-            "response_lengths": response_mask[bi].sum(dim=1).detach().cpu().tolist(),
-            "policy_loss": float(loss_vec[bi].detach().float().cpu()),
-            "mean_kl": float(
-                ((per_token_kl[bi] * token_mask[bi]).sum(dim=1) / token_counts[bi])
-                .mean()
-                .detach()
-                .cpu()
-            ),
+            "prompt_text": single_prompt_text,
+            "responses": single_texts,
+            "reward_breakdown": reward_breakdown,
+            "total_rewards": total_rewards.detach().cpu().tolist(),
+            "advantages": advantages.detach().cpu().tolist(),
+            "log_probs": sequence_log_probs.detach().float().cpu().tolist(),
+            "sequence_log_probs": sequence_log_probs.detach().float().cpu().tolist(),
+            "mean_sequence_log_probs": float(mean_sequence_log_probs.mean().detach().cpu()),
+            "response_lengths": single_response_mask.sum(dim=1).detach().cpu().tolist(),
+            "policy_loss": float(objective.detach().float().cpu()),
+            "mean_kl": float(((per_token_kl * token_mask).sum(dim=1) / token_counts).mean().detach().cpu()),
             "epsilon": epsilon,
             "beta": beta,
             "seed": seed,
@@ -719,8 +665,8 @@ def compute_policy_gradient_bundle_batch(
             "objective_name": objective_name,
             "geometry_feature_mode": geometry_feature_mode,
         })
-        if geometry_rows is not None:
-            debug_rows[-1]["geometry_feature_norm"] = float(geometry_rows[bi].norm().item())
+        if geometry_feature_mode != GeometryFeatureMode.NONE:
+             debug_rows[-1]["geometry_feature_norm"] = float(geometry_vector.norm().item())
 
     return {
         "grad": grad_rows,
