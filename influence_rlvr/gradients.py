@@ -628,21 +628,18 @@ def compute_policy_gradient_bundle_batch(
         else:
             raise ValueError(f"Unsupported objective_mode={objective_mode!r}.")
 
-        # 3. BACKWARD PASS: Standard PyTorch (No vmap required)
-        peft_model.zero_grad()
-        retain_graph = geometry_feature_mode != GeometryFeatureMode.NONE
-        
-        grad_vector = _grad_vector_from_scalar(peft_model, objective, retain_graph=retain_graph)
-        grad_vector = _sanitize_grad_vector(grad_vector, context=f"batch_idx_{bi}_{objective_mode}")
-        grad_rows.append(grad_vector)
-
-        # Geometry Feature Calculation (If applicable)
         if geometry_feature_mode == GeometryFeatureMode.POLICY_SCORE:
             peft_model.zero_grad()
             geometry_scalar = sequence_log_probs.mean()
-            geometry_vector = _grad_vector_from_scalar(peft_model, geometry_scalar, retain_graph=False)
+            # Retain the graph here!
+            geometry_vector = _grad_vector_from_scalar(peft_model, geometry_scalar, retain_graph=True)
             geometry_vector = _sanitize_grad_vector(geometry_vector, context=f"batch_idx_{bi}_policy_score")
             geometry_rows.append(geometry_vector)
+
+        peft_model.zero_grad()
+        grad_vector = _grad_vector_from_scalar(peft_model, objective, retain_graph=False)
+        grad_vector = _sanitize_grad_vector(grad_vector, context=f"batch_idx_{bi}_{objective_mode}")
+        grad_rows.append(grad_vector)
 
         # Append Debug Info
         debug_rows.append({
@@ -667,6 +664,13 @@ def compute_policy_gradient_bundle_batch(
         })
         if geometry_feature_mode != GeometryFeatureMode.NONE:
              debug_rows[-1]["geometry_feature_norm"] = float(geometry_vector.norm().item())
+
+        import gc
+        del objective, per_token_logps, sequence_log_probs, token_mask, token_counts, per_token_kl
+        if geometry_feature_mode == GeometryFeatureMode.POLICY_SCORE:
+            del geometry_scalar
+        gc.collect()
+        torch.cuda.empty_cache()
 
     return {
         "grad": grad_rows,
