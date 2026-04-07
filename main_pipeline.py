@@ -94,10 +94,11 @@ CODE_TRAIN_SPLIT = "train"
 CODE_EVAL_SPLIT = "validation"
 CODE_EVAL_PERCENT = 10
 EVAL_MAX_NEW_TOKENS = 256
+VLLM_GPU_MEMORY_UTILIZATION = 0.9
 INFLUENCE_MODE = InfluenceMode.HISTORICAL
 EXPERIMENT_MODE = ExperimentMode.MATH_GRPO
 GENERATION_BACKEND = GenerationBackend.VLLM
-VLLM_CONFIG = VLLMConfig()
+VLLM_CONFIG = VLLMConfig(gpu_memory_utilization=VLLM_GPU_MEMORY_UTILIZATION)
 CODE_EVAL_CONFIG = CodeEvalConfig(
     do_sample=True,
     num_samples=4,
@@ -194,9 +195,7 @@ def _apply_training_run_config(cfg: dict, path: Path) -> None:
     vmlm = cfg.get("vllm_max_model_length")
     vmxlr = cfg.get("vllm_max_lora_rank")
     VLLM_CONFIG = VLLMConfig(
-        gpu_memory_utilization=float(
-            cfg.get("vllm_gpu_memory_utilization", VLLM_CONFIG.gpu_memory_utilization)
-        ),
+        gpu_memory_utilization=float(VLLM_GPU_MEMORY_UTILIZATION),
         tensor_parallel_size=int(
             cfg.get("vllm_tensor_parallel_size", VLLM_CONFIG.tensor_parallel_size)
         ),

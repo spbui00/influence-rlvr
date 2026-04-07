@@ -224,9 +224,9 @@ def compute_policy_gradient_bundle(
         adapter_path=adapter_path,
         model_id=model_id,
     )
-    if generation_backend == GenerationBackend.VLLM:
-        clear_vllm_engine_cache()
-        clear_cache(device)
+    # if generation_backend == GenerationBackend.VLLM:
+    #     clear_vllm_engine_cache()
+    #     clear_cache(device)
     completions_trl = rollout_to_completions(rollout)
     total_rewards, reward_breakdown = _evaluate_rewards(reward_funcs, completions_trl, device)
 
