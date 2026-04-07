@@ -98,7 +98,7 @@ MATH_EVAL_PERCENT = 0
 CODE_TRAIN_SPLIT = "train"
 CODE_EVAL_SPLIT = "validation"
 CODE_EVAL_PERCENT = 0
-EVAL_MAX_NEW_TOKENS = 256
+EVAL_MAX_NEW_TOKENS = 1024
 VLLM_GPU_MEMORY_UTILIZATION = 0.35
 INFLUENCE_MODE = InfluenceMode.HISTORICAL
 EXPERIMENT_MODE = ExperimentMode.MATH_GRPO
@@ -127,9 +127,8 @@ ENABLE_GRAD_CACHE = True
 RESULTS_REUSE_POLICY = "ask"
 
 CHECKPOINT_THINNING = CheckpointThinningConfig(
-    mode=CheckpointThinningMode.NONE,
-    target_count=50,
-    polynomial_power=0.5,
+    mode=CheckpointThinningMode.LEARNING_RATE,
+    target_count=100
 )
 
 _TRAINING_SCRIPT_MATH_FORMAT_SUFFIX = (
