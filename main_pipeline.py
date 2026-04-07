@@ -119,7 +119,7 @@ REPLAY_GRADIENT_CONFIG = ReplayGradientConfig(
     max_new_tokens=EVAL_MAX_NEW_TOKENS,
     temperature=0.7,
     top_p=0.9,
-    replay_gradient_batch_size=8,
+    replay_gradient_batch_size=2,
 )
 
 SKIP_TRAINING = True
@@ -413,6 +413,7 @@ def _pipeline_main():
     )
     model = get_peft_model(base_model, lora_config)
     model.print_trainable_parameters()
+    model.gradient_checkpointing_enable()
 
 
     def save_base_checkpoint(peft_model, tokenizer_obj, output_dir):
