@@ -666,9 +666,18 @@ def compute_policy_gradient_bundle_batch(
              debug_rows[-1]["geometry_feature_norm"] = float(geometry_vector.norm().item())
 
         import gc
+        
         del objective, per_token_logps, sequence_log_probs, token_mask, token_counts, per_token_kl
+        
+        if 'old_per_token_logps' in locals(): del old_per_token_logps
+        if 'ref_per_token_logps' in locals() and ref_per_token_logps is not None: del ref_per_token_logps
+        if 'advantages' in locals(): del advantages
+        if 'total_rewards' in locals(): del total_rewards
+        if 'slice_trl' in locals(): del slice_trl
+        
         if geometry_feature_mode == GeometryFeatureMode.POLICY_SCORE:
             del geometry_scalar
+            
         gc.collect()
         torch.cuda.empty_cache()
 
