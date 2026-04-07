@@ -49,6 +49,35 @@ class SecondOrderGeometry(StringEnum):
     POLICY_SCORE_FISHER = "policy_score_fisher"
 
 
+class CheckpointThinningMode(StringEnum):
+    NONE = "none"
+    POLYNOMIAL = "polynomial"
+    PIECEWISE_BUCKET = "piecewise_bucket"
+    LEARNING_RATE = "learning_rate"
+
+
+@dataclass(frozen=True)
+class CheckpointThinningConfig:
+    mode: CheckpointThinningMode = CheckpointThinningMode.NONE
+    target_count: int | None = None
+    polynomial_power: float = 0.5
+    piecewise_early_last_index: int = 40
+    piecewise_mid_last_index: int = 100
+    piecewise_mid_stride: int = 3
+    piecewise_late_stride: int = 10
+
+    def to_config_dict(self) -> dict[str, object]:
+        return {
+            "checkpoint_thinning_mode": self.mode.value,
+            "checkpoint_thinning_target_count": self.target_count,
+            "checkpoint_thinning_polynomial_power": self.polynomial_power,
+            "checkpoint_thinning_piecewise_early_last_index": self.piecewise_early_last_index,
+            "checkpoint_thinning_piecewise_mid_last_index": self.piecewise_mid_last_index,
+            "checkpoint_thinning_piecewise_mid_stride": self.piecewise_mid_stride,
+            "checkpoint_thinning_piecewise_late_stride": self.piecewise_late_stride,
+        }
+
+
 @dataclass(frozen=True)
 class CodeEvalConfig:
     do_sample: bool = False

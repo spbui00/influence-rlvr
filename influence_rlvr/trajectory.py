@@ -3,6 +3,7 @@ import os
 import re
 import time
 
+import numpy as np
 from peft import load_peft_weights, set_peft_model_state_dict
 
 from .eval import evaluate_code_dataset, evaluate_math_dataset
@@ -12,6 +13,8 @@ from .gradients import (
     compute_sft_gradient,
 )
 from .modes import (
+    CheckpointThinningConfig,
+    CheckpointThinningMode,
     CodeEvalConfig,
     GenerationBackend,
     GeometryFeatureMode,
@@ -97,6 +100,204 @@ def build_checkpoint_schedule(output_dir, default_learning_rate):
 
     schedule.sort(key=lambda item: item["step"])
     return schedule
+
+
+def _thin_checkpoint_schedule_polynomial(schedule, target_count, power):
+    n = len(schedule)
+    if n <= target_count:
+        return list(schedule)
+    max_idx = n - 1
+    oversamples = (target_count * 2, target_count * 4, max(n, target_count * 8))
+    indices = np.array([], dtype=np.int64)
+    for size in oversamples:
+        x = np.linspace(0.0, 1.0, int(size))
+        curve = np.power(x, float(power))
+        indices = np.unique(np.round(curve * max_idx).astype(np.int64))
+        if len(indices) >= target_count:
+            break
+    if len(indices) > target_count:
+        pick = np.linspace(0, len(indices) - 1, target_count)
+        indices = np.sort(np.unique(indices[pick.round().astype(np.int64)]))
+    while len(indices) < target_count:
+        extra = np.linspace(0, max_idx, target_count * 2)
+        for e in extra:
+            gi = int(round(float(e)))
+            gi = max(0, min(max_idx, gi))
+            if gi not in set(indices.tolist()):
+                indices = np.sort(np.unique(np.append(indices, gi)))
+            if len(indices) >= target_count:
+                break
+        if len(indices) < target_count:
+            for gi in range(n):
+                if gi not in set(indices.tolist()):
+                    indices = np.sort(np.unique(np.append(indices, gi)))
+                if len(indices) >= target_count:
+                    break
+    if len(indices) > target_count:
+        pick = np.linspace(0, len(indices) - 1, target_count)
+        indices = indices[pick.round().astype(np.int64)]
+        indices = np.sort(np.unique(indices))
+    return [schedule[int(i)] for i in indices]
+
+
+def _thin_checkpoint_schedule_piecewise(
+    schedule,
+    early_last_index,
+    mid_last_index,
+    mid_stride,
+    late_stride,
+):
+    thinned = []
+    for i, cp in enumerate(schedule):
+        if i <= early_last_index:
+            thinned.append(cp)
+        elif i <= mid_last_index:
+            if mid_stride <= 0 or i % mid_stride == 0:
+                thinned.append(cp)
+        else:
+            if late_stride <= 0 or i % late_stride == 0:
+                thinned.append(cp)
+    return thinned
+
+
+def _thin_checkpoint_schedule_learning_rate(schedule, target_count):
+    n = len(schedule)
+    if n <= target_count:
+        return list(schedule)
+    cumulative_lrs = []
+    current_sum = 0.0
+    for cp in schedule:
+        current_sum += float(cp["learning_rate"])
+        cumulative_lrs.append(current_sum)
+    total = cumulative_lrs[-1]
+    if total <= 0.0:
+        return _thin_checkpoint_schedule_polynomial(schedule, target_count, power=1.0)
+    cumulative_array = np.array(cumulative_lrs, dtype=np.float64)
+    target_milestones = np.linspace(0.0, total, int(target_count))
+    selected_indices = []
+    for target in target_milestones:
+        idx = int(np.argmin(np.abs(cumulative_array - target)))
+        if not selected_indices or idx != selected_indices[-1]:
+            selected_indices.append(idx)
+    seen = set()
+    ordered = []
+    for idx in selected_indices:
+        if idx not in seen:
+            seen.add(idx)
+            ordered.append(idx)
+    selected_indices = ordered
+    for idx in range(n):
+        if len(selected_indices) >= target_count:
+            break
+        if idx not in seen:
+            seen.add(idx)
+            selected_indices.append(idx)
+    return [schedule[i] for i in selected_indices[:target_count]]
+
+
+def thin_checkpoint_schedule(
+    schedule,
+    config: CheckpointThinningConfig | None = None,
+    *,
+    log: bool = True,
+):
+    if not schedule:
+        return []
+    cfg = config or CheckpointThinningConfig()
+    mode = CheckpointThinningMode.parse(cfg.mode)
+    n = len(schedule)
+    steps_before = [cp["step"] for cp in schedule]
+
+    if mode == CheckpointThinningMode.NONE:
+        if log:
+            print(
+                f"Checkpoint thinning: mode=none — using all {n} checkpoints",
+                flush=True,
+            )
+            if n <= 48:
+                print(f"  steps={steps_before}", flush=True)
+            else:
+                print(
+                    f"  steps: first 8 {steps_before[:8]} … last 8 {steps_before[-8:]}",
+                    flush=True,
+                )
+        return list(schedule)
+
+    if mode == CheckpointThinningMode.PIECEWISE_BUCKET:
+        thinned = _thin_checkpoint_schedule_piecewise(
+            schedule,
+            cfg.piecewise_early_last_index,
+            cfg.piecewise_mid_last_index,
+            cfg.piecewise_mid_stride,
+            cfg.piecewise_late_stride,
+        )
+        if log:
+            steps_after = [cp["step"] for cp in thinned]
+            print(
+                f"Checkpoint thinning: mode=piecewise_bucket "
+                f"(early_last_index={cfg.piecewise_early_last_index}, "
+                f"mid_last_index={cfg.piecewise_mid_last_index}, "
+                f"mid_stride={cfg.piecewise_mid_stride}, late_stride={cfg.piecewise_late_stride})",
+                flush=True,
+            )
+            print(f"  {n} -> {len(thinned)} checkpoints", flush=True)
+            print(f"  selected steps: {steps_after}", flush=True)
+            _dropped = sorted(set(steps_before) - set(steps_after))
+            if len(_dropped) <= 48:
+                print(f"  dropped steps: {_dropped}", flush=True)
+            else:
+                print(
+                    f"  dropped {len(_dropped)} steps (showing first 24): {_dropped[:24]} …",
+                    flush=True,
+                )
+        return thinned
+
+    tc = cfg.target_count
+    if tc is None or tc <= 0 or n <= tc:
+        if log:
+            print(
+                f"Checkpoint thinning: mode={mode.value} skipped "
+                f"(target_count={tc}, have={n})",
+                flush=True,
+            )
+            if n <= 48:
+                print(f"  steps={steps_before}", flush=True)
+            else:
+                print(
+                    f"  steps: first 8 {steps_before[:8]} … last 8 {steps_before[-8:]}",
+                    flush=True,
+                )
+        return list(schedule)
+
+    if mode == CheckpointThinningMode.POLYNOMIAL:
+        thinned = _thin_checkpoint_schedule_polynomial(schedule, tc, cfg.polynomial_power)
+    elif mode == CheckpointThinningMode.LEARNING_RATE:
+        thinned = _thin_checkpoint_schedule_learning_rate(schedule, tc)
+    else:
+        return list(schedule)
+
+    if log:
+        steps_after = [cp["step"] for cp in thinned]
+        print(
+            f"Checkpoint thinning: mode={mode.value}, target_count={tc}"
+            + (
+                f", polynomial_power={cfg.polynomial_power}"
+                if mode == CheckpointThinningMode.POLYNOMIAL
+                else ""
+            ),
+            flush=True,
+        )
+        print(f"  {n} -> {len(thinned)} checkpoints", flush=True)
+        print(f"  selected steps: {steps_after}", flush=True)
+        _dropped = sorted(set(steps_before) - set(steps_after))
+        if len(_dropped) <= 48:
+            print(f"  dropped steps: {_dropped}", flush=True)
+        else:
+            print(
+                f"  dropped {len(_dropped)} steps (showing first 24): {_dropped[:24]} …",
+                flush=True,
+            )
+    return thinned
 
 
 def load_adapter_checkpoint(peft_model, checkpoint_dir, adapter_name="default"):

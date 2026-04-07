@@ -16,6 +16,8 @@ from .gradients import (
     compute_rlvr_gradient,
 )
 from .modes import (
+    CheckpointThinningConfig,
+    CheckpointThinningMode,
     CodeEvalConfig,
     ExperimentMode,
     GenerationBackend,
@@ -35,6 +37,7 @@ from .trajectory import (
     checkpoint_step,
     list_checkpoint_dirs,
     build_checkpoint_schedule,
+    thin_checkpoint_schedule,
     load_adapter_checkpoint,
     ensure_reference_adapter,
     collect_test_infos,
@@ -63,6 +66,8 @@ __all__ = [
     "GeometryFeatureMode",
     "SecondOrderGeometry",
     "ReplayGradientConfig",
+    "CheckpointThinningMode",
+    "CheckpointThinningConfig",
     "CodeEvalConfig",
     "VLLMConfig",
     "compute_policy_gradient_bundle",
@@ -73,6 +78,7 @@ __all__ = [
     "checkpoint_step",
     "list_checkpoint_dirs",
     "build_checkpoint_schedule",
+    "thin_checkpoint_schedule",
     "load_adapter_checkpoint",
     "ensure_reference_adapter",
     "collect_test_infos",

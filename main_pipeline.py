@@ -37,8 +37,11 @@ from influence_rlvr import (
     detect_device,
     ensure_reference_adapter,
     mbpp_execution_reward_func,
+    thin_checkpoint_schedule,
 )
 from influence_rlvr.modes import (
+    CheckpointThinningConfig,
+    CheckpointThinningMode,
     CodeEvalConfig,
     ExperimentMode,
     GenerationBackend,
@@ -81,7 +84,7 @@ TRAIN_GRAD_SEED = 1234
 LAMBDA_DAMP = 0.1
 N_MATH = 300
 N_CODE = 10
-N_TRAIN_REPLAY = 300
+N_TRAIN_REPLAY = 1000
 N_CODE_TRAIN = N_MATH
 TRAIN_REPLAY_SUBSET_SEED = None
 LORA_R = 8
@@ -121,6 +124,12 @@ REPLAY_GRADIENT_CONFIG = ReplayGradientConfig(
 SKIP_TRAINING = True
 ENABLE_GRAD_CACHE = True
 RESULTS_REUSE_POLICY = "ask"
+
+CHECKPOINT_THINNING = CheckpointThinningConfig(
+    mode=CheckpointThinningMode.NONE,
+    target_count=50,
+    polynomial_power=0.5,
+)
 
 _TRAINING_SCRIPT_MATH_FORMAT_SUFFIX = (
     "After </think>, the last line must contain only the final numeric GSM8K answer in "
@@ -607,18 +616,24 @@ def _pipeline_main():
     print("PHASE 2: Trajectory Replay — Gradient Collection Across Checkpoints")
     print("=" * 80)
 
-    checkpoint_schedule = build_checkpoint_schedule(
+    checkpoint_schedule_full = build_checkpoint_schedule(
         OUTPUT_DIR, default_learning_rate=LEARNING_RATE,
     )
-    if not checkpoint_schedule:
+    if not checkpoint_schedule_full:
         raise RuntimeError(
             f"No checkpoints found under {OUTPUT_DIR}. "
             f"Make sure training ran with save_steps={SAVE_STEPS}."
         )
 
-    print(f"Found {len(checkpoint_schedule)} checkpoints:")
-    for cp in checkpoint_schedule:
+    print(f"Found {len(checkpoint_schedule_full)} checkpoints on disk:")
+    for cp in checkpoint_schedule_full:
         print(f"  step {cp['step']:>3d}  lr={cp['learning_rate']:.6e}")
+
+    checkpoint_schedule = thin_checkpoint_schedule(
+        checkpoint_schedule_full,
+        CHECKPOINT_THINNING,
+        log=True,
+    )
 
     if GRPO_BETA != 0.0:
         ensure_reference_adapter(model)
@@ -719,12 +734,15 @@ def _pipeline_main():
         **CODE_EVAL_CONFIG.to_config_dict(),
         **REPLAY_GRADIENT_CONFIG.to_config_dict(),
         **VLLM_CONFIG.to_config_dict(),
+        **CHECKPOINT_THINNING.to_config_dict(),
         "lambda_damp": LAMBDA_DAMP,
         "train_grad_seed": TRAIN_GRAD_SEED,
         "device": str(DEVICE),
         "batch_history_fingerprint": batch_history_fingerprint,
         "train_domain": training_domain,
         "test_domain": test_domain,
+        "checkpoint_steps_on_disk": [cp["step"] for cp in checkpoint_schedule_full],
+        "checkpoint_steps_replay": [cp["step"] for cp in checkpoint_schedule],
     }
 
     results_path, reusing_results_dir, results_config_fingerprint = resolve_results_dir(
@@ -778,10 +796,13 @@ def _pipeline_main():
         **CODE_EVAL_CONFIG.to_config_dict(),
         **REPLAY_GRADIENT_CONFIG.to_config_dict(),
         **VLLM_CONFIG.to_config_dict(),
+        **CHECKPOINT_THINNING.to_config_dict(),
         "train_grad_seed": TRAIN_GRAD_SEED,
         "batch_history_fingerprint": batch_history_fingerprint,
         "train_domain": training_domain,
         "test_domain": test_domain,
+        "checkpoint_steps_on_disk": [cp["step"] for cp in checkpoint_schedule_full],
+        "checkpoint_steps_replay": [cp["step"] for cp in checkpoint_schedule],
     }
 
     CACHE_FINGERPRINT = build_cache_fingerprint(CACHE_CONFIG)
