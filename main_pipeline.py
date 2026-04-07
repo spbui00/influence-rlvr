@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import sys
 import time
 from dataclasses import replace
@@ -80,8 +81,9 @@ TRAIN_GRAD_SEED = 1234
 LAMBDA_DAMP = 0.1
 N_MATH = 300
 N_CODE = 10
-N_TRAIN_REPLAY = N_MATH
+N_TRAIN_REPLAY = 300
 N_CODE_TRAIN = N_MATH
+TRAIN_REPLAY_SUBSET_SEED = None
 LORA_R = 8
 LORA_ALPHA = 16
 LORA_TARGET_MODULES = ["q_proj", "v_proj"]
@@ -94,7 +96,7 @@ CODE_TRAIN_SPLIT = "train"
 CODE_EVAL_SPLIT = "validation"
 CODE_EVAL_PERCENT = 10
 EVAL_MAX_NEW_TOKENS = 256
-VLLM_GPU_MEMORY_UTILIZATION = 0.9
+VLLM_GPU_MEMORY_UTILIZATION = 0.35
 INFLUENCE_MODE = InfluenceMode.HISTORICAL
 EXPERIMENT_MODE = ExperimentMode.MATH_GRPO
 GENERATION_BACKEND = GenerationBackend.VLLM
@@ -140,7 +142,7 @@ def _run_config_json_path() -> Path:
 def _apply_training_run_config(cfg: dict, path: Path) -> None:
     global MODEL_ID, LEARNING_RATE, MAX_STEPS, SAVE_STEPS, PER_DEVICE_BATCH, GRAD_ACCUM_STEPS
     global GRPO_BETA, GRPO_EPSILON, G_TRAIN, GENERATION_BATCH_SIZE, TRAIN_GRAD_SEED
-    global N_MATH, N_TRAIN_REPLAY, LORA_R, LORA_ALPHA, LORA_TARGET_MODULES
+    global N_MATH, LORA_R, LORA_ALPHA, LORA_TARGET_MODULES
     global GENERATION_BACKEND, VLLM_CONFIG, REPLAY_GRADIENT_CONFIG, EVAL_MAX_NEW_TOKENS
     global MAX_COMPLETION_LENGTH, _MATH_PROMPT_MATCHES_TRAINING_SCRIPT
     global TRAINING_RUN_CONFIG, TRAINING_RUN_CONFIG_PATH
@@ -176,10 +178,6 @@ def _apply_training_run_config(cfg: dict, path: Path) -> None:
         EVAL_MAX_NEW_TOKENS = int(ev)
 
     N_MATH = int(cfg.get("n_math", N_MATH))
-    if N_MATH <= 0:
-        N_TRAIN_REPLAY = 10**9
-    else:
-        N_TRAIN_REPLAY = N_MATH
 
     LORA_R = int(cfg.get("lora_r", LORA_R))
     LORA_ALPHA = int(cfg.get("lora_alpha", LORA_ALPHA))
@@ -507,6 +505,19 @@ def _pipeline_main():
             training_reward_funcs = [accuracy_reward_func]
 
     replay_train_dataset = training_dataset
+    train_replay_pool_size = len(replay_train_dataset)
+    train_replay_subset_seed_resolved = (
+        TRAIN_REPLAY_SUBSET_SEED
+        if TRAIN_REPLAY_SUBSET_SEED is not None
+        else (TRAIN_GRAD_SEED + 902891)
+    )
+    if N_TRAIN_REPLAY > 0:
+        k = min(N_TRAIN_REPLAY, train_replay_pool_size)
+        if k < train_replay_pool_size:
+            rng = random.Random(train_replay_subset_seed_resolved)
+            indices = sorted(rng.sample(range(train_replay_pool_size), k))
+            replay_train_dataset = replay_train_dataset.select(indices)
+    train_replay_effective_n = len(replay_train_dataset)
     test_domain = "Code"
 
     print(f"  RL train ({training_domain}): {len(training_dataset)} samples")
@@ -516,6 +527,10 @@ def _pipeline_main():
         print(f"  Held-out math eval ({MATH_EVAL_SPLIT}): {len(math_eval_dataset)} samples")
     if code_eval_dataset is not None:
         print(f"  Held-out code eval ({CODE_EVAL_SPLIT}): {len(code_eval_dataset)} samples")
+    print(
+        f"  Replay train subset: {train_replay_effective_n}/{train_replay_pool_size} "
+        f"(cap={N_TRAIN_REPLAY}, seed={train_replay_subset_seed_resolved})"
+    )
 
 
     # ═══════════════════════════════════════════════════════════════════════════════
@@ -690,7 +705,10 @@ def _pipeline_main():
         "n_math": N_MATH,
         "n_code": N_CODE,
         "n_code_train": N_CODE_TRAIN,
-        "n_train_replay": N_TRAIN_REPLAY,
+        "n_train_replay": train_replay_effective_n,
+        "n_train_replay_cap": N_TRAIN_REPLAY,
+        "train_replay_pool_size": train_replay_pool_size,
+        "train_replay_subset_seed": train_replay_subset_seed_resolved,
         "code_train_split": CODE_TRAIN_SPLIT,
         "math_eval_split": MATH_EVAL_SPLIT,
         "math_eval_percent": MATH_EVAL_PERCENT,
@@ -746,7 +764,10 @@ def _pipeline_main():
         "n_math": N_MATH,
         "n_code": N_CODE,
         "n_code_train": N_CODE_TRAIN,
-        "n_train_replay": N_TRAIN_REPLAY,
+        "n_train_replay": train_replay_effective_n,
+        "n_train_replay_cap": N_TRAIN_REPLAY,
+        "train_replay_pool_size": train_replay_pool_size,
+        "train_replay_subset_seed": train_replay_subset_seed_resolved,
         "code_train_split": CODE_TRAIN_SPLIT,
         "math_eval_split": MATH_EVAL_SPLIT,
         "math_eval_percent": MATH_EVAL_PERCENT,
@@ -780,7 +801,7 @@ def _pipeline_main():
             enable_vllm=GENERATION_BACKEND == GenerationBackend.VLLM,
             generation_backend=GENERATION_BACKEND,
             test_limit=len(test_dataset),
-            train_limit=min(N_TRAIN_REPLAY, len(replay_train_dataset)),
+            train_limit=train_replay_effective_n,
             include_debug=False,
             base_seed=TRAIN_GRAD_SEED,
             test_reward_fn_builder=build_code_reward_fns,

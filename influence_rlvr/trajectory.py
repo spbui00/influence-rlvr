@@ -439,7 +439,7 @@ def collect_checkpoint_infos(
             and (math_eval_dataset is not None or code_eval_dataset is not None)
         ):
             clear_vllm_engine_cache()
-            clear_cache(device)
+            # clear_cache(device)
 
         train_seed_base = None
         test_seed_base = None
@@ -550,6 +550,6 @@ def collect_checkpoint_infos(
             ),
             progress,
         )
-        clear_cache(device)
+        # clear_cache(device)
 
     return checkpoint_infos
