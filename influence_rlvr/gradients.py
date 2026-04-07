@@ -1,9 +1,11 @@
 import warnings
 from contextlib import contextmanager
+from functools import partial
 
 import torch
 import torch.nn.functional as F
 from torch.func import functional_call, grad, vmap
+from torch.utils.checkpoint import checkpoint
 
 from .generation import RolloutBatch, generate_rollout_batch, rollout_to_completions
 from .modes import GenerationBackend, GeometryFeatureMode, GradientObjective, VLLMConfig
@@ -48,6 +50,20 @@ def _use_adapter(model, adapter_name):
             model.set_adapter(previous_adapter)
 
 
+def _microbatch_token_logps_forward(
+    model,
+    prompt_len,
+    res_len,
+    input_ids,
+    attention_mask,
+    response_token_ids,
+):
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+    logits = outputs.logits[:, prompt_len - 1 : prompt_len - 1 + res_len, :]
+    log_probs = torch.log_softmax(logits, dim=-1)
+    return log_probs.gather(2, response_token_ids.unsqueeze(-1)).squeeze(-1)
+
+
 def _compute_per_token_logps(
     model,
     prompt_ids,
@@ -55,6 +71,7 @@ def _compute_per_token_logps(
     response_ids,
     response_mask,
     micro_batch_size=4,
+    use_gradient_checkpointing=None,
 ):
     n_p = prompt_ids.shape[0]
     n_r = response_ids.shape[0]
@@ -68,9 +85,18 @@ def _compute_per_token_logps(
     if micro_batch_size < 1:
         raise ValueError(f"micro_batch_size must be >= 1, got {micro_batch_size}")
 
+    if use_gradient_checkpointing is None:
+        use_gradient_checkpointing = torch.is_grad_enabled()
+
     prompt_len = prompt_ids.shape[1]
     res_len = response_ids.shape[1]
     all_logps = []
+    forward_fn = partial(
+        _microbatch_token_logps_forward,
+        model,
+        prompt_len,
+        res_len,
+    )
 
     for i in range(0, n_r, micro_batch_size):
         end = min(i + micro_batch_size, n_r)
@@ -79,8 +105,8 @@ def _compute_per_token_logps(
 
         if n_p == 1:
             b = curr_res_ids.shape[0]
-            curr_prompt_ids = prompt_ids.repeat(b, 1)
-            curr_prompt_mask = prompt_attention_mask.repeat(b, 1)
+            curr_prompt_ids = prompt_ids.expand(b, -1)
+            curr_prompt_mask = prompt_attention_mask.expand(b, -1)
         else:
             curr_prompt_ids = prompt_ids[i:end]
             curr_prompt_mask = prompt_attention_mask[i:end]
@@ -88,12 +114,18 @@ def _compute_per_token_logps(
         input_ids = torch.cat([curr_prompt_ids, curr_res_ids], dim=1)
         attention_mask = torch.cat([curr_prompt_mask, curr_res_mask], dim=1)
 
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
-        logits = outputs.logits[:, prompt_len - 1 : prompt_len - 1 + res_len, :]
-        log_probs = F.log_softmax(logits, dim=-1)
-        per_token_logps = log_probs.gather(2, curr_res_ids.unsqueeze(-1)).squeeze(-1)
+        if use_gradient_checkpointing:
+            per_token_logps = checkpoint(
+                forward_fn,
+                input_ids,
+                attention_mask,
+                curr_res_ids,
+                use_reentrant=False,
+            )
+        else:
+            per_token_logps = forward_fn(input_ids, attention_mask, curr_res_ids)
+
         all_logps.append(per_token_logps)
-        del outputs, logits, log_probs
 
     return torch.cat(all_logps, dim=0)
 
@@ -905,15 +937,16 @@ def _compute_old_per_token_logps(
     response_mask,
 ):
     if old_peft_model is None:
-        return _compute_per_token_logps(
-            peft_model,
-            prompt_ids,
-            prompt_attention_mask,
-            response_ids,
-            response_mask,
-        ).detach()
+        with torch.inference_mode():
+            return _compute_per_token_logps(
+                peft_model,
+                prompt_ids,
+                prompt_attention_mask,
+                response_ids,
+                response_mask,
+            ).detach()
 
-    with torch.no_grad():
+    with torch.inference_mode():
         return _compute_per_token_logps(
             old_peft_model,
             prompt_ids,
@@ -935,7 +968,7 @@ def _compute_ref_per_token_logps(
         return None
 
     if ref_model is not None:
-        with torch.no_grad():
+        with torch.inference_mode():
             return _compute_per_token_logps(
                 ref_model,
                 prompt_ids,
@@ -946,7 +979,7 @@ def _compute_ref_per_token_logps(
 
     ref_adapter_name = "ref" if "ref" in peft_model.peft_config else None
     if ref_adapter_name is not None:
-        with torch.no_grad(), _use_adapter(peft_model, ref_adapter_name):
+        with torch.inference_mode(), _use_adapter(peft_model, ref_adapter_name):
             return _compute_per_token_logps(
                 peft_model,
                 prompt_ids,
@@ -955,7 +988,7 @@ def _compute_ref_per_token_logps(
                 response_mask,
             )
 
-    with torch.no_grad(), peft_model.disable_adapter():
+    with torch.inference_mode(), peft_model.disable_adapter():
         return _compute_per_token_logps(
             peft_model,
             prompt_ids,
