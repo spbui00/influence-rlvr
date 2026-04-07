@@ -706,13 +706,13 @@ def collect_checkpoint_infos(
                 model_id=model_id,
             )
 
-        if (
-            enable_vllm
-            and generation_backend == GenerationBackend.VLLM
-            and (math_eval_dataset is not None or code_eval_dataset is not None)
-        ):
-            clear_vllm_engine_cache()
-            # clear_cache(device)
+        # if (
+        #     enable_vllm
+        #     and generation_backend == GenerationBackend.VLLM
+        #     and (math_eval_dataset is not None or code_eval_dataset is not None)
+        # ):
+        #     clear_vllm_engine_cache()
+        #     clear_cache(device)
 
         train_seed_base = None
         test_seed_base = None
