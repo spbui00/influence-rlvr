@@ -43,6 +43,23 @@ def tokenize_prompt(tokenizer, prompt, device):
     return prompt_text, input_ids, attention_mask
 
 
+def tokenize_prompts_batch(tokenizer, prompts: list, device: torch.device):
+    texts = [render_prompt(tokenizer, p) for p in prompts]
+    encoded = tokenizer(
+        texts,
+        return_tensors="pt",
+        padding=True,
+        add_special_tokens=False,
+    )
+    input_ids = encoded["input_ids"].to(device)
+    attention_mask = encoded.get("attention_mask")
+    if attention_mask is None:
+        attention_mask = torch.ones_like(input_ids)
+    else:
+        attention_mask = attention_mask.to(device)
+    return texts, input_ids, attention_mask
+
+
 def extract_lora_gradients(peft_model):
     grads = []
     for _, param in peft_model.named_parameters():

@@ -10,6 +10,7 @@ from .eval import evaluate_code_dataset, evaluate_math_dataset
 from .generation import clear_vllm_engine_cache
 from .gradients import (
     compute_policy_gradient_bundle,
+    compute_policy_gradient_bundle_batch,
     compute_sft_gradient,
 )
 from .modes import (
@@ -392,72 +393,139 @@ def collect_reward_infos(
     model_id=None,
     progress=False,
     progress_prefix="",
+    replay_gradient_batch_size: int = 1,
 ):
     count = len(dataset) if limit is None else min(limit, len(dataset))
     reward_infos = []
     zero_cases = []
+    bs = max(1, int(replay_gradient_batch_size))
 
-    for idx in range(count):
-        sample_start = time.time()
-        sample = dataset[idx]
-        reward_funcs = reward_fn_builder(sample, G)
-        seed = None if seed_base is None else seed_base + idx
-        result = compute_policy_gradient_bundle(
-            peft_model,
-            tokenizer,
-            sample["prompt"],
-            reward_funcs,
-            G=G,
-            device=device,
-            enable_vllm=enable_vllm,
-            generation_backend=generation_backend,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            seed=seed,
-            epsilon=epsilon,
-            beta=beta,
-            ref_model=ref_model,
-            objective_mode=gradient_objective_mode,
-            geometry_feature_mode=geometry_feature_mode,
-            vllm_config=vllm_config,
-            adapter_path=adapter_path,
-            model_id=model_id,
-        )
-
-        grad = result["grad"]
-        debug = result["debug"] if include_debug else None
-        geometry_feature = result.get("geometry_feature")
-
-        info = {
-            "grad": grad,
-            "prompt": sample["prompt"],
-            "solution": sample.get("solution"),
-        }
-        if geometry_feature is not None:
-            info["geometry_feature"] = geometry_feature
-        if sample_index_key is not None:
-            sample_index = int(sample.get(sample_index_key, idx))
-            info["train_index"] = sample_index
-            if sample_weight_lookup is not None:
-                info["historical_weight"] = float(
-                    sample_weight_lookup.get(sample_index, 0.0)
-                )
-        if debug is not None:
-            info["debug"] = debug
-        reward_infos.append(info)
-
-        grad_norm = grad.norm().item()
-        if grad_norm <= 1e-12:
-            zero_cases.append(idx)
-        elapsed = time.time() - sample_start
-        _progress_print(
-            (
-                f"{progress_prefix} sample {idx + 1}/{count} done "
-                f"in {elapsed:.1f}s | ||g||={grad_norm:.6f}"
-            ).strip(),
-            progress,
-        )
+    idx = 0
+    while idx < count:
+        chunk_start = time.time()
+        chunk_end = min(idx + bs, count)
+        if bs <= 1:
+            sample = dataset[idx]
+            reward_funcs = reward_fn_builder(sample, G)
+            seed = None if seed_base is None else seed_base + idx
+            result = compute_policy_gradient_bundle(
+                peft_model,
+                tokenizer,
+                sample["prompt"],
+                reward_funcs,
+                G=G,
+                device=device,
+                enable_vllm=enable_vllm,
+                generation_backend=generation_backend,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                seed=seed,
+                epsilon=epsilon,
+                beta=beta,
+                ref_model=ref_model,
+                objective_mode=gradient_objective_mode,
+                geometry_feature_mode=geometry_feature_mode,
+                vllm_config=vllm_config,
+                adapter_path=adapter_path,
+                model_id=model_id,
+            )
+            grad = result["grad"]
+            debug = result["debug"] if include_debug else None
+            geometry_feature = result.get("geometry_feature")
+            info = {
+                "grad": grad,
+                "prompt": sample["prompt"],
+                "solution": sample.get("solution"),
+            }
+            if geometry_feature is not None:
+                info["geometry_feature"] = geometry_feature
+            if sample_index_key is not None:
+                sample_index = int(sample.get(sample_index_key, idx))
+                info["train_index"] = sample_index
+                if sample_weight_lookup is not None:
+                    info["historical_weight"] = float(
+                        sample_weight_lookup.get(sample_index, 0.0)
+                    )
+            if debug is not None:
+                info["debug"] = debug
+            reward_infos.append(info)
+            grad_norm = grad.norm().item()
+            if grad_norm <= 1e-12:
+                zero_cases.append(idx)
+            elapsed = time.time() - chunk_start
+            _progress_print(
+                (
+                    f"{progress_prefix} sample {idx + 1}/{count} done "
+                    f"in {elapsed:.1f}s | ||g||={grad_norm:.6f}"
+                ).strip(),
+                progress,
+            )
+            idx += 1
+        else:
+            batch_indices = list(range(idx, chunk_end))
+            samples = [dataset[i] for i in batch_indices]
+            prompts = [s["prompt"] for s in samples]
+            reward_funcs_batch = [reward_fn_builder(s, G) for s in samples]
+            seed = None if seed_base is None else seed_base + idx
+            result = compute_policy_gradient_bundle_batch(
+                peft_model,
+                tokenizer,
+                prompts,
+                reward_funcs_batch,
+                G=G,
+                device=device,
+                enable_vllm=enable_vllm,
+                generation_backend=generation_backend,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                seed=seed,
+                epsilon=epsilon,
+                beta=beta,
+                old_peft_model=None,
+                ref_model=ref_model,
+                objective_mode=gradient_objective_mode,
+                geometry_feature_mode=geometry_feature_mode,
+                vllm_config=vllm_config,
+                adapter_path=adapter_path,
+                model_id=model_id,
+            )
+            grads = result["grad"]
+            debugs = result["debug"] if include_debug else None
+            geometry_features = result.get("geometry_feature")
+            for j, sample in enumerate(samples):
+                global_idx = batch_indices[j]
+                grad = grads[j]
+                info = {
+                    "grad": grad,
+                    "prompt": sample["prompt"],
+                    "solution": sample.get("solution"),
+                }
+                if geometry_features is not None:
+                    info["geometry_feature"] = geometry_features[j]
+                if sample_index_key is not None:
+                    sample_index = int(sample.get(sample_index_key, global_idx))
+                    info["train_index"] = sample_index
+                    if sample_weight_lookup is not None:
+                        info["historical_weight"] = float(
+                            sample_weight_lookup.get(sample_index, 0.0)
+                        )
+                if debugs is not None:
+                    info["debug"] = debugs[j]
+                reward_infos.append(info)
+                grad_norm = grad.norm().item()
+                if grad_norm <= 1e-12:
+                    zero_cases.append(global_idx)
+            elapsed = time.time() - chunk_start
+            _progress_print(
+                (
+                    f"{progress_prefix} samples {idx + 1}-{chunk_end}/{count} "
+                    f"(batch {bs}) done in {elapsed:.1f}s"
+                ).strip(),
+                progress,
+            )
+            idx = chunk_end
 
     return reward_infos, zero_cases
 
@@ -488,6 +556,7 @@ def collect_train_infos(
     model_id=None,
     progress=False,
     progress_prefix="",
+    replay_gradient_batch_size: int = 1,
 ):
     return collect_reward_infos(
         peft_model,
@@ -516,6 +585,7 @@ def collect_train_infos(
         model_id=model_id,
         progress=progress,
         progress_prefix=progress_prefix,
+        replay_gradient_batch_size=replay_gradient_batch_size,
     )
 
 
@@ -554,6 +624,7 @@ def collect_checkpoint_infos(
     replay_max_new_tokens=256,
     replay_temperature=0.7,
     replay_top_p=0.9,
+    replay_gradient_batch_size=1,
     vllm_config=None,
     model_id=None,
     progress=True,
@@ -579,6 +650,7 @@ def collect_checkpoint_infos(
         max_new_tokens=replay_max_new_tokens,
         temperature=replay_temperature,
         top_p=replay_top_p,
+        replay_gradient_batch_size=int(replay_gradient_batch_size),
     )
     if vllm_config is None:
         vllm_config = VLLMConfig()
@@ -685,6 +757,7 @@ def collect_checkpoint_infos(
                 model_id=model_id,
                 progress=progress,
                 progress_prefix=f"{prefix} [test]",
+                replay_gradient_batch_size=replay_gradient_config.replay_gradient_batch_size,
             )
 
         _progress_print(f"{prefix} collecting train gradients", progress)
@@ -725,6 +798,7 @@ def collect_checkpoint_infos(
             model_id=model_id,
             progress=progress,
             progress_prefix=f"{prefix} [train]",
+            replay_gradient_batch_size=replay_gradient_config.replay_gradient_batch_size,
         )
 
         checkpoint_infos.append({

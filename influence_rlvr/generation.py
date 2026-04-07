@@ -23,6 +23,8 @@ class RolloutBatch:
     texts: list[str]
     token_ids: torch.Tensor
     response_mask: torch.Tensor
+    num_prompts: int = 1
+    num_samples: int = 1
 
 
 def rollout_to_completions(rollout: RolloutBatch) -> list[list[dict[str, str]]]:
@@ -168,6 +170,8 @@ def rollout_batch_from_token_sequences(
     token_sequences: list[torch.Tensor],
     *,
     device: str | torch.device,
+    num_prompts: int | None = None,
+    num_samples: int | None = None,
 ) -> RolloutBatch:
     runtime_device = _normalize_device(device)
     pad_token_id = tokenizer.pad_token_id
@@ -185,10 +189,21 @@ def rollout_batch_from_token_sequences(
         tokenizer.decode(ids.tolist(), skip_special_tokens=True)
         for ids in token_sequences
     ]
+    n_seq = len(token_sequences)
+    if num_prompts is None and num_samples is None:
+        np_ = 1
+        ns = n_seq
+    elif num_prompts is not None and num_samples is not None:
+        np_ = int(num_prompts)
+        ns = int(num_samples)
+    else:
+        raise ValueError("Pass both num_prompts and num_samples, or neither.")
     return RolloutBatch(
         texts=texts,
         token_ids=token_ids,
         response_mask=response_mask,
+        num_prompts=np_,
+        num_samples=ns,
     )
 
 
@@ -230,6 +245,7 @@ def _hf_generate_rollout_batch(
     top_p: float,
 ) -> RolloutBatch:
     sampling_model.eval()
+    batch_size = int(prompt_ids.shape[0])
     generate_kwargs = {
         "input_ids": prompt_ids,
         "attention_mask": prompt_attention_mask,
@@ -248,18 +264,29 @@ def _hf_generate_rollout_batch(
         generated = sampling_model.generate(**generate_kwargs)
 
     prompt_len = int(prompt_ids.shape[1])
-    token_sequences = [
-        _trim_hf_continuation(
-            sequence[prompt_len:],
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.pad_token_id,
+    n_out = int(generated.shape[0])
+    expected = batch_size * num_samples
+    if n_out != expected:
+        raise RuntimeError(
+            f"HF generate returned {n_out} sequences, expected {expected} "
+            f"(batch_size={batch_size} * num_samples={num_samples})."
         )
-        for sequence in generated[:num_samples]
-    ]
+    token_sequences = []
+    for i in range(n_out):
+        sequence = generated[i]
+        token_sequences.append(
+            _trim_hf_continuation(
+                sequence[prompt_len:],
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+        )
     return rollout_batch_from_token_sequences(
         tokenizer,
         token_sequences,
         device=prompt_ids.device,
+        num_prompts=batch_size,
+        num_samples=num_samples,
     )
 
 
@@ -369,7 +396,12 @@ def _build_lora_request(adapter_path: str | Path | None):
 
 
 def _call_vllm_generate(engine, prompt_token_ids, sampling_params, lora_request):
-    prompt_list = [prompt_token_ids]
+    if isinstance(prompt_token_ids, list) and prompt_token_ids and isinstance(
+        prompt_token_ids[0], list
+    ):
+        prompts_in = prompt_token_ids
+    else:
+        prompts_in = [prompt_token_ids]
     kwargs = {
         "sampling_params": sampling_params,
         "use_tqdm": False,
@@ -378,21 +410,22 @@ def _call_vllm_generate(engine, prompt_token_ids, sampling_params, lora_request)
         kwargs["lora_request"] = lora_request
 
     try:
-        return engine.generate(prompt_token_ids=prompt_list, **kwargs)
+        return engine.generate(prompt_token_ids=prompts_in, **kwargs)
     except TypeError:
         pass
 
-    prompts = [{"prompt_token_ids": prompt_token_ids}]
+    dict_prompts = [{"prompt_token_ids": p} for p in prompts_in]
     try:
-        return engine.generate(prompts, **kwargs)
+        return engine.generate(dict_prompts, **kwargs)
     except TypeError:
-        return engine.generate(prompts=prompts, **kwargs)
+        return engine.generate(prompts=dict_prompts, **kwargs)
 
 
 def _vllm_generate_rollout_batch(
     sampling_model,
     tokenizer,
     prompt_ids: torch.Tensor,
+    prompt_attention_mask: torch.Tensor,
     *,
     num_samples: int,
     max_new_tokens: int,
@@ -420,30 +453,41 @@ def _vllm_generate_rollout_batch(
         sampling_kwargs["seed"] = seed
     sampling_params = SamplingParams(**sampling_kwargs)
 
+    batch_size = int(prompt_ids.shape[0])
+    prompts_list = []
+    for b in range(batch_size):
+        n = int(prompt_attention_mask[b].sum().item())
+        prompts_list.append(prompt_ids[b, :n].detach().cpu().tolist())
+
     outputs = _call_vllm_generate(
         engine,
-        prompt_ids.squeeze(0).detach().cpu().tolist(),
+        prompts_list,
         sampling_params,
         _build_lora_request(adapter_path),
     )
-    if not outputs:
-        raise RuntimeError("vLLM returned no outputs for the requested prompt.")
+    if not outputs or len(outputs) != batch_size:
+        raise RuntimeError(
+            f"vLLM returned {0 if not outputs else len(outputs)} outputs, "
+            f"expected {batch_size}."
+        )
 
-    request_output = outputs[0]
     token_sequences = []
     texts = []
-    for output in request_output.outputs[:num_samples]:
-        output_token_ids = torch.tensor(list(output.token_ids), dtype=torch.long)
-        token_sequences.append(output_token_ids)
-        text = getattr(output, "text", None)
-        if text is None:
-            text = tokenizer.decode(output_token_ids.tolist(), skip_special_tokens=True)
-        texts.append(text)
+    for request_output in outputs:
+        for output in request_output.outputs[:num_samples]:
+            output_token_ids = torch.tensor(list(output.token_ids), dtype=torch.long)
+            token_sequences.append(output_token_ids)
+            text = getattr(output, "text", None)
+            if text is None:
+                text = tokenizer.decode(output_token_ids.tolist(), skip_special_tokens=True)
+            texts.append(text)
 
     rollout = rollout_batch_from_token_sequences(
         tokenizer,
         token_sequences,
         device=device,
+        num_prompts=batch_size,
+        num_samples=num_samples,
     )
     rollout.texts = texts
     return rollout
@@ -485,6 +529,7 @@ def generate_rollout_batch(
         sampling_model,
         tokenizer,
         prompt_ids,
+        prompt_attention_mask,
         num_samples=num_samples,
         max_new_tokens=max_new_tokens,
         do_sample=do_sample,

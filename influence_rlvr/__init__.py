@@ -12,6 +12,7 @@ from .attribution import (
 )
 from .gradients import (
     compute_policy_gradient_bundle,
+    compute_policy_gradient_bundle_batch,
     compute_sft_gradient,
     compute_rlvr_gradient,
 )
@@ -71,6 +72,7 @@ __all__ = [
     "CodeEvalConfig",
     "VLLMConfig",
     "compute_policy_gradient_bundle",
+    "compute_policy_gradient_bundle_batch",
     "compute_sft_gradient",
     "compute_rlvr_gradient",
     "evaluate_math_dataset",

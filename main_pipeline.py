@@ -119,6 +119,7 @@ REPLAY_GRADIENT_CONFIG = ReplayGradientConfig(
     max_new_tokens=EVAL_MAX_NEW_TOKENS,
     temperature=0.7,
     top_p=0.9,
+    replay_gradient_batch_size=8,
 )
 
 SKIP_TRAINING = True

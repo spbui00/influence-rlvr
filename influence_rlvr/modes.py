@@ -139,6 +139,7 @@ class ReplayGradientConfig:
     max_new_tokens: int = 256
     temperature: float = 0.7
     top_p: float = 0.9
+    replay_gradient_batch_size: int = 1
 
     def to_kwargs(self) -> dict[str, object]:
         return {
@@ -148,6 +149,7 @@ class ReplayGradientConfig:
             "replay_max_new_tokens": self.max_new_tokens,
             "replay_temperature": self.temperature,
             "replay_top_p": self.top_p,
+            "replay_gradient_batch_size": self.replay_gradient_batch_size,
         }
 
     def to_config_dict(self) -> dict[str, object]:
@@ -160,4 +162,5 @@ class ReplayGradientConfig:
             "replay_max_new_tokens": self.max_new_tokens,
             "replay_temperature": self.temperature,
             "replay_top_p": self.top_p,
+            "replay_gradient_batch_size": self.replay_gradient_batch_size,
         }
