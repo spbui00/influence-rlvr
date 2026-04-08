@@ -5,22 +5,6 @@ from .base import BaseInfluenceMethod
 from .tracin import _stack_train_weights
 
 
-def _stack_geometry_features(infos, normalize):
-    features = []
-    for info in infos:
-        feature = info.get("geometry_feature")
-        if feature is None:
-            raise ValueError(
-                "Fisher influence requires 'geometry_feature' on each train info."
-            )
-        features.append(feature.float())
-    matrix = torch.stack(features)
-    if normalize:
-        norms = matrix.norm(dim=1, keepdim=True).clamp(min=1e-12)
-        matrix = matrix / norms
-    return matrix
-
-
 def _geometry_weight_vector(infos):
     if not infos:
         return torch.zeros(0, dtype=torch.float32)
@@ -44,7 +28,18 @@ class FisherInfluence(BaseInfluenceMethod):
             self.lambda_damp = lambda_damp
             self.normalize = normalize
             self._train_grad_list = [info["grad"] for info in train_infos]
+            self._geometry_list = []
+            for info in train_infos:
+                gf = info.get("geometry_feature")
+                if gf is None:
+                    raise ValueError(
+                        "Fisher influence requires 'geometry_feature' on each train info."
+                    )
+                self._geometry_list.append(gf)
             n = len(self._train_grad_list)
+            if n != len(self._geometry_list):
+                raise ValueError("train_infos grad and geometry_feature counts differ.")
+
             if n > 0 and normalize:
                 norms = torch.empty(n, dtype=torch.float32, device="cuda")
                 for i in range(n):
@@ -57,35 +52,89 @@ class FisherInfluence(BaseInfluenceMethod):
             else:
                 self._grad_norms = None
 
-            geometry_features = _stack_geometry_features(train_infos, normalize)
-            geometry_weights = _geometry_weight_vector(train_infos)
-            self.geometry_matrix = (
-                geometry_features * geometry_weights.sqrt().unsqueeze(1)
-            )
-            gram = self.geometry_matrix @ self.geometry_matrix.T
-            identity = torch.eye(gram.shape[0], dtype=torch.float32)
-            self.inverse_small = torch.linalg.inv(identity + gram / lambda_damp)
+            if n > 0 and normalize:
+                geom_norms = torch.empty(n, dtype=torch.float32, device="cuda")
+                for i in range(n):
+                    xi = self._geometry_list[i].to(
+                        device="cuda", dtype=torch.float32
+                    )
+                    geom_norms[i] = xi.norm().clamp(min=1e-12)
+                    del xi
+                self._geometry_norms = geom_norms
+            else:
+                self._geometry_norms = None
 
-    def _normalize_test(self, g_test: torch.Tensor) -> torch.Tensor:
-        g = g_test.float()
+            self.geometry_weights = _geometry_weight_vector(train_infos).to("cuda")
+
+            chunk_size = 10
+            if n == 0:
+                gram = torch.empty(0, 0, dtype=torch.float32, device="cpu")
+                self.inverse_small = torch.empty(0, 0, dtype=torch.float32)
+            else:
+                gram = torch.empty(n, n, dtype=torch.float32, device="cpu")
+                for i in range(0, n, chunk_size):
+                    i_end = min(i + chunk_size, n)
+                    chunk_i = self._geometry_weighted_chunk(i, i_end)
+                    for j in range(0, n, chunk_size):
+                        j_end = min(j + chunk_size, n)
+                        chunk_j = self._geometry_weighted_chunk(j, j_end)
+                        block = chunk_i @ chunk_j.T
+                        gram[i:i_end, j:j_end] = block.cpu()
+                        del chunk_j
+                        del block
+                    del chunk_i
+                identity = torch.eye(n, dtype=torch.float32, device="cpu")
+                self.inverse_small = torch.linalg.inv(
+                    identity + gram / lambda_damp
+                )
+                del identity
+
+    def _geometry_weighted_chunk(self, start: int, end: int) -> torch.Tensor:
+        chunk = torch.stack(
+            [
+                self._geometry_list[k].to(device="cuda", dtype=torch.float32)
+                for k in range(start, end)
+            ]
+        )
         if self.normalize:
-            g = g / (g.norm() + 1e-12)
-        return g
+            chunk = chunk / self._geometry_norms[start:end].unsqueeze(1)
+        chunk = chunk * self.geometry_weights[start:end].sqrt().unsqueeze(1)
+        return chunk
 
     def _precondition(self, g_test: torch.Tensor) -> torch.Tensor:
-        g = self._normalize_test(g_test)
-        features_g = self.geometry_matrix @ g
-        correction = self.geometry_matrix.T @ (self.inverse_small @ features_g)
-        return (1.0 / self.lambda_damp) * g - (
-            1.0 / self.lambda_damp**2
-        ) * correction
+        with torch.no_grad():
+            g = g_test.to(device="cuda", dtype=torch.float32)
+            if self.normalize:
+                g = g / (g.norm() + 1e-12)
+            n = len(self._geometry_list)
+            chunk_size = 10
+            if n == 0:
+                return (1.0 / self.lambda_damp) * g
+            features_g = torch.empty(n, dtype=torch.float32, device="cuda")
+            for i in range(0, n, chunk_size):
+                i_end = min(i + chunk_size, n)
+                chunk = self._geometry_weighted_chunk(i, i_end)
+                features_g[i:i_end] = chunk @ g
+                del chunk
+            temp = self.inverse_small.to("cuda") @ features_g
+            del features_g
+            correction = torch.zeros_like(g)
+            for i in range(0, n, chunk_size):
+                i_end = min(i + chunk_size, n)
+                chunk = self._geometry_weighted_chunk(i, i_end)
+                correction += chunk.T @ temp[i:i_end]
+                del chunk
+            del temp
+            return (1.0 / self.lambda_damp) * g - (
+                1.0 / self.lambda_damp**2
+            ) * correction
 
     def compute_all_scores(self, test_info: dict) -> np.ndarray:
         with torch.no_grad():
             n = len(self._train_grad_list)
             if n == 0:
                 return np.zeros(0, dtype=np.float32)
-            h_inv_g = self._precondition(test_info["grad"]).to("cuda")
+            h_inv_g = self._precondition(test_info["grad"])
             chunk_size = 10
             out = np.empty(n, dtype=np.float32)
             for i in range(0, n, chunk_size):
@@ -111,7 +160,7 @@ class FisherInfluence(BaseInfluenceMethod):
             )
             if self.normalize:
                 g_train = g_train / (g_train.norm() + 1e-12)
-            h_inv_g = self._precondition(test_info["grad"]).to("cuda")
+            h_inv_g = self._precondition(test_info["grad"])
             return torch.dot(h_inv_g, g_train).item()
 
 

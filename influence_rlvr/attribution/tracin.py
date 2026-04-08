@@ -13,23 +13,33 @@ def tracin_base_matrix_from_infos(test_infos, train_infos, normalize: bool) -> n
         if n_test == 0 or n_train == 0:
             return matrix
 
-        test_norms = [
-            torch.norm(t["grad"]).item() if normalize else 1.0
-            for t in test_infos
-        ]
-        train_norms = [
-            torch.norm(t["grad"]).item() if normalize else 1.0
-            for t in train_infos
-        ]
+        if normalize:
+            test_norms = []
+            for t in test_infos:
+                x = t["grad"].to(device="cuda", dtype=torch.float32)
+                test_norms.append(x.norm().item())
+                del x
+            train_norms = []
+            for t in train_infos:
+                x = t["grad"].to(device="cuda", dtype=torch.float32)
+                train_norms.append(x.norm().item())
+                del x
+        else:
+            test_norms = [1.0] * n_test
+            train_norms = [1.0] * n_train
 
         for i, t_info in enumerate(test_infos):
-            t_grad = t_info["grad"]
+            t_grad_gpu = t_info["grad"].to(device="cuda", dtype=torch.float32)
             for j, tr_info in enumerate(train_infos):
-                tr_grad = tr_info["grad"]
-                dot_val = torch.dot(t_grad, tr_grad).item()
+                tr_grad_gpu = tr_info["grad"].to(
+                    device="cuda", dtype=torch.float32
+                )
+                dot_val = torch.dot(t_grad_gpu, tr_grad_gpu).item()
                 if normalize:
                     dot_val = dot_val / (test_norms[i] * train_norms[j])
                 matrix[i, j] = dot_val
+                del tr_grad_gpu
+            del t_grad_gpu
 
         return matrix
 
