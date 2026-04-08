@@ -29,16 +29,46 @@ class DataInfInfluence(BaseInfluenceMethod):
         self.lambda_damp = lambda_damp
         self.normalize = normalize
         self.n = len(g_train_list)
+        self.g_train_list = g_train_list
+        chunk_size = 10
 
-        J = torch.stack(g_train_list).float()
-        if normalize:
-            norms = J.norm(dim=1, keepdim=True).clamp(min=1e-12)
-            J = J / norms
+        if self.n == 0:
+            self._grad_norms = None
+            self.K = torch.empty(0, 0, dtype=torch.float32)
+            self.M = torch.empty(0, 0, dtype=torch.float32)
+            return
 
-        self.J = J
-        K = J @ J.T
+        dev = g_train_list[0].device
+        if self.normalize:
+            norms = torch.empty(self.n, dtype=torch.float32, device=dev)
+            for i in range(self.n):
+                norms[i] = g_train_list[i].float().norm().clamp(min=1e-12)
+            self._grad_norms = norms
+        else:
+            self._grad_norms = None
+
+        K = torch.empty(self.n, self.n, dtype=torch.float32, device=dev)
+        for i in range(0, self.n, chunk_size):
+            i_end = min(i + chunk_size, self.n)
+            chunk_i = torch.stack(
+                [g_train_list[k].float() for k in range(i, i_end)]
+            )
+            if self.normalize:
+                chunk_i = chunk_i / self._grad_norms[i:i_end].unsqueeze(1)
+            for j in range(0, self.n, chunk_size):
+                j_end = min(j + chunk_size, self.n)
+                chunk_j = torch.stack(
+                    [g_train_list[k].float() for k in range(j, j_end)]
+                )
+                if self.normalize:
+                    chunk_j = chunk_j / self._grad_norms[j:j_end].unsqueeze(1)
+                block = chunk_i @ chunk_j.T
+                K[i:i_end, j:j_end] = block
+                del chunk_j
+            del chunk_i
+
         self.K = K
-        I_n = torch.eye(self.n, dtype=torch.float32)
+        I_n = torch.eye(self.n, dtype=torch.float32, device=dev)
         self.M = torch.linalg.inv(self.n * lambda_damp * I_n + K)
         del I_n
 
@@ -49,20 +79,57 @@ class DataInfInfluence(BaseInfluenceMethod):
         return g
 
     def compute_all_scores(self, test_info: dict) -> np.ndarray:
-        g_test = self._normalize_test(test_info["grad"])
+        if self.n == 0:
+            return np.zeros(0, dtype=np.float32)
+        dev = self.g_train_list[0].device
+        g_test = self._normalize_test(test_info["grad"]).to(dev)
         lam = self.lambda_damp
-        v = self.J @ g_test
+        chunk_size = 10
+        v = torch.empty(self.n, dtype=torch.float32, device=dev)
+        for i in range(0, self.n, chunk_size):
+            i_end = min(i + chunk_size, self.n)
+            chunk_i = torch.stack(
+                [self.g_train_list[k].float() for k in range(i, i_end)]
+            )
+            if self.normalize:
+                chunk_i = chunk_i / self._grad_norms[i:i_end].unsqueeze(1)
+            v[i:i_end] = chunk_i @ g_test
+            del chunk_i
         scores = (1.0 / lam) * v - (1.0 / lam**2) * (v @ self.M @ self.K)
-        return scores.numpy()
+        return scores.detach().cpu().numpy()
 
     def compute_score(self, test_info: dict, train_info: dict) -> float:
-        g_test = self._normalize_test(test_info["grad"])
+        if self.n == 0:
+            return 0.0
+        dev = self.g_train_list[0].device
+        g_test = self._normalize_test(test_info["grad"]).to(dev)
         g_train = train_info["grad"].float()
         if self.normalize:
             g_train = g_train / (g_train.norm() + 1e-12)
         lam = self.lambda_damp
-        Jg = self.J @ g_test
-        h_inv_g = (1.0 / lam) * g_test - (1.0 / lam**2) * (self.J.T @ self.M @ Jg)
+        chunk_size = 10
+        Jg = torch.empty(self.n, dtype=torch.float32, device=dev)
+        for i in range(0, self.n, chunk_size):
+            i_end = min(i + chunk_size, self.n)
+            chunk_i = torch.stack(
+                [self.g_train_list[k].float() for k in range(i, i_end)]
+            )
+            if self.normalize:
+                chunk_i = chunk_i / self._grad_norms[i:i_end].unsqueeze(1)
+            Jg[i:i_end] = chunk_i @ g_test
+            del chunk_i
+        My = self.M @ Jg
+        acc = torch.zeros_like(g_test)
+        for i in range(0, self.n, chunk_size):
+            i_end = min(i + chunk_size, self.n)
+            chunk_i = torch.stack(
+                [self.g_train_list[k].float() for k in range(i, i_end)]
+            )
+            if self.normalize:
+                chunk_i = chunk_i / self._grad_norms[i:i_end].unsqueeze(1)
+            acc += chunk_i.T @ My[i:i_end]
+            del chunk_i
+        h_inv_g = (1.0 / lam) * g_test - (1.0 / lam**2) * acc
         weight = float(train_info.get("historical_weight", 1.0))
         return (weight * torch.dot(h_inv_g, g_train)).item()
 

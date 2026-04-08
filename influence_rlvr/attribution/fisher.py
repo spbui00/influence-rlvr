@@ -42,10 +42,16 @@ class FisherInfluence(BaseInfluenceMethod):
     def __init__(self, train_infos: list, lambda_damp: float = 0.1, normalize: bool = False):
         self.lambda_damp = lambda_damp
         self.normalize = normalize
-        self.train_grads = torch.stack([info["grad"].float() for info in train_infos])
-        if normalize:
-            grad_norms = self.train_grads.norm(dim=1, keepdim=True).clamp(min=1e-12)
-            self.train_grads = self.train_grads / grad_norms
+        self._train_grad_list = [info["grad"] for info in train_infos]
+        n = len(self._train_grad_list)
+        if n > 0 and normalize:
+            dev = self._train_grad_list[0].device
+            norms = torch.empty(n, dtype=torch.float32, device=dev)
+            for i in range(n):
+                norms[i] = self._train_grad_list[i].float().norm().clamp(min=1e-12)
+            self._grad_norms = norms
+        else:
+            self._grad_norms = None
 
         geometry_features = _stack_geometry_features(train_infos, normalize)
         geometry_weights = _geometry_weight_vector(train_infos)
@@ -68,7 +74,23 @@ class FisherInfluence(BaseInfluenceMethod):
 
     def compute_all_scores(self, test_info: dict) -> np.ndarray:
         h_inv_g = self._precondition(test_info["grad"])
-        return (self.train_grads @ h_inv_g).numpy()
+        n = len(self._train_grad_list)
+        if n == 0:
+            return np.zeros(0, dtype=np.float32)
+        chunk_size = 10
+        out = np.empty(n, dtype=np.float32)
+        for i in range(0, n, chunk_size):
+            i_end = min(i + chunk_size, n)
+            chunk = torch.stack(
+                [self._train_grad_list[k].float() for k in range(i, i_end)]
+            ).to(h_inv_g.device)
+            if self.normalize:
+                chunk = chunk / self._grad_norms[i:i_end].unsqueeze(1).to(
+                    h_inv_g.device
+                )
+            out[i:i_end] = (chunk @ h_inv_g).detach().cpu().numpy()
+            del chunk
+        return out
 
     def compute_score(self, test_info: dict, train_info: dict) -> float:
         g_train = train_info["grad"].float()
