@@ -13,15 +13,34 @@ def _stack_grads(infos, normalize):
 
 
 def tracin_base_matrix_from_infos(test_infos, train_infos, normalize: bool) -> np.ndarray:
-    if not test_infos or not train_infos:
-        return np.zeros(
-            (len(test_infos), len(train_infos)),
-            dtype=np.float32,
-        )
-    test_grads = _stack_grads(test_infos, normalize)
-    train_grads = _stack_grads(train_infos, normalize)
-    matrix = (test_grads @ train_grads.T).cpu().numpy().astype(np.float32, copy=False)
-    del test_grads, train_grads
+    n_test = len(test_infos)
+    n_train = len(train_infos)
+    matrix = np.zeros((n_test, n_train), dtype=np.float32)
+
+    if n_test == 0 or n_train == 0:
+        return matrix
+
+    test_norms = [
+        torch.norm(t["grad"]).item() if normalize else 1.0 
+        for t in test_infos
+    ]
+    train_norms = [
+        torch.norm(t["grad"]).item() if normalize else 1.0 
+        for t in train_infos
+    ]
+
+    for i, t_info in enumerate(test_infos):
+        t_grad = t_info["grad"]
+        for j, tr_info in enumerate(train_infos):
+            tr_grad = tr_info["grad"]
+            
+            dot_val = torch.dot(t_grad, tr_grad).item()
+            
+            if normalize:
+                dot_val = dot_val / (test_norms[i] * train_norms[j])
+                
+            matrix[i, j] = dot_val
+
     return matrix
 
 
