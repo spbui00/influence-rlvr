@@ -4,44 +4,34 @@ import torch
 from .base import BaseInfluenceMethod
 
 
-def _stack_grads(infos, normalize):
-    grads = torch.stack([info["grad"].float() for info in infos])
-    if normalize:
-        norms = grads.norm(dim=1, keepdim=True).clamp(min=1e-12)
-        grads = grads / norms
-    return grads
-
-
 def tracin_base_matrix_from_infos(test_infos, train_infos, normalize: bool) -> np.ndarray:
-    n_test = len(test_infos)
-    n_train = len(train_infos)
-    matrix = np.zeros((n_test, n_train), dtype=np.float32)
+    with torch.no_grad():
+        n_test = len(test_infos)
+        n_train = len(train_infos)
+        matrix = np.zeros((n_test, n_train), dtype=np.float32)
 
-    if n_test == 0 or n_train == 0:
+        if n_test == 0 or n_train == 0:
+            return matrix
+
+        test_norms = [
+            torch.norm(t["grad"]).item() if normalize else 1.0
+            for t in test_infos
+        ]
+        train_norms = [
+            torch.norm(t["grad"]).item() if normalize else 1.0
+            for t in train_infos
+        ]
+
+        for i, t_info in enumerate(test_infos):
+            t_grad = t_info["grad"]
+            for j, tr_info in enumerate(train_infos):
+                tr_grad = tr_info["grad"]
+                dot_val = torch.dot(t_grad, tr_grad).item()
+                if normalize:
+                    dot_val = dot_val / (test_norms[i] * train_norms[j])
+                matrix[i, j] = dot_val
+
         return matrix
-
-    test_norms = [
-        torch.norm(t["grad"]).item() if normalize else 1.0 
-        for t in test_infos
-    ]
-    train_norms = [
-        torch.norm(t["grad"]).item() if normalize else 1.0 
-        for t in train_infos
-    ]
-
-    for i, t_info in enumerate(test_infos):
-        t_grad = t_info["grad"]
-        for j, tr_info in enumerate(train_infos):
-            tr_grad = tr_info["grad"]
-            
-            dot_val = torch.dot(t_grad, tr_grad).item()
-            
-            if normalize:
-                dot_val = dot_val / (test_norms[i] * train_norms[j])
-                
-            matrix[i, j] = dot_val
-
-    return matrix
 
 
 def _stack_train_weights(infos):
@@ -97,9 +87,11 @@ class TrajectoryTracInInfluence:
                     dtype=np.float32,
                 )
             else:
-                test_grads = _stack_grads(checkpoint["test_infos"], self.normalize)
-                train_grads = _stack_grads(checkpoint["train_infos"], self.normalize)
-                matrix = (test_grads @ train_grads.T).cpu().numpy()
+                matrix = tracin_base_matrix_from_infos(
+                    checkpoint["test_infos"],
+                    checkpoint["train_infos"],
+                    self.normalize,
+                )
             learning_rate = float(checkpoint.get("learning_rate", 1.0))
             weighted_matrix = learning_rate * matrix * train_weights.numpy()[None, :]
 

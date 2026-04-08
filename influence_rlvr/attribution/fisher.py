@@ -40,25 +40,31 @@ def _geometry_weight_vector(infos):
 
 class FisherInfluence(BaseInfluenceMethod):
     def __init__(self, train_infos: list, lambda_damp: float = 0.1, normalize: bool = False):
-        self.lambda_damp = lambda_damp
-        self.normalize = normalize
-        self._train_grad_list = [info["grad"] for info in train_infos]
-        n = len(self._train_grad_list)
-        if n > 0 and normalize:
-            dev = self._train_grad_list[0].device
-            norms = torch.empty(n, dtype=torch.float32, device=dev)
-            for i in range(n):
-                norms[i] = self._train_grad_list[i].float().norm().clamp(min=1e-12)
-            self._grad_norms = norms
-        else:
-            self._grad_norms = None
+        with torch.no_grad():
+            self.lambda_damp = lambda_damp
+            self.normalize = normalize
+            self._train_grad_list = [info["grad"] for info in train_infos]
+            n = len(self._train_grad_list)
+            if n > 0 and normalize:
+                norms = torch.empty(n, dtype=torch.float32, device="cuda")
+                for i in range(n):
+                    gi = self._train_grad_list[i].to(
+                        device="cuda", dtype=torch.float32
+                    )
+                    norms[i] = gi.norm().clamp(min=1e-12)
+                    del gi
+                self._grad_norms = norms
+            else:
+                self._grad_norms = None
 
-        geometry_features = _stack_geometry_features(train_infos, normalize)
-        geometry_weights = _geometry_weight_vector(train_infos)
-        self.geometry_matrix = geometry_features * geometry_weights.sqrt().unsqueeze(1)
-        gram = self.geometry_matrix @ self.geometry_matrix.T
-        identity = torch.eye(gram.shape[0], dtype=torch.float32)
-        self.inverse_small = torch.linalg.inv(identity + gram / lambda_damp)
+            geometry_features = _stack_geometry_features(train_infos, normalize)
+            geometry_weights = _geometry_weight_vector(train_infos)
+            self.geometry_matrix = (
+                geometry_features * geometry_weights.sqrt().unsqueeze(1)
+            )
+            gram = self.geometry_matrix @ self.geometry_matrix.T
+            identity = torch.eye(gram.shape[0], dtype=torch.float32)
+            self.inverse_small = torch.linalg.inv(identity + gram / lambda_damp)
 
     def _normalize_test(self, g_test: torch.Tensor) -> torch.Tensor:
         g = g_test.float()
@@ -70,32 +76,43 @@ class FisherInfluence(BaseInfluenceMethod):
         g = self._normalize_test(g_test)
         features_g = self.geometry_matrix @ g
         correction = self.geometry_matrix.T @ (self.inverse_small @ features_g)
-        return (1.0 / self.lambda_damp) * g - (1.0 / self.lambda_damp**2) * correction
+        return (1.0 / self.lambda_damp) * g - (
+            1.0 / self.lambda_damp**2
+        ) * correction
 
     def compute_all_scores(self, test_info: dict) -> np.ndarray:
-        n = len(self._train_grad_list)
-        if n == 0:
-            return np.zeros(0, dtype=np.float32)
-        h_inv_g = self._precondition(test_info["grad"]).to("cuda")
-        chunk_size = 10
-        out = np.empty(n, dtype=np.float32)
-        for i in range(0, n, chunk_size):
-            i_end = min(i + chunk_size, n)
-            chunk = torch.stack(
-                [self._train_grad_list[k].float() for k in range(i, i_end)]
-            ).to("cuda")
-            if self.normalize:
-                chunk = chunk / self._grad_norms[i:i_end].unsqueeze(1).to("cuda")
-            out[i:i_end] = (chunk @ h_inv_g).detach().cpu().numpy()
-            del chunk
-        return out
+        with torch.no_grad():
+            n = len(self._train_grad_list)
+            if n == 0:
+                return np.zeros(0, dtype=np.float32)
+            h_inv_g = self._precondition(test_info["grad"]).to("cuda")
+            chunk_size = 10
+            out = np.empty(n, dtype=np.float32)
+            for i in range(0, n, chunk_size):
+                i_end = min(i + chunk_size, n)
+                chunk = torch.stack(
+                    [
+                        self._train_grad_list[k].to(
+                            device="cuda", dtype=torch.float32
+                        )
+                        for k in range(i, i_end)
+                    ]
+                )
+                if self.normalize:
+                    chunk = chunk / self._grad_norms[i:i_end].unsqueeze(1)
+                out[i:i_end] = (chunk @ h_inv_g).detach().cpu().numpy()
+                del chunk
+            return out
 
     def compute_score(self, test_info: dict, train_info: dict) -> float:
-        g_train = train_info["grad"].float()
-        if self.normalize:
-            g_train = g_train / (g_train.norm() + 1e-12)
-        h_inv_g = self._precondition(test_info["grad"])
-        return torch.dot(h_inv_g, g_train).item()
+        with torch.no_grad():
+            g_train = train_info["grad"].to(
+                device="cuda", dtype=torch.float32
+            )
+            if self.normalize:
+                g_train = g_train / (g_train.norm() + 1e-12)
+            h_inv_g = self._precondition(test_info["grad"]).to("cuda")
+            return torch.dot(h_inv_g, g_train).item()
 
 
 class TrajectoryFisherInfluence:
