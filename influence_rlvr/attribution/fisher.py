@@ -73,21 +73,19 @@ class FisherInfluence(BaseInfluenceMethod):
         return (1.0 / self.lambda_damp) * g - (1.0 / self.lambda_damp**2) * correction
 
     def compute_all_scores(self, test_info: dict) -> np.ndarray:
-        h_inv_g = self._precondition(test_info["grad"])
         n = len(self._train_grad_list)
         if n == 0:
             return np.zeros(0, dtype=np.float32)
+        h_inv_g = self._precondition(test_info["grad"]).to("cuda")
         chunk_size = 10
         out = np.empty(n, dtype=np.float32)
         for i in range(0, n, chunk_size):
             i_end = min(i + chunk_size, n)
             chunk = torch.stack(
                 [self._train_grad_list[k].float() for k in range(i, i_end)]
-            ).to(h_inv_g.device)
+            ).to("cuda")
             if self.normalize:
-                chunk = chunk / self._grad_norms[i:i_end].unsqueeze(1).to(
-                    h_inv_g.device
-                )
+                chunk = chunk / self._grad_norms[i:i_end].unsqueeze(1).to("cuda")
             out[i:i_end] = (chunk @ h_inv_g).detach().cpu().numpy()
             del chunk
         return out

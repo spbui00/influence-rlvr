@@ -47,28 +47,33 @@ class DataInfInfluence(BaseInfluenceMethod):
         else:
             self._grad_norms = None
 
-        K = torch.empty(self.n, self.n, dtype=torch.float32, device=dev)
+        K = torch.empty(self.n, self.n, dtype=torch.float32, device="cpu")
         for i in range(0, self.n, chunk_size):
             i_end = min(i + chunk_size, self.n)
             chunk_i = torch.stack(
                 [g_train_list[k].float() for k in range(i, i_end)]
-            )
+            ).to("cuda")
             if self.normalize:
-                chunk_i = chunk_i / self._grad_norms[i:i_end].unsqueeze(1)
+                chunk_i = chunk_i / self._grad_norms[i:i_end].unsqueeze(1).to(
+                    "cuda"
+                )
             for j in range(0, self.n, chunk_size):
                 j_end = min(j + chunk_size, self.n)
                 chunk_j = torch.stack(
                     [g_train_list[k].float() for k in range(j, j_end)]
-                )
+                ).to("cuda")
                 if self.normalize:
-                    chunk_j = chunk_j / self._grad_norms[j:j_end].unsqueeze(1)
+                    chunk_j = chunk_j / self._grad_norms[j:j_end].unsqueeze(1).to(
+                        "cuda"
+                    )
                 block = chunk_i @ chunk_j.T
-                K[i:i_end, j:j_end] = block
+                K[i:i_end, j:j_end] = block.cpu()
                 del chunk_j
+                del block
             del chunk_i
 
         self.K = K
-        I_n = torch.eye(self.n, dtype=torch.float32, device=dev)
+        I_n = torch.eye(self.n, dtype=torch.float32, device="cpu")
         self.M = torch.linalg.inv(self.n * lambda_damp * I_n + K)
         del I_n
 
@@ -81,53 +86,60 @@ class DataInfInfluence(BaseInfluenceMethod):
     def compute_all_scores(self, test_info: dict) -> np.ndarray:
         if self.n == 0:
             return np.zeros(0, dtype=np.float32)
-        dev = self.g_train_list[0].device
-        g_test = self._normalize_test(test_info["grad"]).to(dev)
+        g_test = self._normalize_test(test_info["grad"]).to("cuda")
         lam = self.lambda_damp
         chunk_size = 10
-        v = torch.empty(self.n, dtype=torch.float32, device=dev)
+        v = torch.empty(self.n, dtype=torch.float32, device="cuda")
         for i in range(0, self.n, chunk_size):
             i_end = min(i + chunk_size, self.n)
             chunk_i = torch.stack(
                 [self.g_train_list[k].float() for k in range(i, i_end)]
-            )
+            ).to("cuda")
             if self.normalize:
-                chunk_i = chunk_i / self._grad_norms[i:i_end].unsqueeze(1)
+                chunk_i = chunk_i / self._grad_norms[i:i_end].unsqueeze(1).to(
+                    "cuda"
+                )
             v[i:i_end] = chunk_i @ g_test
             del chunk_i
-        scores = (1.0 / lam) * v - (1.0 / lam**2) * (v @ self.M @ self.K)
+        v_cpu = v.cpu()
+        del v
+        scores = (1.0 / lam) * v_cpu - (1.0 / lam**2) * (v_cpu @ self.M @ self.K)
         return scores.detach().cpu().numpy()
 
     def compute_score(self, test_info: dict, train_info: dict) -> float:
         if self.n == 0:
             return 0.0
-        dev = self.g_train_list[0].device
-        g_test = self._normalize_test(test_info["grad"]).to(dev)
-        g_train = train_info["grad"].float()
+        g_test = self._normalize_test(test_info["grad"]).to("cuda")
+        g_train = train_info["grad"].float().to("cuda")
         if self.normalize:
             g_train = g_train / (g_train.norm() + 1e-12)
         lam = self.lambda_damp
         chunk_size = 10
-        Jg = torch.empty(self.n, dtype=torch.float32, device=dev)
+        Jg = torch.empty(self.n, dtype=torch.float32, device="cuda")
         for i in range(0, self.n, chunk_size):
             i_end = min(i + chunk_size, self.n)
             chunk_i = torch.stack(
                 [self.g_train_list[k].float() for k in range(i, i_end)]
-            )
+            ).to("cuda")
             if self.normalize:
-                chunk_i = chunk_i / self._grad_norms[i:i_end].unsqueeze(1)
+                chunk_i = chunk_i / self._grad_norms[i:i_end].unsqueeze(1).to(
+                    "cuda"
+                )
             Jg[i:i_end] = chunk_i @ g_test
             del chunk_i
-        My = self.M @ Jg
+        My = self.M @ Jg.cpu()
+        del Jg
         acc = torch.zeros_like(g_test)
         for i in range(0, self.n, chunk_size):
             i_end = min(i + chunk_size, self.n)
             chunk_i = torch.stack(
                 [self.g_train_list[k].float() for k in range(i, i_end)]
-            )
+            ).to("cuda")
             if self.normalize:
-                chunk_i = chunk_i / self._grad_norms[i:i_end].unsqueeze(1)
-            acc += chunk_i.T @ My[i:i_end]
+                chunk_i = chunk_i / self._grad_norms[i:i_end].unsqueeze(1).to(
+                    "cuda"
+                )
+            acc += chunk_i.T @ My[i:i_end].to("cuda")
             del chunk_i
         h_inv_g = (1.0 / lam) * g_test - (1.0 / lam**2) * acc
         weight = float(train_info.get("historical_weight", 1.0))
