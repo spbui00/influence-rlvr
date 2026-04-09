@@ -9,7 +9,6 @@ Example:
   uv run python scripts/coverage_checkpoint_union.py \\
     --rlvr-output outputs/run7/rlvr-output \\
     --results-dir outputs/run7/results1 \\
-    --learning-rate 5e-5 \\
     --per-sample-target 20 \\
     --plot figures/coverage_union.png \\
     --json-out figures/coverage_union.json
@@ -32,6 +31,7 @@ if str(ROOT) not in sys.path:
 
 RESULTS_MANIFEST_FILE = "results_manifest.json"
 TRAIN_BATCH_HISTORY_FILE = "historical_batch_history.json"
+RUN_CONFIG_FILE = "run_config.json"
 
 
 def _load_checkpoint_schedule_module():
@@ -45,6 +45,7 @@ def _load_checkpoint_schedule_module():
 
 CKS = _load_checkpoint_schedule_module()
 build_checkpoint_schedule = CKS.build_checkpoint_schedule
+list_checkpoint_dirs = CKS.list_checkpoint_dirs
 thin_checkpoint_schedule = CKS.thin_checkpoint_schedule
 CheckpointThinningConfig = CKS.CheckpointThinningConfig
 CheckpointThinningMode = CKS.CheckpointThinningMode
@@ -138,6 +139,41 @@ def _replay_subset_indices(pool_size: int, n: int, subset_seed: int) -> list[int
     return sorted(rng.sample(range(int(pool_size)), k))
 
 
+def _infer_learning_rate(
+    rlvr: Path, results_dir: Path | None
+) -> tuple[float, str]:
+    rc = rlvr / RUN_CONFIG_FILE
+    if rc.is_file():
+        try:
+            data = json.loads(rc.read_text())
+            if data.get("learning_rate") is not None:
+                return float(data["learning_rate"]), RUN_CONFIG_FILE
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+    if results_dir is not None:
+        rm = results_dir / RESULTS_MANIFEST_FILE
+        if rm.is_file():
+            try:
+                payload = json.loads(rm.read_text())
+                cfg = payload.get("config") or {}
+                if cfg.get("learning_rate") is not None:
+                    return float(cfg["learning_rate"]), f"{RESULTS_MANIFEST_FILE} config"
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+    try:
+        for d in list_checkpoint_dirs(str(rlvr)):
+            ts_path = Path(d) / "trainer_state.json"
+            if not ts_path.is_file():
+                continue
+            ts = json.loads(ts_path.read_text())
+            for item in ts.get("log_history") or []:
+                if isinstance(item, dict) and item.get("learning_rate") is not None:
+                    return float(item["learning_rate"]), "trainer_state.json log_history"
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return 5e-5, "default"
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         description=(
@@ -154,8 +190,11 @@ def main() -> int:
     p.add_argument(
         "--learning-rate",
         type=float,
-        default=5e-5,
-        help="Fallback LR for build_checkpoint_schedule",
+        default=None,
+        help=(
+            "LR fallback for schedule building. If omitted: read run_config.json, "
+            "else results_manifest config, else trainer_state log_history, else 5e-5."
+        ),
     )
     p.add_argument(
         "--per-sample-target",
@@ -219,11 +258,24 @@ def main() -> int:
     args = p.parse_args()
 
     rlvr = args.rlvr_output.expanduser().resolve()
+    results_resolved = (
+        args.results_dir.expanduser().resolve() if args.results_dir else None
+    )
+    if args.learning_rate is not None:
+        learning_rate = float(args.learning_rate)
+        learning_rate_source = "cli"
+    else:
+        learning_rate, learning_rate_source = _infer_learning_rate(rlvr, results_resolved)
+    print(
+        f"Using learning_rate={learning_rate:g} (source: {learning_rate_source})",
+        flush=True,
+    )
+
     hist_steps = load_historical_steps(rlvr)
     if not hist_steps:
         raise SystemExit(f"No steps in {rlvr / TRAIN_BATCH_HISTORY_FILE}")
 
-    full_schedule = build_checkpoint_schedule(str(rlvr), args.learning_rate)
+    full_schedule = build_checkpoint_schedule(str(rlvr), learning_rate)
     if not full_schedule:
         raise SystemExit(f"No checkpoints found under {rlvr}")
     by_step = _schedule_by_step(full_schedule)
@@ -232,12 +284,10 @@ def main() -> int:
     if explicit:
         train_indices = explicit
     elif args.results_dir:
-        train_indices = _load_train_indices_from_results(
-            args.results_dir.expanduser().resolve()
-        )
+        train_indices = _load_train_indices_from_results(results_resolved)
         if not train_indices:
             raise SystemExit(
-                f"No dataset_train_index in {args.results_dir / RESULTS_MANIFEST_FILE}; "
+                f"No dataset_train_index in {results_resolved / RESULTS_MANIFEST_FILE}; "
                 "use --train-indices or regenerate results with a current pipeline."
             )
     elif args.replay_pool_size is not None and args.replay_n is not None:
@@ -296,6 +346,8 @@ def main() -> int:
 
     out = {
         "rlvr_output": str(rlvr),
+        "learning_rate": learning_rate,
+        "learning_rate_source": learning_rate_source,
         "per_sample_target": tc,
         "n_train_indices": len(train_indices),
         "samples_with_no_covering_checkpoint": n_zero_cover,
