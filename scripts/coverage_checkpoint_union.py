@@ -14,7 +14,8 @@ Example (only rlvr-output required for full-history analysis):
 
 Use --results-dir path/to/results1 to restrict to dataset_train_index from that bundle's
 results_manifest.json. JSON and stdout report: how many indices have ≥1 matched checkpoint,
-per-sample history step/inclusion counts from historical_batch_history, and checkpoint-thin stats.
+per-sample history step/inclusion counts, per-checkpoint counts of indices (before/after thin),
+and checkpoint-thin stats. With --plot, also writes <stem>_ckpt_frequency.png (bars: checkpoint vs #indices).
 Learning rate: omitted -> run_config.json, else results_manifest, else trainer_state, else 5e-5.
 """
 
@@ -25,6 +26,7 @@ import importlib.util
 import json
 import random
 import sys
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -100,6 +102,67 @@ def _historical_steps_covering_index(steps: list[HistStep], train_index: int) ->
     return sorted(set(out))
 
 
+def _per_checkpoint_sample_counts(
+    per_sample: dict[str, dict],
+) -> tuple[Counter[int], Counter[int], list[int]]:
+    before: Counter[int] = Counter()
+    after: Counter[int] = Counter()
+    for v in per_sample.values():
+        for s in v["covering_steps"]:
+            before[int(s)] += 1
+        for s in v["thinned_steps"]:
+            after[int(s)] += 1
+    all_steps = sorted(set(before.keys()) | set(after.keys()))
+    return before, after, all_steps
+
+
+def _plot_checkpoint_frequency_bars(
+    all_steps: list[int],
+    before: Counter[int],
+    after: Counter[int],
+    tc: int,
+    n_train: int,
+):
+    import matplotlib.pyplot as plt
+
+    y_b = [before.get(s, 0) for s in all_steps]
+    y_a = [after.get(s, 0) for s in all_steps]
+    n = len(all_steps)
+    fig, axes = plt.subplots(2, 1, figsize=(14, 8), constrained_layout=True, sharex=True)
+    xpos = np.arange(n, dtype=float)
+    for ax, ys, title in (
+        (
+            axes[0],
+            y_b,
+            "Before LR-thin: per checkpoint, how many train indices matched it (±1)",
+        ),
+        (
+            axes[1],
+            y_a,
+            f"After LR-thin (cap={tc}): per checkpoint, how many indices kept it",
+        ),
+    ):
+        if n == 0:
+            ax.text(0.5, 0.5, "No checkpoints", ha="center", va="center")
+            ax.set_title(title)
+            continue
+        ax.bar(xpos, ys, width=0.85, edgecolor="black", alpha=0.88)
+        ax.set_ylabel(f"# indices (of {n_train})")
+        ax.set_title(title)
+        ymax = max(ys) if ys else 1
+        ax.set_ylim(0, max(1.05, ymax * 1.08))
+    axes[1].set_xlabel("Checkpoint global_step (sorted)")
+    if n > 0:
+        if n <= 48:
+            tick_step = 1
+        else:
+            tick_step = max(1, n // 48)
+        tick_idx = list(range(0, n, tick_step))
+        axes[1].set_xticks(xpos[tick_idx])
+        axes[1].set_xticklabels([str(all_steps[i]) for i in tick_idx], rotation=45, ha="right")
+    return fig
+
+
 def _history_batch_stats_for_index(
     steps: list[HistStep], train_index: int
 ) -> tuple[int, int]:
@@ -136,9 +199,14 @@ def _load_train_indices_from_results(results_dir: Path) -> list[int]:
     data = json.loads(path.read_text())
     out: list[int] = []
     for s in data.get("train_samples", []):
-        di = s.get("dataset_train_index")
-        if di is not None:
-            out.append(int(di))
+        raw = s.get("dataset_train_index")
+        if raw is None:
+            raw = s.get("train_index")
+        if raw is not None:
+            try:
+                out.append(int(raw))
+            except (TypeError, ValueError):
+                continue
     return out
 
 
@@ -282,6 +350,16 @@ def main() -> int:
         ),
     )
     p.add_argument(
+        "--plot-checkpoint-frequency",
+        type=Path,
+        default=None,
+        help=(
+            "Bar chart: x = each distinct checkpoint global_step (sorted), y = how many train "
+            "indices include that checkpoint before thin vs after thin (two panels). "
+            "Default: next to --plot as <stem>_ckpt_frequency.png when --plot is set."
+        ),
+    )
+    p.add_argument(
         "--json-out",
         type=Path,
         default=None,
@@ -325,9 +403,16 @@ def main() -> int:
     elif args.results_dir:
         train_indices = _load_train_indices_from_results(results_resolved)
         if not train_indices:
+            rm = results_resolved / RESULTS_MANIFEST_FILE
+            try:
+                n_ts = len(json.loads(rm.read_text()).get("train_samples", []))
+            except (OSError, json.JSONDecodeError):
+                n_ts = -1
             raise SystemExit(
-                f"No dataset_train_index in {results_resolved / RESULTS_MANIFEST_FILE}; "
-                "use --train-indices or regenerate results with a current pipeline."
+                f"No usable train index in {rm} "
+                f"({n_ts} train_samples; need dataset_train_index or train_index on each). "
+                "Influence must record train_index in checkpoint train_infos when writing the manifest. "
+                "Fix: re-run influence with current code, or pass --train-indices a,b,c matching your run."
             )
         train_indices_source = str(results_resolved)
     elif args.replay_pool_size is not None and args.replay_n is not None:
@@ -371,7 +456,9 @@ def main() -> int:
         n_cov = len(covering)
         if not covering:
             thinned_steps: list[int] = []
+            covering_steps: list[int] = []
         else:
+            covering_steps = [int(cp["step"]) for cp in covering]
             thinned = thin_checkpoint_schedule(covering, thin_cfg, log=False)
             thinned_steps = [int(cp["step"]) for cp in thinned]
             for s in thinned_steps:
@@ -381,6 +468,7 @@ def main() -> int:
             "history_logged_steps_with_index": hist_steps_n,
             "history_total_batch_inclusions": hist_inclusions,
             "covering_checkpoints": n_cov,
+            "covering_steps": covering_steps,
             "thinned_steps": thinned_steps,
         }
         if rank < int(args.max_plot_samples):
@@ -399,6 +487,8 @@ def main() -> int:
         if v["covering_checkpoints"] > 0:
             covering_counts_covered.append(int(v["covering_checkpoints"]))
             thinned_lens_covered.append(len(v["thinned_steps"]))
+
+    before_ctr, after_ctr, all_ckpt_steps = _per_checkpoint_sample_counts(per_sample)
 
     out = {
         "rlvr_output": str(rlvr),
@@ -447,6 +537,12 @@ def main() -> int:
                 if per_sample
                 else None,
             },
+        },
+        "per_checkpoint_sample_counts_before_thin": {
+            str(k): int(before_ctr[k]) for k in sorted(before_ctr.keys())
+        },
+        "per_checkpoint_sample_counts_after_thin": {
+            str(k): int(after_ctr[k]) for k in sorted(after_ctr.keys())
         },
     }
 
@@ -577,6 +673,30 @@ def main() -> int:
         print(f"Wrote covered-sample histogram {covered_hist_path}")
     elif covered_hist_path is not None and not covering_counts_covered:
         print("Skipping covered-sample histogram: no covered samples", flush=True)
+
+    freq_path = None
+    if args.plot_checkpoint_frequency is not None:
+        freq_path = args.plot_checkpoint_frequency.expanduser().resolve()
+    elif args.plot is not None:
+        pm = args.plot.expanduser().resolve()
+        freq_path = pm.with_name(f"{pm.stem}_ckpt_frequency{pm.suffix}")
+
+    if freq_path is not None and all_ckpt_steps:
+        import matplotlib.pyplot as plt
+
+        fig_f = _plot_checkpoint_frequency_bars(
+            all_ckpt_steps,
+            before_ctr,
+            after_ctr,
+            tc,
+            len(train_indices),
+        )
+        freq_path.parent.mkdir(parents=True, exist_ok=True)
+        fig_f.savefig(freq_path, dpi=160)
+        plt.close(fig_f)
+        print(f"Wrote per-checkpoint frequency plot {freq_path}")
+    elif freq_path is not None:
+        print("Skipping per-checkpoint frequency plot: no checkpoint steps", flush=True)
 
     return 0
 
