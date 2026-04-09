@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import statistics
 import sys
 from pathlib import Path
 
@@ -61,6 +62,24 @@ def resolve_ckpt(by_step: dict[int, dict], hist_step: int) -> dict | None:
     if hist_step - 1 in by_step:
         return by_step[hist_step - 1]
     return None
+
+
+def inclusions_per_checkpoint(
+    history: list[tuple[int, dict[int, int]]],
+    by_step: dict[int, dict],
+    train_index: int,
+) -> dict[int, int]:
+    per_cp: dict[int, int] = {}
+    for step, counts in history:
+        c = counts.get(train_index, 0)
+        if not c:
+            continue
+        cp = resolve_ckpt(by_step, step)
+        if cp is None:
+            continue
+        sid = int(cp["step"])
+        per_cp[sid] = per_cp.get(sid, 0) + c
+    return per_cp
 
 
 def covering_checkpoint_entries(
@@ -166,17 +185,63 @@ def main() -> None:
         raise SystemExit("No train indices to process")
 
     union: set[int] = set()
+    totals_per_sample: list[int] = []
+    mean_per_cp_per_sample: list[float] = []
+    min_per_cp_per_sample: list[int] = []
+    max_per_cp_per_sample: list[int] = []
+    all_cell_counts: list[int] = []
+
     for k in train_indices:
+        per_cp = inclusions_per_checkpoint(history, by_step, k)
         cov = covering_checkpoint_entries(history, by_step, k)
         th = thin_checkpoint_schedule(cov, thin_cfg, log=False)
         for cp in th:
             union.add(int(cp["step"]))
 
+        if not per_cp:
+            totals_per_sample.append(0)
+            continue
+        cells = list(per_cp.values())
+        t = sum(cells)
+        totals_per_sample.append(t)
+        all_cell_counts.extend(cells)
+        mean_per_cp_per_sample.append(t / len(cells))
+        min_per_cp_per_sample.append(min(cells))
+        max_per_cp_per_sample.append(max(cells))
+
     u = sorted(union)
+    n_used = len(train_indices)
+    n_cov = sum(1 for t in totals_per_sample if t > 0)
+
     print(f"train_sample_selection: {subset_note}")
-    print(f"n_train_samples_used: {len(train_indices)}")
+    print(f"n_train_samples_used: {n_used}")
     print(f"LR thinning target per sample: {max_k} (mode=learning_rate)")
     print(f"union_checkpoint_count: {len(u)}")
+    print(
+        "appearance_stats (logged batch rows for an index, grouped by resolved checkpoint):"
+    )
+    print(
+        f"  total inclusions per sample (sum over CPs): "
+        f"mean={statistics.fmean(totals_per_sample):.3f} "
+        f"min={min(totals_per_sample)} max={max(totals_per_sample)} "
+        f"(samples with >0: {n_cov}/{n_used})"
+    )
+    if mean_per_cp_per_sample:
+        print(
+            "  among CPs that include a sample — mean inclusions in one CP, within that sample "
+            f"(unweighted over CPs): mean={statistics.fmean(mean_per_cp_per_sample):.3f} "
+            f"min={min(mean_per_cp_per_sample):.3f} max={max(mean_per_cp_per_sample):.3f}"
+        )
+        print(
+            "  same — min / max inclusions in a single CP for that sample: "
+            f"min_over_samples={min(min_per_cp_per_sample)} "
+            f"max_over_samples={max(max_per_cp_per_sample)}"
+        )
+    if all_cell_counts:
+        print(
+            "  over all (sample, checkpoint) pairs: "
+            f"min_in_cell={min(all_cell_counts)} max_in_cell={max(all_cell_counts)}"
+        )
     if len(u) <= 48:
         print(f"union_steps: {u}")
     else:
