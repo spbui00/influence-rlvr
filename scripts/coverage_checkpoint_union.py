@@ -254,7 +254,17 @@ def main() -> int:
         "--plot",
         type=Path,
         default=None,
-        help="Write matplotlib figure to this path",
+        help="Write matplotlib figure (union stem + per-sample scatter) to this path",
+    )
+    p.add_argument(
+        "--plot-covered-hist",
+        type=Path,
+        default=None,
+        help=(
+            "Histogram: for covered samples only, distribution of (1) # matched checkpoints "
+            "before thin, (2) # after LR-thin. Default: next to --plot as <stem>_covered_hist.png "
+            "when --plot is set; omit to skip unless this flag is set explicitly."
+        ),
     )
     p.add_argument(
         "--json-out",
@@ -359,6 +369,13 @@ def main() -> int:
         1 for v in per_sample.values() if v["covering_checkpoints"] == 0
     )
 
+    covering_counts_covered: list[int] = []
+    thinned_lens_covered: list[int] = []
+    for v in per_sample.values():
+        if v["covering_checkpoints"] > 0:
+            covering_counts_covered.append(int(v["covering_checkpoints"]))
+            thinned_lens_covered.append(len(v["thinned_steps"]))
+
     out = {
         "rlvr_output": str(rlvr),
         "learning_rate": learning_rate,
@@ -369,6 +386,19 @@ def main() -> int:
         "union_size": len(union_sorted),
         "union_steps": union_sorted,
         "per_sample": per_sample,
+        "covered_samples_summary": {
+            "n_covered": len(covering_counts_covered),
+            "covering_checkpoints_before_thin": {
+                "min": min(covering_counts_covered) if covering_counts_covered else None,
+                "max": max(covering_counts_covered) if covering_counts_covered else None,
+                "mean": float(np.mean(covering_counts_covered)) if covering_counts_covered else None,
+            },
+            "thinned_count_after_lr_thin": {
+                "min": min(thinned_lens_covered) if thinned_lens_covered else None,
+                "max": max(thinned_lens_covered) if thinned_lens_covered else None,
+                "mean": float(np.mean(thinned_lens_covered)) if thinned_lens_covered else None,
+            },
+        },
     }
 
     if args.json_out:
@@ -440,6 +470,51 @@ def main() -> int:
         fig.savefig(plotp, dpi=160)
         plt.close(fig)
         print(f"Wrote plot {plotp}")
+
+    covered_hist_path = None
+    if args.plot_covered_hist is not None:
+        covered_hist_path = args.plot_covered_hist.expanduser().resolve()
+    elif args.plot is not None:
+        plotp_main = args.plot.expanduser().resolve()
+        covered_hist_path = plotp_main.with_name(
+            f"{plotp_main.stem}_covered_hist{plotp_main.suffix}"
+        )
+
+    if covered_hist_path is not None and covering_counts_covered:
+        import matplotlib.pyplot as plt
+
+        fig_h, (ax_a, ax_b) = plt.subplots(
+            1, 2, figsize=(12, 4), constrained_layout=True
+        )
+        max_cov = max(covering_counts_covered)
+        bins_cov = (
+            np.arange(0.5, max_cov + 1.5, 1.0) if max_cov <= 200 else 30
+        )
+        ax_a.hist(covering_counts_covered, bins=bins_cov, edgecolor="black", alpha=0.85)
+        ax_a.set_xlabel("# matched checkpoints (before LR-thin)")
+        ax_a.set_ylabel("# covered samples")
+        ax_a.set_title(
+            f"Covered samples only (n={len(covering_counts_covered)}): "
+            "checkpoints matching history (±1)"
+        )
+
+        max_th = max(thinned_lens_covered)
+        bins_th = (
+            np.arange(-0.5, max_th + 1.5, 1.0)
+            if max_th <= 50
+            else max(10, max_th // 5)
+        )
+        ax_b.hist(thinned_lens_covered, bins=bins_th, edgecolor="black", alpha=0.85, color="C1")
+        ax_b.set_xlabel(f"# checkpoints after LR-thin (cap={tc})")
+        ax_b.set_ylabel("# covered samples")
+        ax_b.set_title("Same samples: count kept after per-sample LR-thinning")
+
+        covered_hist_path.parent.mkdir(parents=True, exist_ok=True)
+        fig_h.savefig(covered_hist_path, dpi=160)
+        plt.close(fig_h)
+        print(f"Wrote covered-sample histogram {covered_hist_path}")
+    elif covered_hist_path is not None and not covering_counts_covered:
+        print("Skipping covered-sample histogram: no covered samples", flush=True)
 
     return 0
 
