@@ -117,7 +117,8 @@ def main() -> None:
         description=(
             "Hypothetical union size: per train index, covering checkpoints LR-thinned "
             "to --max, then union. Default: all dataset indices that appear in batch history. "
-            "With --n-train-replay + pool + seed: same random subset as main_pipeline replay."
+            "With --n-train-replay + pool + seed: same random subset as main_pipeline replay. "
+            "Optional --appearance-minimum filters to samples with enough logged inclusions."
         )
     )
     p.add_argument("--rlvr-output", type=Path, required=True)
@@ -146,6 +147,15 @@ def main() -> None:
         type=int,
         default=None,
         help="Seed for rng.sample(range(pool), k); same as pipeline train_replay_subset_seed",
+    )
+    p.add_argument(
+        "--appearance-minimum",
+        type=int,
+        default=0,
+        help=(
+            "After replay/history selection, keep only samples whose total logged inclusions "
+            "(sum over CPs, same resolution as stats) is >= this. 0 = no filter."
+        ),
     )
     args = p.parse_args()
 
@@ -183,6 +193,26 @@ def main() -> None:
 
     if not train_indices:
         raise SystemExit("No train indices to process")
+
+    appear_min = max(0, int(args.appearance_minimum))
+    n_before_prefilter = len(train_indices)
+    if appear_min > 0:
+        kept: list[int] = []
+        for k in train_indices:
+            per_cp = inclusions_per_checkpoint(history, by_step, k)
+            if sum(per_cp.values()) >= appear_min:
+                kept.append(k)
+        train_indices = kept
+        print(
+            f"appearance_prefilter: total inclusions (resolved CPs) >= {appear_min} "
+            f"→ kept {len(train_indices)}/{n_before_prefilter}",
+            flush=True,
+        )
+    if not train_indices:
+        raise SystemExit(
+            f"No train indices left after --appearance-minimum={appear_min} "
+            f"(had {n_before_prefilter} before filter)"
+        )
 
     union: set[int] = set()
     totals_per_sample: list[int] = []
