@@ -55,6 +55,16 @@ class InfluenceAnalyzer:
     def train_solutions(self) -> list[str]:
         return [item.solution for item in self.manifest.train_samples]
 
+    def column_train_label(self, matrix_column: int) -> str:
+        ts = self.manifest.train_samples
+        if matrix_column < 0 or matrix_column >= len(ts):
+            return f"col {matrix_column}"
+        sample = ts[matrix_column]
+        di = getattr(sample, "dataset_train_index", None)
+        if di is not None:
+            return f"col{matrix_column} (dataset train_index={di})"
+        return f"col {matrix_column}"
+
     @property
     def has_eval_metrics(self) -> bool:
         return any(
@@ -301,6 +311,22 @@ class InfluenceAnalyzer:
 
     def build_report(self, top_k: int = 3, bottom_k: int = 0) -> str:
         lines = []
+        im = str(self.manifest.config.get("influence_mode", "")).lower()
+        if "historical" in im:
+            lines.append(
+                "Historical influence: each train column is scaled by that example's fraction of the "
+                "logged optimizer batch at each replayed checkpoint."
+            )
+            lines.append(
+                "With checkpoint thinning, a given training example usually does not appear in the "
+                "batch at most of those steps, so most columns stay exactly 0 — expected behavior, "
+                "not a failed TracIn/DataInf/Fisher calculation."
+            )
+            lines.append(
+                "For a dense counterfactual matrix without batch gating, use influence_mode=dense "
+                "(and re-run the pipeline)."
+            )
+            lines.append("")
         methods = ["TracIn", "DataInf"]
         if self.bundle.fisher_matrix is not None:
             methods.append("Fisher")
@@ -313,15 +339,17 @@ class InfluenceAnalyzer:
                 lines.append("")
                 lines.append(f"Test {test_idx}: {textwrap.shorten(prompt, width=100, placeholder='...')}")
                 for rank, entry in enumerate(self.topk(method, test_idx, top_k), start=1):
+                    slot = self.column_train_label(entry.train_index)
                     lines.append(
-                        f"  #{rank}  train {entry.train_index}: score={entry.score:+.3e}  | "
+                        f"  #{rank}  {slot}: score={entry.score:+.3e}  | "
                         f"{textwrap.shorten(entry.train_prompt, width=80, placeholder='...')}"
                     )
                 if bottom_k > 0:
                     lines.append(f"  Least-{bottom_k}:")
                     for entry in self.bottomk(method, test_idx, bottom_k):
+                        slot = self.column_train_label(entry.train_index)
                         lines.append(
-                            f"    train {entry.train_index}: score={entry.score:+.3e}  | "
+                            f"    {slot}: score={entry.score:+.3e}  | "
                             f"{textwrap.shorten(entry.train_prompt, width=80, placeholder='...')}"
                         )
 

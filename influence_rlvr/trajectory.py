@@ -38,6 +38,32 @@ import torch
 _CHECKPOINT_RE = re.compile(r"checkpoint-(\d+)$")
 _CHECKPOINT_SEED_STRIDE = 100000
 _TEST_SEED_OFFSET = 10000
+_HISTORY_STEP_FALLBACK_WARNED = False
+
+
+def _resolve_history_step_weight_info(
+    train_step_weight_lookup: dict[int, dict] | None,
+    checkpoint_step: int,
+) -> dict | None:
+    global _HISTORY_STEP_FALLBACK_WARNED
+    if train_step_weight_lookup is None:
+        return None
+    k = int(checkpoint_step)
+    if k in train_step_weight_lookup:
+        return train_step_weight_lookup[k]
+    for delta in (1, -1):
+        alt = k + delta
+        if alt in train_step_weight_lookup:
+            if not _HISTORY_STEP_FALLBACK_WARNED:
+                print(
+                    "Warning: historical_batch_history step ids did not match checkpoint "
+                    f"global_step (tried {k}; using {alt}). Align batch logging with "
+                    "checkpoint steps or regenerate historical_batch_history.json.",
+                    flush=True,
+                )
+                _HISTORY_STEP_FALLBACK_WARNED = True
+            return train_step_weight_lookup[alt]
+    return None
 
 
 def _progress_print(message, enabled):
@@ -783,10 +809,14 @@ def collect_checkpoint_infos(
         _progress_print(f"{prefix} collecting train gradients", progress)
         step_weight_info = None
         if train_step_weight_lookup is not None:
-            step_weight_info = train_step_weight_lookup.get(int(checkpoint["step"]))
+            step_weight_info = _resolve_history_step_weight_info(
+                train_step_weight_lookup,
+                int(checkpoint["step"]),
+            )
             if influence_mode == InfluenceMode.HISTORICAL and step_weight_info is None:
                 raise RuntimeError(
-                    f"Missing historical batch metadata for checkpoint step {checkpoint['step']}."
+                    f"Missing historical batch metadata for checkpoint step {checkpoint['step']} "
+                    "(no entry for that step or step±1)."
                 )
         train_infos, zero_train_cases = collect_train_infos(
             peft_model,

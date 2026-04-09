@@ -47,17 +47,21 @@ class SampleDescriptor:
     prompt_preview: str
     solution: str = ""
     prompt: Any = None
+    dataset_train_index: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SampleDescriptor":
+        raw = data.get("dataset_train_index")
+        dataset_train_index = int(raw) if raw is not None else None
         return cls(
             index=int(data["index"]),
             prompt_preview=data.get("prompt_preview", ""),
             solution=data.get("solution", ""),
             prompt=data.get("prompt"),
+            dataset_train_index=dataset_train_index,
         )
 
 

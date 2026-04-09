@@ -46,7 +46,7 @@ class HistoricalBatchGRPOTrainer(GRPOTrainer):
     def training_step(self, model, inputs, num_items_in_batch):
         loss = super().training_step(model, inputs, num_items_in_batch)
         if self.accelerator.sync_gradients:
-            self._finalize_historical_step(int(self.state.global_step) + 1)
+            self._finalize_historical_step(int(self.state.global_step))
         return loss
 
     def train(self, *args, **kwargs):

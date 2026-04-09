@@ -208,12 +208,20 @@ def build_checkpoint_summaries(checkpoint_infos: list[dict[str, Any]]) -> list[C
 def _build_sample_descriptors(infos: list[dict[str, Any]]) -> list[SampleDescriptor]:
     samples = []
     for index, info in enumerate(infos):
+        raw_ti = info.get("train_index")
+        dataset_train_index = None
+        if raw_ti is not None:
+            try:
+                dataset_train_index = int(raw_ti)
+            except (TypeError, ValueError):
+                dataset_train_index = None
         samples.append(
             SampleDescriptor(
                 index=index,
                 prompt_preview=prompt_preview(info.get("prompt")),
                 solution=solution_preview(info.get("solution")),
                 prompt=info.get("prompt"),
+                dataset_train_index=dataset_train_index,
             )
         )
     return samples
