@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""From rlvr training output only: per-sample covering checkpoints, LR-thin, union (no IF manifest)."""
+"""From rlvr training output: optional scan 0..P-1 by appearance, then replay sample, LR-thin, union."""
 
 from __future__ import annotations
 
@@ -47,6 +47,37 @@ def replay_train_indices(pool_size: int, n: int, subset_seed: int) -> list[int]:
         return []
     rng = random.Random(int(subset_seed))
     return sorted(rng.sample(range(int(pool_size)), k))
+
+
+def replay_train_indices_from_eligible(
+    eligible: list[int], n: int, subset_seed: int
+) -> list[int]:
+    if not eligible:
+        return []
+    k = min(int(n), len(eligible))
+    rng = random.Random(int(subset_seed))
+    return sorted(rng.sample(eligible, k))
+
+
+def total_inclusions_resolved(
+    history: list[tuple[int, dict[int, int]]],
+    by_step: dict[int, dict],
+    train_index: int,
+) -> int:
+    return sum(inclusions_per_checkpoint(history, by_step, train_index).values())
+
+
+def indices_in_pool_meeting_appearance_minimum(
+    history: list[tuple[int, dict[int, int]]],
+    by_step: dict[int, dict],
+    pool_size: int,
+    appear_min: int,
+) -> list[int]:
+    out: list[int] = []
+    for k in range(int(pool_size)):
+        if total_inclusions_resolved(history, by_step, k) >= appear_min:
+            out.append(k)
+    return out
 
 
 def schedule_by_step(rlvr: Path, lr: float) -> dict[int, dict]:
@@ -117,8 +148,8 @@ def main() -> None:
         description=(
             "Hypothetical union size: per train index, covering checkpoints LR-thinned "
             "to --max, then union. Default: all dataset indices that appear in batch history. "
-            "With --n-train-replay + pool + seed: same random subset as main_pipeline replay. "
-            "Optional --appearance-minimum filters to samples with enough logged inclusions."
+            "With --n-train-replay + pool + seed: random subset (from full pool, or from "
+            "appearance-filtered pool if --appearance-minimum > 0)."
         )
     )
     p.add_argument("--rlvr-output", type=Path, required=True)
@@ -140,7 +171,8 @@ def main() -> None:
         "--train-replay-pool-size",
         type=int,
         default=None,
-        help="Full train pool size (e.g. len(math train)); used with --n-train-replay",
+        help="Dataset train pool size P (indices 0..P-1, e.g. GSM8K). Required for "
+        "--n-train-replay and for --appearance-minimum.",
     )
     p.add_argument(
         "--train-replay-subset-seed",
@@ -153,8 +185,9 @@ def main() -> None:
         type=int,
         default=0,
         help=(
-            "After replay/history selection, keep only samples whose total logged inclusions "
-            "(sum over CPs, same resolution as stats) is >= this. 0 = no filter."
+            "First scan indices 0..P-1 (--train-replay-pool-size P); keep only those whose "
+            "total logged inclusions (resolved CPs) is >= this. Then --n-train-replay samples "
+            "from that eligible set (not from the full pool). 0 = skip this step."
         ),
     )
     args = p.parse_args()
@@ -177,12 +210,51 @@ def main() -> None:
     n_tr = args.n_train_replay
     pool = args.train_replay_pool_size
     sub_seed = args.train_replay_subset_seed
-    if (n_tr is not None) + (pool is not None) + (sub_seed is not None) not in (0, 3):
+    appear_min = max(0, int(args.appearance_minimum))
+
+    if appear_min > 0 and pool is None:
         raise SystemExit(
-            "Either pass all of --n-train-replay, --train-replay-pool-size, "
-            "--train-replay-subset-seed, or none of them (use all indices seen in history)."
+            "--appearance-minimum requires --train-replay-pool-size P "
+            "(scan dataset indices 0..P-1 first)"
         )
+
     if n_tr is not None:
+        if pool is None or sub_seed is None:
+            raise SystemExit(
+                "--n-train-replay requires --train-replay-pool-size and --train-replay-subset-seed"
+            )
+    elif appear_min == 0 and (pool is not None or sub_seed is not None):
+        raise SystemExit(
+            "Use --train-replay-pool-size / --train-replay-subset-seed only with "
+            "--n-train-replay, or set --appearance-minimum to scan a full pool first."
+        )
+
+    if appear_min > 0:
+        assert pool is not None
+        eligible = indices_in_pool_meeting_appearance_minimum(
+            history, by_step, pool, appear_min
+        )
+        print(
+            f"dataset_prefilter: indices in [0,{pool}) with resolved CP inclusions "
+            f">= {appear_min}: {len(eligible)}/{pool}",
+            flush=True,
+        )
+        if not eligible:
+            raise SystemExit("No dataset indices pass --appearance-minimum")
+        if n_tr is not None:
+            assert sub_seed is not None
+            train_indices = replay_train_indices_from_eligible(eligible, n_tr, sub_seed)
+            subset_note = (
+                f"replay n={len(train_indices)} (cap={n_tr}, seed={sub_seed}) "
+                f"sampled from {len(eligible)} eligible (after dataset prefilter)"
+            )
+        else:
+            train_indices = eligible
+            subset_note = (
+                f"all {len(eligible)} eligible indices in [0,{pool}) "
+                f"(appearance-minimum={appear_min})"
+            )
+    elif n_tr is not None:
         train_indices = replay_train_indices(pool, n_tr, sub_seed)
         subset_note = (
             f"replay subset n={len(train_indices)} (cap={n_tr}, pool={pool}, seed={sub_seed})"
@@ -193,26 +265,6 @@ def main() -> None:
 
     if not train_indices:
         raise SystemExit("No train indices to process")
-
-    appear_min = max(0, int(args.appearance_minimum))
-    n_before_prefilter = len(train_indices)
-    if appear_min > 0:
-        kept: list[int] = []
-        for k in train_indices:
-            per_cp = inclusions_per_checkpoint(history, by_step, k)
-            if sum(per_cp.values()) >= appear_min:
-                kept.append(k)
-        train_indices = kept
-        print(
-            f"appearance_prefilter: total inclusions (resolved CPs) >= {appear_min} "
-            f"→ kept {len(train_indices)}/{n_before_prefilter}",
-            flush=True,
-        )
-    if not train_indices:
-        raise SystemExit(
-            f"No train indices left after --appearance-minimum={appear_min} "
-            f"(had {n_before_prefilter} before filter)"
-        )
 
     union: set[int] = set()
     totals_per_sample: list[int] = []
