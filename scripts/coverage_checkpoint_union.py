@@ -12,7 +12,9 @@ Example (only rlvr-output required for full-history analysis):
     --plot figures/coverage_union.png \\
     --json-out figures/coverage_union.json
 
-Use --results-dir only to match train indices from a specific influence results bundle.
+Use --results-dir path/to/results1 to restrict to dataset_train_index from that bundle's
+results_manifest.json. JSON and stdout report: how many indices have ≥1 matched checkpoint,
+per-sample history step/inclusion counts from historical_batch_history, and checkpoint-thin stats.
 Learning rate: omitted -> run_config.json, else results_manifest, else trainer_state, else 5e-5.
 """
 
@@ -96,6 +98,19 @@ def _historical_steps_covering_index(steps: list[HistStep], train_index: int) ->
         if train_index in st.train_index_counts:
             out.append(int(st.step))
     return sorted(set(out))
+
+
+def _history_batch_stats_for_index(
+    steps: list[HistStep], train_index: int
+) -> tuple[int, int]:
+    distinct_steps = 0
+    total_inclusions = 0
+    for st in steps:
+        c = st.train_index_counts.get(train_index)
+        if c:
+            distinct_steps += 1
+            total_inclusions += int(c)
+    return distinct_steps, total_inclusions
 
 
 def _covering_checkpoint_list(
@@ -306,6 +321,7 @@ def main() -> int:
     explicit = _parse_train_indices(args.train_indices)
     if explicit:
         train_indices = explicit
+        train_indices_source = "cli_train_indices"
     elif args.results_dir:
         train_indices = _load_train_indices_from_results(results_resolved)
         if not train_indices:
@@ -313,6 +329,7 @@ def main() -> int:
                 f"No dataset_train_index in {results_resolved / RESULTS_MANIFEST_FILE}; "
                 "use --train-indices or regenerate results with a current pipeline."
             )
+        train_indices_source = str(results_resolved)
     elif args.replay_pool_size is not None and args.replay_n is not None:
         if args.replay_subset_seed is not None:
             sub_seed = int(args.replay_subset_seed)
@@ -325,8 +342,12 @@ def main() -> int:
         train_indices = _replay_subset_indices(
             args.replay_pool_size, args.replay_n, sub_seed
         )
+        train_indices_source = (
+            f"replay_subset(pool={args.replay_pool_size},n={args.replay_n},seed={sub_seed})"
+        )
     else:
         train_indices = _all_train_indices_from_history(hist_steps)
+        train_indices_source = f"all_from_{TRAIN_BATCH_HISTORY_FILE}"
         print(
             f"Using all {len(train_indices)} unique train indices from "
             f"{TRAIN_BATCH_HISTORY_FILE} (pass --results-dir or --train-indices to restrict).",
@@ -345,6 +366,7 @@ def main() -> int:
     scatter_y: list[float] = []
 
     for rank, k in enumerate(train_indices):
+        hist_steps_n, hist_inclusions = _history_batch_stats_for_index(hist_steps, k)
         covering = _covering_checkpoint_list(hist_steps, by_step, k)
         n_cov = len(covering)
         if not covering:
@@ -356,6 +378,8 @@ def main() -> int:
                 union_steps.add(s)
         per_sample[str(k)] = {
             "dataset_train_index": k,
+            "history_logged_steps_with_index": hist_steps_n,
+            "history_total_batch_inclusions": hist_inclusions,
             "covering_checkpoints": n_cov,
             "thinned_steps": thinned_steps,
         }
@@ -378,6 +402,7 @@ def main() -> int:
 
     out = {
         "rlvr_output": str(rlvr),
+        "train_indices_source": train_indices_source,
         "learning_rate": learning_rate,
         "learning_rate_source": learning_rate_source,
         "per_sample_target": tc,
@@ -399,6 +424,30 @@ def main() -> int:
                 "mean": float(np.mean(thinned_lens_covered)) if thinned_lens_covered else None,
             },
         },
+        "history_batch_stats_over_train_indices": {
+            "distinct_logged_steps_sum": int(
+                sum(v["history_logged_steps_with_index"] for v in per_sample.values())
+            ),
+            "total_batch_inclusions_sum": int(
+                sum(v["history_total_batch_inclusions"] for v in per_sample.values())
+            ),
+            "per_sample_means": {
+                "mean_logged_steps_with_index": float(
+                    np.mean(
+                        [v["history_logged_steps_with_index"] for v in per_sample.values()]
+                    )
+                )
+                if per_sample
+                else None,
+                "mean_batch_inclusions": float(
+                    np.mean(
+                        [v["history_total_batch_inclusions"] for v in per_sample.values()]
+                    )
+                )
+                if per_sample
+                else None,
+            },
+        },
     }
 
     if args.json_out:
@@ -407,11 +456,24 @@ def main() -> int:
         outp.write_text(json.dumps(out, indent=2))
         print(f"Wrote {outp}")
 
+    n_cov_only = len(covering_counts_covered)
     print(
-        f"Train indices: {len(train_indices)} | "
+        f"Train indices: {len(train_indices)} (source: {train_indices_source}) | "
+        f"covered (≥1 matched checkpoint): {n_cov_only} | "
         f"no covering checkpoint: {n_zero_cover} | "
         f"union size: {len(union_sorted)}"
     )
+    if per_sample:
+        hs = [v["history_logged_steps_with_index"] for v in per_sample.values()]
+        hi = [v["history_total_batch_inclusions"] for v in per_sample.values()]
+        print(
+            f"History (this index set): "
+            f"sum distinct logged steps with index={sum(hs)} | "
+            f"sum batch inclusions={sum(hi)} | "
+            f"mean logged steps/sample={float(np.mean(hs)):.2f} | "
+            f"mean inclusions/sample={float(np.mean(hi)):.2f}",
+            flush=True,
+        )
     if len(union_sorted) <= 64:
         print(f"Union steps: {union_sorted}")
     else:
