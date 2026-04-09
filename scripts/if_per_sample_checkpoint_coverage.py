@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Print how many unique train samples the IF run used, and plot train_index vs # checkpoints seen."""
+"""Train samples vs coverage in the IF replay checkpoint set (e.g. 50 LR-thinned steps from results_manifest)."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -72,6 +73,24 @@ def replay_subset(pool: int, n: int, seed: int) -> list[int]:
     return sorted(rng.sample(range(pool), k)) if k > 0 else []
 
 
+def if_replay_checkpoint_steps(results_dir: Path) -> list[int]:
+    path = results_dir / MANIFEST_FILE
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    data = json.loads(path.read_text())
+    cfg = data.get("config") or {}
+    raw = cfg.get("checkpoint_steps_replay")
+    if isinstance(raw, list) and raw:
+        return [int(x) for x in raw]
+    cps = data.get("checkpoints") or []
+    if cps:
+        return sorted({int(c["step"]) for c in cps if c.get("step") is not None})
+    raise SystemExit(
+        f"{path} has no config.checkpoint_steps_replay and no checkpoints[]; "
+        "cannot determine IF replay steps."
+    )
+
+
 def train_indices_from_manifest(results_dir: Path) -> list[int]:
     path = results_dir / MANIFEST_FILE
     if not path.is_file():
@@ -99,7 +118,16 @@ def train_indices_from_manifest(results_dir: Path) -> list[int]:
     return inferred if len(inferred) == n else []
 
 
-def infer_lr(rlvr: Path) -> float:
+def infer_lr(rlvr: Path, results_dir: Path | None = None) -> float:
+    if results_dir is not None:
+        rm = results_dir / MANIFEST_FILE
+        if rm.is_file():
+            try:
+                cfg = json.loads(rm.read_text()).get("config") or {}
+                if cfg.get("learning_rate") is not None:
+                    return float(cfg["learning_rate"])
+            except (json.JSONDecodeError, TypeError, ValueError, OSError):
+                pass
     rc = rlvr / RUN_CONFIG
     if rc.is_file():
         try:
@@ -126,7 +154,14 @@ def main() -> None:
 
     rlvr = args.rlvr_output.expanduser().resolve()
     results_dir = args.results_dir.expanduser().resolve()
-    lr = float(args.learning_rate) if args.learning_rate is not None else infer_lr(rlvr)
+    lr = (
+        float(args.learning_rate)
+        if args.learning_rate is not None
+        else infer_lr(rlvr, results_dir)
+    )
+
+    if_steps = if_replay_checkpoint_steps(results_dir)
+    if_step_set = set(if_steps)
 
     history = load_history(rlvr)
     if not history:
@@ -143,24 +178,39 @@ def main() -> None:
         )
 
     n_unique = len(train_indices)
+    n_if_ckpt = len(if_steps)
     xs: list[int] = []
     ys: list[int] = []
+    n_covered = 0
     for k in train_indices:
-        steps = covering_checkpoint_steps(history, by_step, k)
+        all_cp = covering_checkpoint_steps(history, by_step, k)
+        steps = [s for s in all_cp if s in if_step_set]
         xs.append(k)
         ys.append(len(steps))
+        if steps:
+            n_covered += 1
 
-    print(f"Unique train samples in this IF run: {n_unique}")
-    print(f"(from {results_dir / MANIFEST_FILE})")
+    pct = 100.0 * n_covered / n_unique if n_unique else 0.0
+    print(f"IF replay checkpoints (from manifest): {n_if_ckpt}")
+    print(f"Train samples in this IF run: {n_unique} ({results_dir / MANIFEST_FILE})")
+    print(
+        f"Train samples with ≥1 IF replay checkpoint in batch history: "
+        f"{n_covered} / {n_unique} ({pct:.1f}%)"
+    )
 
     if args.plot:
         fig, ax = plt.subplots(figsize=(12, 4), constrained_layout=True)
         ax.scatter(xs, ys, s=12, alpha=0.7)
         ax.set_xlabel("Train sample index (dataset)")
-        ax.set_ylabel("Checkpoints where sample appeared in batch history")
-        ax.set_title(
-            f"Per-sample checkpoint coverage (learning_rate={lr:g}, n_samples={n_unique})"
+        ax.set_ylabel(
+            f"IF replay checkpoints (of {n_if_ckpt}) where sample appeared in logged batches"
         )
+        ax.set_title(
+            f"Coverage in IF checkpoint set (lr={lr:g}, n_train={n_unique}, "
+            f"covered={n_covered})"
+        )
+        ax.set_ylim(bottom=-0.05)
+        ax.yaxis.set_major_locator(MaxNLocator(integer=True))
         outp = args.plot.expanduser().resolve()
         outp.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(outp, dpi=160)
