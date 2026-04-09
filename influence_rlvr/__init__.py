@@ -34,11 +34,13 @@ from .rewards import (
     accuracy_reward_func,
     mbpp_execution_reward_func,
 )
-from .trajectory import (
+from .checkpoint_schedule import (
+    build_checkpoint_schedule,
     checkpoint_step,
     list_checkpoint_dirs,
-    build_checkpoint_schedule,
     thin_checkpoint_schedule,
+)
+from .trajectory import (
     load_adapter_checkpoint,
     ensure_reference_adapter,
     collect_test_infos,
