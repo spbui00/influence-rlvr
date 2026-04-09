@@ -31,6 +31,7 @@ from influence_rlvr import (
     TrajectoryTracInInfluence,
     accuracy_reward_func,
     build_checkpoint_schedule,
+    build_influence_checkpoint_schedule_per_sample_union,
     clear_cache,
     collect_checkpoint_infos,
     detect_device,
@@ -125,9 +126,14 @@ SKIP_TRAINING = True
 ENABLE_GRAD_CACHE = True
 RESULTS_REUSE_POLICY = "ask"
 
+APPEARANCE_MINIMUM = 10
+CHECKPOINT_THINNING_PER_SAMPLE = CheckpointThinningConfig(
+    mode=CheckpointThinningMode.LEARNING_RATE,
+    target_count=20,
+)
 CHECKPOINT_THINNING = CheckpointThinningConfig(
     mode=CheckpointThinningMode.LEARNING_RATE,
-    target_count=50
+    target_count=50,
 )
 
 _TRAINING_SCRIPT_MATH_FORMAT_SUFFIX = (
@@ -523,13 +529,20 @@ def _pipeline_main():
         if TRAIN_REPLAY_SUBSET_SEED is not None
         else (TRAIN_GRAD_SEED + 902891)
     )
-    if N_TRAIN_REPLAY > 0:
-        k = min(N_TRAIN_REPLAY, train_replay_pool_size)
-        if k < train_replay_pool_size:
-            rng = random.Random(train_replay_subset_seed_resolved)
-            indices = sorted(rng.sample(range(train_replay_pool_size), k))
-            replay_train_dataset = replay_train_dataset.select(indices)
-    train_replay_effective_n = len(replay_train_dataset)
+    defer_replay_to_if_union = (
+        INFLUENCE_MODE == InfluenceMode.HISTORICAL
+        and EXPERIMENT_MODE != ExperimentMode.BASE_EVAL
+    )
+    if not defer_replay_to_if_union:
+        if N_TRAIN_REPLAY > 0:
+            k = min(N_TRAIN_REPLAY, train_replay_pool_size)
+            if k < train_replay_pool_size:
+                rng = random.Random(train_replay_subset_seed_resolved)
+                indices = sorted(rng.sample(range(train_replay_pool_size), k))
+                replay_train_dataset = replay_train_dataset.select(indices)
+        train_replay_effective_n = len(replay_train_dataset)
+    else:
+        train_replay_effective_n = None
     test_domain = "Code"
 
     print(f"  RL train ({training_domain}): {len(training_dataset)} samples")
@@ -539,10 +552,17 @@ def _pipeline_main():
         print(f"  Held-out math eval ({MATH_EVAL_SPLIT}): {len(math_eval_dataset)} samples")
     if code_eval_dataset is not None:
         print(f"  Held-out code eval ({CODE_EVAL_SPLIT}): {len(code_eval_dataset)} samples")
-    print(
-        f"  Replay train subset: {train_replay_effective_n}/{train_replay_pool_size} "
-        f"(cap={N_TRAIN_REPLAY}, seed={train_replay_subset_seed_resolved})"
-    )
+    if defer_replay_to_if_union:
+        print(
+            f"  Replay train subset: deferred until IF checkpoint union "
+            f"(appearance_min={APPEARANCE_MINIMUM}, cap={N_TRAIN_REPLAY}, "
+            f"seed={train_replay_subset_seed_resolved})"
+        )
+    else:
+        print(
+            f"  Replay train subset: {train_replay_effective_n}/{train_replay_pool_size} "
+            f"(cap={N_TRAIN_REPLAY}, seed={train_replay_subset_seed_resolved})"
+        )
 
 
     # ═══════════════════════════════════════════════════════════════════════════════
@@ -632,15 +652,6 @@ def _pipeline_main():
     for cp in checkpoint_schedule_full:
         print(f"  step {cp['step']:>3d}  lr={cp['learning_rate']:.6e}")
 
-    checkpoint_schedule = thin_checkpoint_schedule(
-        checkpoint_schedule_full,
-        CHECKPOINT_THINNING,
-        log=True,
-    )
-
-    if GRPO_BETA != 0.0:
-        ensure_reference_adapter(model)
-
     effective_influence_mode = INFLUENCE_MODE
     if EXPERIMENT_MODE == ExperimentMode.BASE_EVAL and INFLUENCE_MODE == InfluenceMode.HISTORICAL:
         print(
@@ -652,6 +663,7 @@ def _pipeline_main():
     batch_history_manifest = None
     batch_weight_lookup = None
     batch_history_fingerprint = None
+
     if effective_influence_mode == InfluenceMode.HISTORICAL:
         batch_history_manifest = load_batch_history(OUTPUT_DIR)
         if batch_history_manifest is None:
@@ -672,8 +684,35 @@ def _pipeline_main():
             "microbatch_count": 0,
             "weights": {},
         }
+        checkpoint_schedule, train_replay_indices = (
+            build_influence_checkpoint_schedule_per_sample_union(
+                OUTPUT_DIR,
+                LEARNING_RATE,
+                pool_size=train_replay_pool_size,
+                appearance_minimum=APPEARANCE_MINIMUM,
+                n_train_replay=N_TRAIN_REPLAY,
+                train_replay_subset_seed=train_replay_subset_seed_resolved,
+                per_sample_thinning=CHECKPOINT_THINNING_PER_SAMPLE,
+                log=True,
+            )
+        )
+        replay_train_dataset = training_dataset.select(train_replay_indices)
+        train_replay_effective_n = len(replay_train_dataset)
+        print(
+            f"  Replay train subset (IF union): {train_replay_effective_n}/"
+            f"{train_replay_pool_size} (cap={N_TRAIN_REPLAY}, "
+            f"seed={train_replay_subset_seed_resolved})"
+        )
     else:
+        checkpoint_schedule = thin_checkpoint_schedule(
+            checkpoint_schedule_full,
+            CHECKPOINT_THINNING,
+            log=True,
+        )
         print("Using dense counterfactual influence mode.")
+
+    if GRPO_BETA != 0.0:
+        ensure_reference_adapter(model)
 
 
     def build_math_reward_fns(sample, num_generations):
@@ -737,7 +776,21 @@ def _pipeline_main():
         **CODE_EVAL_CONFIG.to_config_dict(),
         **REPLAY_GRADIENT_CONFIG.to_config_dict(),
         **VLLM_CONFIG.to_config_dict(),
-        **CHECKPOINT_THINNING.to_config_dict(),
+        **(
+            CHECKPOINT_THINNING_PER_SAMPLE.to_config_dict()
+            if effective_influence_mode == InfluenceMode.HISTORICAL
+            else CHECKPOINT_THINNING.to_config_dict()
+        ),
+        "appearance_minimum": (
+            APPEARANCE_MINIMUM
+            if effective_influence_mode == InfluenceMode.HISTORICAL
+            else None
+        ),
+        "if_checkpoint_schedule": (
+            "per_sample_union"
+            if effective_influence_mode == InfluenceMode.HISTORICAL
+            else "global_thinning"
+        ),
         "lambda_damp": LAMBDA_DAMP,
         "train_grad_seed": TRAIN_GRAD_SEED,
         "device": str(DEVICE),
@@ -799,7 +852,21 @@ def _pipeline_main():
         **CODE_EVAL_CONFIG.to_config_dict(),
         **REPLAY_GRADIENT_CONFIG.to_config_dict(),
         **VLLM_CONFIG.to_config_dict(),
-        **CHECKPOINT_THINNING.to_config_dict(),
+        **(
+            CHECKPOINT_THINNING_PER_SAMPLE.to_config_dict()
+            if effective_influence_mode == InfluenceMode.HISTORICAL
+            else CHECKPOINT_THINNING.to_config_dict()
+        ),
+        "appearance_minimum": (
+            APPEARANCE_MINIMUM
+            if effective_influence_mode == InfluenceMode.HISTORICAL
+            else None
+        ),
+        "if_checkpoint_schedule": (
+            "per_sample_union"
+            if effective_influence_mode == InfluenceMode.HISTORICAL
+            else "global_thinning"
+        ),
         "train_grad_seed": TRAIN_GRAD_SEED,
         "batch_history_fingerprint": batch_history_fingerprint,
         "train_domain": training_domain,

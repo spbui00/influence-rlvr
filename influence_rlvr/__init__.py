@@ -36,6 +36,7 @@ from .rewards import (
 )
 from .checkpoint_schedule import (
     build_checkpoint_schedule,
+    build_influence_checkpoint_schedule_per_sample_union,
     checkpoint_step,
     list_checkpoint_dirs,
     thin_checkpoint_schedule,
@@ -82,6 +83,7 @@ __all__ = [
     "checkpoint_step",
     "list_checkpoint_dirs",
     "build_checkpoint_schedule",
+    "build_influence_checkpoint_schedule_per_sample_union",
     "thin_checkpoint_schedule",
     "load_adapter_checkpoint",
     "ensure_reference_adapter",

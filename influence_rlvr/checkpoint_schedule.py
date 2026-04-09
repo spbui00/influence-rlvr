@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import random
 import re
 import sys
 from pathlib import Path
@@ -281,3 +282,162 @@ def thin_checkpoint_schedule(
                 flush=True,
             )
     return thinned
+
+
+_HIST_BATCH_FILE = "historical_batch_history.json"
+
+
+def load_historical_batch_history_steps(output_dir: str | Path) -> list[tuple[int, dict[int, int]]]:
+    path = os.path.join(str(output_dir), _HIST_BATCH_FILE)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Missing batch history: {path}")
+    data = _load_json(path)
+    out: list[tuple[int, dict[int, int]]] = []
+    for item in data.get("steps", []):
+        tic = item.get("train_index_counts") or {}
+        counts = {int(k): int(v) for k, v in tic.items()}
+        out.append((int(item["step"]), counts))
+    return out
+
+
+def _schedule_by_step_map(schedule: list[dict]) -> dict[int, dict]:
+    return {int(cp["step"]): cp for cp in schedule}
+
+
+def _resolve_ckpt_for_history_step(
+    by_step: dict[int, dict], hist_step: int
+) -> dict | None:
+    if hist_step in by_step:
+        return by_step[hist_step]
+    if hist_step + 1 in by_step:
+        return by_step[hist_step + 1]
+    if hist_step - 1 in by_step:
+        return by_step[hist_step - 1]
+    return None
+
+
+def _inclusions_per_checkpoint(
+    history: list[tuple[int, dict[int, int]]],
+    by_step: dict[int, dict],
+    train_index: int,
+) -> dict[int, int]:
+    per_cp: dict[int, int] = {}
+    for step, counts in history:
+        c = counts.get(train_index, 0)
+        if not c:
+            continue
+        cp = _resolve_ckpt_for_history_step(by_step, step)
+        if cp is None:
+            continue
+        sid = int(cp["step"])
+        per_cp[sid] = per_cp.get(sid, 0) + c
+    return per_cp
+
+
+def _total_inclusions_resolved(
+    history: list[tuple[int, dict[int, int]]],
+    by_step: dict[int, dict],
+    train_index: int,
+) -> int:
+    return sum(_inclusions_per_checkpoint(history, by_step, train_index).values())
+
+
+def _covering_checkpoint_entries(
+    history: list[tuple[int, dict[int, int]]],
+    by_step: dict[int, dict],
+    train_index: int,
+) -> list[dict]:
+    seen: dict[int, dict] = {}
+    for step, counts in history:
+        if train_index not in counts:
+            continue
+        cp = _resolve_ckpt_for_history_step(by_step, step)
+        if cp is None:
+            continue
+        sid = int(cp["step"])
+        if sid not in seen:
+            seen[sid] = cp
+    return [seen[k] for k in sorted(seen.keys())]
+
+
+def _indices_meeting_appearance_minimum(
+    history: list[tuple[int, dict[int, int]]],
+    by_step: dict[int, dict],
+    pool_size: int,
+    appearance_minimum: int,
+) -> list[int]:
+    out: list[int] = []
+    for k in range(int(pool_size)):
+        if _total_inclusions_resolved(history, by_step, k) >= appearance_minimum:
+            out.append(k)
+    return out
+
+
+def build_influence_checkpoint_schedule_per_sample_union(
+    output_dir: str | Path,
+    default_learning_rate: float,
+    *,
+    pool_size: int,
+    appearance_minimum: int,
+    n_train_replay: int,
+    train_replay_subset_seed: int,
+    per_sample_thinning: CheckpointThinningConfig,
+    log: bool = True,
+) -> tuple[list[dict], list[int]]:
+    full_schedule = build_checkpoint_schedule(str(output_dir), default_learning_rate)
+    if not full_schedule:
+        raise ValueError(f"No checkpoints under {output_dir}")
+    history = load_historical_batch_history_steps(output_dir)
+    if not history:
+        raise ValueError("historical_batch_history.json has no steps")
+    by_step = _schedule_by_step_map(full_schedule)
+
+    amin = int(appearance_minimum)
+    if amin <= 0:
+        eligible = list(range(int(pool_size)))
+    else:
+        eligible = _indices_meeting_appearance_minimum(
+            history, by_step, pool_size, amin
+        )
+
+    if not eligible:
+        raise ValueError(
+            f"No train indices in [0,{pool_size}) meet appearance_minimum={amin}"
+        )
+
+    n_cap = int(n_train_replay)
+    if n_cap <= 0:
+        train_indices = list(eligible)
+    else:
+        k_take = min(n_cap, len(eligible))
+        rng = random.Random(int(train_replay_subset_seed))
+        train_indices = sorted(rng.sample(eligible, k_take))
+
+    union_by_step: dict[int, dict] = {}
+    for k in train_indices:
+        cov = _covering_checkpoint_entries(history, by_step, k)
+        thinned = thin_checkpoint_schedule(
+            cov, per_sample_thinning, log=False
+        )
+        for cp in thinned:
+            union_by_step[int(cp["step"])] = cp
+
+    result = sorted(union_by_step.values(), key=lambda item: item["step"])
+
+    if log:
+        print(
+            f"IF checkpoint schedule (per-sample union): pool={pool_size}, "
+            f"appearance_minimum={amin}, eligible={len(eligible)}, "
+            f"replay_indices={len(train_indices)}, union={len(result)} checkpoints",
+            flush=True,
+        )
+        steps = [cp["step"] for cp in result]
+        if len(steps) <= 48:
+            print(f"  union steps: {steps}", flush=True)
+        else:
+            print(
+                f"  union steps: first 16 {steps[:16]} … last 8 {steps[-8:]}",
+                flush=True,
+            )
+
+    return result, train_indices
