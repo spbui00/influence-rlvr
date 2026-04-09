@@ -5,13 +5,15 @@ LR-thin that sub-schedule to a fixed target count, then union across all samples
 
 Loads influence_rlvr/checkpoint_schedule.py via importlib (no full package import).
 
-Example:
+Example (only rlvr-output required for full-history analysis):
   uv run python scripts/coverage_checkpoint_union.py \\
     --rlvr-output outputs/run7/rlvr-output \\
-    --results-dir outputs/run7/results1 \\
     --per-sample-target 20 \\
     --plot figures/coverage_union.png \\
     --json-out figures/coverage_union.json
+
+Use --results-dir only to match train indices from a specific influence results bundle.
+Learning rate: omitted -> run_config.json, else results_manifest, else trainer_state, else 5e-5.
 """
 
 from __future__ import annotations
@@ -139,6 +141,13 @@ def _replay_subset_indices(pool_size: int, n: int, subset_seed: int) -> list[int
     return sorted(rng.sample(range(int(pool_size)), k))
 
 
+def _all_train_indices_from_history(hist_steps: list[HistStep]) -> list[int]:
+    seen: set[int] = set()
+    for st in hist_steps:
+        seen.update(st.train_index_counts.keys())
+    return sorted(seen)
+
+
 def _infer_learning_rate(
     rlvr: Path, results_dir: Path | None
 ) -> tuple[float, str]:
@@ -206,7 +215,11 @@ def main() -> int:
         "--results-dir",
         type=Path,
         default=None,
-        help=f"Results dir with {RESULTS_MANIFEST_FILE} (dataset_train_index per train row)",
+        help=(
+            f"Optional: restrict to train indices from {RESULTS_MANIFEST_FILE} "
+            "(same replay subset as an influence run). If you omit this, --train-indices, "
+            "and replay-subset args, every index seen in historical_batch_history is used."
+        ),
     )
     p.add_argument(
         "--train-indices",
@@ -303,9 +316,11 @@ def main() -> int:
             args.replay_pool_size, args.replay_n, sub_seed
         )
     else:
-        raise SystemExit(
-            "Provide one of: --train-indices, --results-dir, or "
-            "(--replay-pool-size and --replay-n with seed)"
+        train_indices = _all_train_indices_from_history(hist_steps)
+        print(
+            f"Using all {len(train_indices)} unique train indices from "
+            f"{TRAIN_BATCH_HISTORY_FILE} (pass --results-dir or --train-indices to restrict).",
+            flush=True,
         )
 
     tc = max(1, int(args.per_sample_target))
