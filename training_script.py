@@ -26,6 +26,8 @@ from influence_rlvr.prompts import (
     extract_gsm8k_target,
 )
 from influence_rlvr.rewards import (
+    _DEFAULT_MBPP_TIMEOUT_SECONDS,
+    _mbpp_best_reward_for_response,
     extract_math_final_answer,
     format_guardrail_reward_func,
     math_answer_equivalence_key,
@@ -33,7 +35,7 @@ from influence_rlvr.rewards import (
     mixed_math_accuracy_grpo_reward,
     mixed_code_execution_grpo_reward,
 )
-from influence_rlvr.taco_convert import load_tac_mbpp_slice
+from influence_rlvr.taco_convert import load_tac_mbpp_slice, tac_try_convert_row
 
 
 NUMINA_DATASET = "AI-MO/NuminaMath-CoT"
@@ -167,7 +169,7 @@ def run_gsm8k_eval(
     n = args.eval_examples
     if n <= 0:
         return
-    split = f"test[:{n}]"
+    split = f"train[:{n}]"
     title = (
         "Baseline eval (before GRPO)"
         if phase == "baseline"
@@ -180,7 +182,7 @@ def run_gsm8k_eval(
         else f"majority vote ({n_votes} samples, T={args.eval_temperature}, top_p={args.eval_top_p})"
     )
     print("\n" + "=" * 80)
-    print(f"{title} — GSM8K {split}, {dec}")
+    print(f"{title} — GSM8K {split} (train split; no GSM8K test), {dec}")
     print("=" * 80)
     eval_ds = load_dataset("openai/gsm8k", "main", split=split)
     acc_scores = []
@@ -222,6 +224,7 @@ def run_gsm8k_eval(
     summary_path = args.output_dir.resolve() / summary_filename
     payload = {
         "phase": phase,
+        "dataset": "gsm8k_train",
         "split": split,
         "mean_accuracy_reward": mean_acc,
         "metadata": _eval_metadata(args, split),
@@ -250,6 +253,223 @@ def run_gsm8k_eval(
         if n_votes > 1 and r.get("majority_vote_counts") is not None:
             print(f"majority_vote_counts={r['majority_vote_counts']}")
         print(f"--- question ---\n{r['question']}\n--- response ---\n{r['response']}\n")
+
+
+def _list_tac_test_arrow_uris() -> list[str]:
+    try:
+        from huggingface_hub import HfFileSystem
+
+        fs = HfFileSystem()
+        paths = sorted(fs.glob("datasets/BAAI/TACO/test/*.arrow"))
+        return [f"hf://{p}" for p in paths]
+    except Exception:
+        return []
+
+
+def load_tac_eval_rows(n_tac: int) -> tuple[list[dict], int, int]:
+    if n_tac <= 0:
+        return [], 0, 0
+    rows: list[dict] = []
+    scanned = 0
+    uris = _list_tac_test_arrow_uris()
+    if not uris:
+        uris = ["hf://datasets/BAAI/TACO/test/data-00000-of-00001.arrow"]
+    for uri in uris:
+        if len(rows) >= n_tac:
+            break
+        try:
+            ds = load_dataset("arrow", data_files=uri, split="train")
+        except Exception:
+            continue
+        for i in range(len(ds)):
+            if len(rows) >= n_tac:
+                break
+            scanned += 1
+            converted = tac_try_convert_row(ds[i])
+            if converted is None:
+                continue
+            rows.append(converted)
+    return rows, scanned, len(rows)
+
+
+def run_numina_test_eval(
+    model,
+    tokenizer,
+    device,
+    args,
+    *,
+    phase: str,
+    summary_filename: str,
+) -> None:
+    n = args.eval_examples
+    if n <= 0:
+        return
+    split = f"train[:{n}]"
+    test_parquet = (
+        f"hf://datasets/{args.numina_dataset}/data/test-00000-of-00001.parquet"
+    )
+    try:
+        eval_ds = load_dataset("parquet", data_files=test_parquet, split=split)
+    except Exception as exc:
+        print(f"\n[eval] Numina test load failed ({exc}); skipping.")
+        return
+    title = "Baseline eval (before GRPO)" if phase == "baseline" else "Post-training eval"
+    print("\n" + "=" * 80)
+    print(f"{title} — NuminaMath-CoT {split} (test parquet), greedy")
+    print("=" * 80)
+    acc_scores = []
+    rows = []
+    for i, ex in enumerate(eval_ds):
+        gold = extract_math_final_answer(ex.get("solution") or "") or ""
+        if not str(gold).strip():
+            continue
+        messages = _build_training_script_math_prompt(ex["problem"])
+        completion_texts = _generate_eval_completions(
+            model,
+            tokenizer,
+            messages,
+            device=device,
+            max_new_tokens=args.eval_max_new_tokens,
+            num_sequences=1,
+            temperature=0.0,
+            top_p=1.0,
+        )
+        c = _as_completion(completion_texts[0])
+        a = accuracy_reward_func(c, [gold])[0]
+        acc_scores.append(a)
+        rows.append({
+            "index": i,
+            "gold": gold,
+            "accuracy_reward": a,
+            "response": completion_texts[0],
+            "problem": ex["problem"],
+        })
+    if not acc_scores:
+        print("  No rows with extractable gold; skipping summary.")
+        return
+    mean_acc = sum(acc_scores) / len(acc_scores)
+    print(f"  mean accuracy_reward: {mean_acc:.4f} (n={len(acc_scores)})")
+    summary_path = args.output_dir.resolve() / summary_filename
+    summary_path.write_text(
+        json.dumps(
+            {
+                "phase": phase,
+                "dataset": "numina_test",
+                "split": split,
+                "mean_accuracy_reward": mean_acc,
+                "n_scored": len(acc_scores),
+                "metadata": _eval_metadata(args, split),
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    print(f"  Wrote {summary_path}")
+
+
+def run_tac_test_eval(
+    model,
+    tokenizer,
+    device,
+    args,
+    *,
+    phase: str,
+    summary_filename: str,
+) -> None:
+    n = args.eval_examples
+    if n <= 0:
+        return
+    rows, scanned, kept = load_tac_eval_rows(n)
+    title = "Baseline eval (before GRPO)" if phase == "baseline" else "Post-training eval"
+    print("\n" + "=" * 80)
+    print(
+        f"{title} — TACO test (exec reward), greedy | "
+        f"kept {kept} / scanned {scanned} (target {n})"
+    )
+    print("=" * 80)
+    if not rows:
+        print("  No convertible TACO test rows; skipping.")
+        return
+    rewards = []
+    for i, row in enumerate(rows):
+        completion_texts = _generate_eval_completions(
+            model,
+            tokenizer,
+            row["prompt"],
+            device=device,
+            max_new_tokens=args.eval_max_new_tokens,
+            num_sequences=1,
+            temperature=0.0,
+            top_p=1.0,
+        )
+        ctl = row.get("challenge_test_list") or []
+        r, _ = _mbpp_best_reward_for_response(
+            completion_texts[0],
+            row["test_list"],
+            row["test_setup_code"] or "",
+            ctl if ctl is not None else [],
+            timeout_seconds=_DEFAULT_MBPP_TIMEOUT_SECONDS,
+        )
+        rewards.append(r)
+    mean_r = sum(rewards) / len(rewards)
+    print(f"  mean execution reward: {mean_r:.4f} (n={len(rewards)})")
+    summary_path = args.output_dir.resolve() / summary_filename
+    summary_path.write_text(
+        json.dumps(
+            {
+                "phase": phase,
+                "dataset": "taco_test",
+                "mean_execution_reward": mean_r,
+                "n_scored": len(rewards),
+                "n_target": n,
+                "scanned_raw": scanned,
+                "metadata": _eval_metadata(args, f"taco_test[:{n}]"),
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    print(f"  Wrote {summary_path}")
+
+
+def run_all_non_skip_evals(
+    model,
+    tokenizer,
+    device,
+    args,
+    *,
+    phase: str,
+) -> None:
+    if args.eval_examples <= 0:
+        print("\n[eval] --eval-examples <= 0; skipping all evals.")
+        return
+    tag = "baseline" if phase == "baseline" else "after_train"
+    if args.mixed:
+        run_numina_test_eval(
+            model,
+            tokenizer,
+            device,
+            args,
+            phase=phase,
+            summary_filename=f"eval_{tag}_numina_test.json",
+        )
+        run_tac_test_eval(
+            model,
+            tokenizer,
+            device,
+            args,
+            phase=phase,
+            summary_filename=f"eval_{tag}_taco_test.json",
+        )
+    else:
+        run_gsm8k_eval(
+            model,
+            tokenizer,
+            device,
+            args,
+            phase=phase,
+            summary_filename=f"eval_{tag}.json",
+        )
 
 
 def save_base_checkpoint(peft_model, tokenizer_obj, output_dir: Path) -> Path:
@@ -343,8 +563,11 @@ vLLM modes: 'colocate' runs vLLM in-process on the training GPU(s).
 'server' expects a TRL vLLM server (see `trl vllm-serve`).
 Use --hf to use transformers generate only.
 
-Multi-seed + significance: use different --seed and --output-dir per run, full test
-eval (--eval-examples 1319), then aggregate:
+Unless --skip-eval: eval only on training-aligned data (no openai/gsm8k test split).
+  Default: GSM8K train[:N]. With --mixed: Numina test parquet + TACO test (each capped by --eval-examples).
+
+Multi-seed + significance: use different --seed and --output-dir per run, large
+train-slice eval (--eval-examples 1319), then aggregate:
   python scripts/compare_gsm8k_eval.py --run-dir outputs/your_run/rlvr-output
   python scripts/compare_gsm8k_eval.py --multi-run 'outputs/nemotron_math_s*/rlvr-output'
 
@@ -516,13 +739,19 @@ def parse_args():
     p.add_argument(
         "--skip-eval",
         action="store_true",
-        help="Skip GSM8K test eval (no baseline before train, no eval after train).",
+        help=(
+            "Skip benchmark evals (no baseline before train, none after). "
+            "When eval is enabled: GSM8K train[:N] for default mode; with --mixed, "
+            "Numina test parquet + TACO test only. Each uses up to --eval-examples rows."
+        ),
     )
     p.add_argument(
         "--eval-examples",
         type=int,
         default=32,
-        help="GSM8K test rows (from the start) for baseline + post-train metrics.",
+        help=(
+            "Per-benchmark row cap (from the start of each split) for baseline + post-train metrics."
+        ),
     )
     p.add_argument(
         "--inspect-examples",
@@ -534,15 +763,15 @@ def parse_args():
         "--eval-max-new-tokens",
         type=int,
         default=1024,
-        help="Max new tokens per GSM8K eval completion.",
+        help="Max new tokens per eval completion (all benchmarks).",
     )
     p.add_argument(
         "--eval-majority-votes",
         type=int,
         default=16,
         help=(
-            "GSM8K eval: number of sampled completions per question (self-consistency / majority vote). "
-            "Use 1 for single greedy decode (legacy)."
+            "GSM8K train eval (default mode): sampled completions per question (majority vote). "
+            "Use 1 for greedy decode. Ignored for --mixed evals."
         ),
     )
     p.add_argument(
@@ -623,13 +852,12 @@ def main():
     save_base_checkpoint(model, tokenizer, out)
 
     if not args.skip_eval:
-        run_gsm8k_eval(
+        run_all_non_skip_evals(
             model,
             tokenizer,
             device,
             args,
             phase="baseline",
-            summary_filename="eval_baseline.json",
         )
 
     if args.mixed:
@@ -706,13 +934,12 @@ def main():
     clear_cache(device)
 
     if not args.skip_eval:
-        run_gsm8k_eval(
+        run_all_non_skip_evals(
             model,
             tokenizer,
             device,
             args,
             phase="after_train",
-            summary_filename="eval_after_train.json",
         )
 
 
