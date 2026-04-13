@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import sys
 from typing import Any
+
+if hasattr(sys, "set_int_max_str_digits"):
+    sys.set_int_max_str_digits(0)
 
 from datasets import Dataset, load_dataset
 
