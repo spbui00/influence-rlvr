@@ -229,9 +229,27 @@ def _build_sample_descriptors(infos: list[dict[str, Any]]) -> list[SampleDescrip
 
 def _build_matrix_manifest(
     tracin_breakdown: list[dict[str, Any]],
-    datainf_breakdown: list[dict[str, Any]],
+    datainf_breakdown: list[dict[str, Any]] | None,
     fisher_breakdown: list[dict[str, Any]] | None = None,
 ) -> MatrixManifest:
+    if datainf_breakdown is None:
+        return MatrixManifest(
+            tracin=TRACIN_MATRIX_FILE,
+            datainf=None,
+            fisher=FISHER_MATRIX_FILE if fisher_breakdown is not None else None,
+            tracin_steps={
+                str(entry["step"]): f"tracin_step_{entry['step']}.npy"
+                for entry in tracin_breakdown
+            },
+            datainf_steps={},
+            fisher_steps=(
+                {
+                    str(entry["step"]): f"fisher_step_{entry['step']}.npy"
+                    for entry in fisher_breakdown
+                }
+                if fisher_breakdown is not None else {}
+            ),
+        )
     return MatrixManifest(
         tracin=TRACIN_MATRIX_FILE,
         datainf=DATAINF_MATRIX_FILE,
@@ -257,7 +275,7 @@ def _build_matrix_manifest(
 def build_results_manifest(
     checkpoint_infos: list[dict[str, Any]],
     tracin_breakdown: list[dict[str, Any]],
-    datainf_breakdown: list[dict[str, Any]],
+    datainf_breakdown: list[dict[str, Any]] | None,
     fisher_breakdown: list[dict[str, Any]] | None,
     config: dict[str, Any],
     *,
@@ -362,10 +380,10 @@ def build_legacy_metadata(manifest: InfluenceResultsManifest) -> dict[str, Any]:
 def save_results_bundle(
     results_dir: str | Path,
     tracin_matrix: np.ndarray,
-    datainf_matrix: np.ndarray,
+    datainf_matrix: np.ndarray | None,
     fisher_matrix: np.ndarray | None,
     tracin_breakdown: list[dict[str, Any]],
-    datainf_breakdown: list[dict[str, Any]],
+    datainf_breakdown: list[dict[str, Any]] | None,
     fisher_breakdown: list[dict[str, Any]] | None,
     checkpoint_infos: list[dict[str, Any]],
     config: dict[str, Any],
@@ -378,7 +396,8 @@ def save_results_bundle(
     results_path.mkdir(parents=True, exist_ok=True)
 
     np.save(results_path / TRACIN_MATRIX_FILE, tracin_matrix)
-    np.save(results_path / DATAINF_MATRIX_FILE, datainf_matrix)
+    if datainf_matrix is not None:
+        np.save(results_path / DATAINF_MATRIX_FILE, datainf_matrix)
     if fisher_matrix is not None:
         np.save(results_path / FISHER_MATRIX_FILE, fisher_matrix)
 
@@ -387,11 +406,12 @@ def save_results_bundle(
             results_path / f"tracin_step_{entry['step']}.npy",
             entry["weighted_matrix"],
         )
-    for entry in datainf_breakdown:
-        np.save(
-            results_path / f"datainf_step_{entry['step']}.npy",
-            entry["weighted_matrix"],
-        )
+    if datainf_breakdown is not None:
+        for entry in datainf_breakdown:
+            np.save(
+                results_path / f"datainf_step_{entry['step']}.npy",
+                entry["weighted_matrix"],
+            )
     for entry in fisher_breakdown or []:
         np.save(
             results_path / f"fisher_step_{entry['step']}.npy",
@@ -558,7 +578,11 @@ def load_results_bundle(results_dir: str | Path) -> LoadedResults:
     results_path = Path(results_dir)
     manifest = load_results_manifest(results_path)
     tracin_matrix = np.load(results_path / manifest.matrices.tracin)
-    datainf_matrix = np.load(results_path / manifest.matrices.datainf)
+    datainf_matrix = None
+    if manifest.matrices.datainf is not None:
+        di_path = results_path / manifest.matrices.datainf
+        if di_path.exists():
+            datainf_matrix = np.load(di_path)
     fisher_matrix = None
     if manifest.matrices.fisher is not None:
         fisher_path = results_path / manifest.matrices.fisher
@@ -568,9 +592,13 @@ def load_results_bundle(results_dir: str | Path) -> LoadedResults:
         results_path,
         manifest.matrices.tracin_steps,
     )
-    datainf_step_matrices = _load_step_matrices(
-        results_path,
-        manifest.matrices.datainf_steps,
+    datainf_step_matrices = (
+        _load_step_matrices(
+            results_path,
+            manifest.matrices.datainf_steps,
+        )
+        if manifest.matrices.datainf is not None
+        else {}
     )
     fisher_step_matrices = _load_step_matrices(
         results_path,

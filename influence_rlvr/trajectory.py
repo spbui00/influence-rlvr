@@ -416,6 +416,7 @@ def collect_checkpoint_infos(
     grad_cache_dir=None,
     cache_fingerprint="",
     cache_config=None,
+    compute_datainf=True,
 ):
     influence_mode = InfluenceMode.parse(influence_mode)
     generation_backend = (
@@ -610,16 +611,19 @@ def collect_checkpoint_infos(
             checkpoint_matrix = tracin_base_matrix_from_infos(
                 test_infos, train_infos, tracin_normalize
             )
-            g_train_list = [info["grad"] for info in train_infos]
-            datainf = DataInfInfluence(
-                g_train_list,
-                lambda_damp=lambda_damp,
-                normalize=datainf_normalize,
-            )
-            datainf_checkpoint_matrix = np.zeros((n_test, n_train), dtype=np.float32)
-            for idx, test_info in enumerate(test_infos):
-                datainf_checkpoint_matrix[idx] = datainf.compute_all_scores(test_info)
-            del datainf
+            if compute_datainf:
+                g_train_list = [info["grad"] for info in train_infos]
+                datainf = DataInfInfluence(
+                    g_train_list,
+                    lambda_damp=lambda_damp,
+                    normalize=datainf_normalize,
+                )
+                datainf_checkpoint_matrix = np.zeros((n_test, n_train), dtype=np.float32)
+                for idx, test_info in enumerate(test_infos):
+                    datainf_checkpoint_matrix[idx] = datainf.compute_all_scores(test_info)
+                del datainf
+            else:
+                datainf_checkpoint_matrix = np.zeros((n_test, n_train), dtype=np.float32)
 
             fisher = FisherInfluence(
                 train_infos,
@@ -645,10 +649,11 @@ def collect_checkpoint_infos(
                 intermediate_dir / f"tracin_matrix_step_{step}.npy",
                 checkpoint_matrix,
             )
-            np.save(
-                intermediate_dir / f"datainf_matrix_step_{step}.npy",
-                datainf_checkpoint_matrix,
-            )
+            if compute_datainf:
+                np.save(
+                    intermediate_dir / f"datainf_matrix_step_{step}.npy",
+                    datainf_checkpoint_matrix,
+                )
             np.save(
                 intermediate_dir / f"fisher_matrix_step_{step}.npy",
                 fisher_checkpoint_matrix,

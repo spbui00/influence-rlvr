@@ -13,7 +13,7 @@ _ANSWER_TAG_PATTERN = re.compile(
 _ASSIGNMENT_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]*=(.+)$")
 _LATEX_FRAC_PATTERN = re.compile(r"\\(?:d?frac)\{([^{}]+)\}\{([^{}]+)\}")
 _CODE_BLOCK_PATTERN = re.compile(
-    r"```(?:python)?\s*(.*?)```",
+    r"```(?:python|py)?\s*(.*?)```",
     re.DOTALL | re.IGNORECASE,
 )
 _PYTHON_START_PATTERN = re.compile(
@@ -241,16 +241,76 @@ def _has_r1_reasoning_format(text):
     return _extract_boxed_answer(answer_region) is not None
 
 
-def _extract_python_code(text):
-    fenced = _CODE_BLOCK_PATTERN.search(text)
-    if fenced:
-        return fenced.group(1).strip()
-
+def _extract_python_code_candidates(text):
+    blocks = [m.group(1).strip() for m in _CODE_BLOCK_PATTERN.finditer(text)]
+    blocks = [b for b in blocks if b]
+    if blocks:
+        return blocks
     start = _PYTHON_START_PATTERN.search(text)
     if start:
-        return text[start.start():].strip()
+        return [text[start.start():].strip()]
+    stripped = text.strip()
+    return [stripped] if stripped else []
 
-    return text.strip()
+
+def _extract_python_code(text):
+    cand = _extract_python_code_candidates(text)
+    return cand[0] if cand else ""
+
+
+def _mbpp_reward_single_code(
+    code,
+    test_list,
+    test_setup_code,
+    challenge_test_list,
+    *,
+    timeout_seconds,
+):
+    challenge_test_list = challenge_test_list or []
+    tests = list(test_list) + list(challenge_test_list)
+    if not code or not tests:
+        return 0.0
+    try:
+        passed, code_loaded = _run_code_tests(
+            code,
+            test_setup_code,
+            tests,
+            timeout_seconds=timeout_seconds,
+        )
+        if passed > 0:
+            return (
+                _MBPP_COMPILES_BONUS
+                + (1.0 - _MBPP_COMPILES_BONUS) * (passed / len(tests))
+            )
+        if code_loaded:
+            return _MBPP_COMPILES_BONUS
+        return 0.0
+    except Exception:
+        return 0.0
+
+
+def _mbpp_best_reward_for_response(
+    response,
+    test_list,
+    test_setup_code,
+    challenge_test_list,
+    *,
+    timeout_seconds,
+):
+    best_r = 0.0
+    best_code = ""
+    for code in _extract_python_code_candidates(response):
+        r = _mbpp_reward_single_code(
+            code,
+            test_list,
+            test_setup_code,
+            challenge_test_list,
+            timeout_seconds=timeout_seconds,
+        )
+        if r > best_r:
+            best_r = r
+            best_code = code
+    return best_r, best_code
 
 
 def _run_code_tests(code, test_setup_code, tests, timeout_seconds):
@@ -324,6 +384,28 @@ def accuracy_reward_func(completions, solution, **kwargs):
     return rewards
 
 
+def mbpp_execution_rewards_and_codes(
+    completions,
+    test_list,
+    test_setup_code="",
+    challenge_test_list=None,
+    timeout_seconds=_DEFAULT_MBPP_TIMEOUT_SECONDS,
+):
+    rewards = []
+    codes = []
+    for response in _extract_responses(completions):
+        r, code = _mbpp_best_reward_for_response(
+            response,
+            test_list,
+            test_setup_code,
+            challenge_test_list,
+            timeout_seconds=timeout_seconds,
+        )
+        rewards.append(r)
+        codes.append(code)
+    return rewards, codes
+
+
 def mbpp_execution_reward_func(
     completions,
     test_list,
@@ -332,33 +414,222 @@ def mbpp_execution_reward_func(
     timeout_seconds=_DEFAULT_MBPP_TIMEOUT_SECONDS,
     **kwargs,
 ):
-    rewards = []
-    challenge_test_list = challenge_test_list or []
-    tests = list(test_list) + list(challenge_test_list)
+    rewards, _ = mbpp_execution_rewards_and_codes(
+        completions,
+        test_list,
+        test_setup_code=test_setup_code,
+        challenge_test_list=challenge_test_list,
+        timeout_seconds=timeout_seconds,
+    )
+    return rewards
 
-    for response in _extract_responses(completions):
-        code = _extract_python_code(response)
-        if not code or not tests:
-            rewards.append(0.0)
-            continue
 
+_DEFAULT_HUMANEVAL_TIMEOUT_SECONDS = 5.0
+_HUMANEVAL_RESULT_PREFIX = "__HUMANEVAL_RESULT__"
+_HUMANEVAL_RUNNER = f"""
+import builtins
+import contextlib
+import io
+import json
+import sys
+
+payload = json.loads(sys.stdin.read())
+
+class _BlockedInput:
+    def __call__(self, *args, **kwargs):
+        raise RuntimeError("Interactive input is disabled during HumanEval reward evaluation.")
+
+class _BlockedStdin(io.TextIOBase):
+    def read(self, *args, **kwargs):
+        raise RuntimeError("Interactive stdin is disabled during HumanEval reward evaluation.")
+
+    def readline(self, *args, **kwargs):
+        raise RuntimeError("Interactive stdin is disabled during HumanEval reward evaluation.")
+
+    def readlines(self, *args, **kwargs):
+        raise RuntimeError("Interactive stdin is disabled during HumanEval reward evaluation.")
+
+class _DiscardIO(io.TextIOBase):
+    def write(self, text):
+        return len(text)
+
+builtins.input = _BlockedInput()
+sys.stdin = _BlockedStdin()
+
+g = {{"__builtins__": builtins.__dict__, "__name__": "__main__"}}
+try:
+    with contextlib.redirect_stdout(_DiscardIO()), contextlib.redirect_stderr(_DiscardIO()):
+        exec(compile(payload["full_code"], "<user>", "exec"), g, g)
+        exec(payload["test"], g, g)
+        cand = g[payload["entry_point"]]
+        g["check"](cand)
+    result = {{"ok": True, "error_type": None, "error": None}}
+except Exception as exc:
+    result = {{"ok": False, "error_type": type(exc).__name__, "error": str(exc)}}
+
+print({json.dumps(_HUMANEVAL_RESULT_PREFIX)} + json.dumps(result))
+"""
+
+
+def _humaneval_run_once(full_code, test, entry_point, timeout_seconds):
+    payload = json.dumps({
+        "full_code": full_code,
+        "test": test,
+        "entry_point": entry_point,
+    })
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _HUMANEVAL_RUNNER],
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(
+            f"HumanEval execution timed out after {timeout_seconds:.1f}s."
+        ) from exc
+
+    if proc.returncode != 0:
+        message = proc.stderr.strip() or proc.stdout.strip()
+        if not message:
+            message = f"HumanEval subprocess exited with code {proc.returncode}."
+        return False
+
+    result_line = None
+    for line in reversed(proc.stdout.splitlines()):
+        if line.startswith(_HUMANEVAL_RESULT_PREFIX):
+            result_line = line[len(_HUMANEVAL_RESULT_PREFIX):]
+            break
+    if result_line is None:
+        return False
+    data = json.loads(result_line)
+    return bool(data.get("ok"))
+
+
+def humaneval_best_reward_for_response(
+    response,
+    prompt_prefix,
+    test,
+    entry_point,
+    *,
+    timeout_seconds=_DEFAULT_HUMANEVAL_TIMEOUT_SECONDS,
+):
+    best = 0.0
+    for code in _extract_python_code_candidates(response):
+        full_code = (prompt_prefix or "") + code
         try:
-            passed, code_loaded = _run_code_tests(
-                code,
-                test_setup_code,
-                tests,
+            ok = _humaneval_run_once(full_code, test, entry_point, timeout_seconds)
+        except (TimeoutError, RuntimeError, json.JSONDecodeError):
+            ok = False
+        if ok:
+            return 1.0
+        best = max(best, 0.0)
+    return best
+
+
+def humaneval_execution_reward_func(
+    completions,
+    prompt_prefix,
+    test,
+    entry_point,
+    timeout_seconds=_DEFAULT_HUMANEVAL_TIMEOUT_SECONDS,
+    **kwargs,
+):
+    rewards = []
+    for response in _extract_responses(completions):
+        rewards.append(
+            humaneval_best_reward_for_response(
+                response,
+                prompt_prefix,
+                test,
+                entry_point,
                 timeout_seconds=timeout_seconds,
             )
-            if passed > 0:
-                rewards.append(
-                    _MBPP_COMPILES_BONUS
-                    + (1.0 - _MBPP_COMPILES_BONUS) * (passed / len(tests))
-                )
-            elif code_loaded:
-                rewards.append(_MBPP_COMPILES_BONUS)
-            else:
-                rewards.append(0.0)
-        except Exception:
-            rewards.append(0.0)
+        )
+    return rewards
 
+
+def mixed_math_accuracy_grpo_reward(
+    prompts,
+    completions,
+    completion_ids=None,
+    task_type=None,
+    solution=None,
+    **kwargs,
+):
+    if task_type is None or solution is None:
+        raise ValueError("mixed_math_accuracy_grpo_reward requires task_type and solution columns.")
+    texts = _extract_responses(completions)
+    rewards = []
+    for i, text in enumerate(texts):
+        if task_type[i] != "math":
+            rewards.append(0.0)
+            continue
+        model_answer = extract_math_final_answer(text)
+        gold = solution[i]
+        rewards.append(
+            1.0 if _answers_match(model_answer, gold) else 0.0
+        )
+    return rewards
+
+
+def mixed_code_execution_grpo_reward(
+    prompts,
+    completions,
+    completion_ids=None,
+    task_type=None,
+    test_list=None,
+    test_setup_code=None,
+    challenge_test_list=None,
+    **kwargs,
+):
+    if task_type is None or test_list is None:
+        raise ValueError(
+            "mixed_code_execution_grpo_reward requires task_type and test_list columns."
+        )
+    texts = _extract_responses(completions)
+    n = len(texts)
+    if test_setup_code is None:
+        test_setup_code = [""] * n
+    rewards = []
+    for i, text in enumerate(texts):
+        if task_type[i] != "code":
+            rewards.append(0.0)
+            continue
+        ts = test_setup_code[i] if i < len(test_setup_code) else ""
+        ctl_raw = None
+        if challenge_test_list is not None and i < len(challenge_test_list):
+            ctl_raw = challenge_test_list[i]
+        ctl = ctl_raw if ctl_raw is not None else []
+        r, _ = _mbpp_best_reward_for_response(
+            text,
+            test_list[i],
+            ts or "",
+            ctl,
+            timeout_seconds=_DEFAULT_MBPP_TIMEOUT_SECONDS,
+        )
+        rewards.append(r)
+    return rewards
+
+
+def mixed_format_guardrail_grpo_reward(
+    prompts,
+    completions,
+    completion_ids=None,
+    task_type=None,
+    **kwargs,
+):
+    if task_type is None:
+        raise ValueError("mixed_format_guardrail_grpo_reward requires task_type column.")
+    texts = _extract_responses(completions)
+    rewards = []
+    for i, text in enumerate(texts):
+        if task_type[i] != "math":
+            rewards.append(0.0)
+            continue
+        rewards.append(
+            format_guardrail_reward_func([[{"content": text}]])[0]
+        )
     return rewards

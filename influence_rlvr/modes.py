@@ -26,6 +26,7 @@ class InfluenceMode(StringEnum):
 class ExperimentMode(StringEnum):
     MATH_GRPO = "math_grpo"
     CODE_GRPO = "code_grpo"
+    MIXED_GRPO = "mixed_grpo"
     BASE_EVAL = "base_eval"
 
 

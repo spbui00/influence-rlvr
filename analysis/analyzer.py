@@ -129,6 +129,10 @@ class InfluenceAnalyzer:
         if key == "tracin":
             return self.bundle.tracin_matrix
         if key == "datainf":
+            if self.bundle.datainf_matrix is None:
+                raise ValueError(
+                    "DataInf matrix is not in this results bundle (it was excluded or omitted)."
+                )
             return self.bundle.datainf_matrix
         if key == "fisher":
             if self.bundle.fisher_matrix is None:
@@ -225,6 +229,8 @@ class InfluenceAnalyzer:
         return output
 
     def plot_agreement(self, output_path: str | Path):
+        if self.bundle.datainf_matrix is None:
+            raise ValueError("DataInf was excluded; tracin_vs_datainf plot is unavailable.")
         fig = agreement_scatter_figure(
             self.bundle.tracin_matrix,
             self.bundle.datainf_matrix,
@@ -491,14 +497,19 @@ class InfluenceAnalyzer:
         output.mkdir(parents=True, exist_ok=True)
         saved = [
             self.plot_heatmap("tracin", output / "tracin_heatmap.png"),
-            self.plot_heatmap("datainf", output / "datainf_heatmap.png"),
-            self.plot_agreement(output / "tracin_vs_datainf.png"),
-            self.plot_step_series(
-                self.default_pairs(top_pairs=top_pairs),
-                output / "trajectory_top_pairs.png",
-            ),
-            self.plot_gradient_norms(output / "gradient_norms.png"),
         ]
+        if self.bundle.datainf_matrix is not None:
+            saved.append(self.plot_heatmap("datainf", output / "datainf_heatmap.png"))
+            saved.append(self.plot_agreement(output / "tracin_vs_datainf.png"))
+        saved.extend(
+            [
+                self.plot_step_series(
+                    self.default_pairs(top_pairs=top_pairs),
+                    output / "trajectory_top_pairs.png",
+                ),
+                self.plot_gradient_norms(output / "gradient_norms.png"),
+            ]
+        )
         if self.bundle.fisher_matrix is not None:
             saved.append(self.plot_heatmap("fisher", output / "fisher_heatmap.png"))
         if self.has_eval_metrics:

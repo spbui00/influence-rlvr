@@ -130,6 +130,7 @@ class FisherInfluence(BaseInfluenceMethod):
             ) * correction
 
     def compute_all_scores(self, test_info: dict) -> np.ndarray:
+        """Return IF of all train examples for test example test_info"""
         with torch.no_grad():
             n = len(self._train_grad_list)
             if n == 0:
@@ -193,7 +194,7 @@ class TrajectoryFisherInfluence:
                 )
                 matrix = np.zeros((n_test, n_train), dtype=np.float32)
                 for idx, test_info in enumerate(checkpoint["test_infos"]):
-                    matrix[idx] = fisher.compute_all_scores(test_info)
+                    matrix[idx] = fisher.compute_all_scores(test_info) # IF of all train examples for test example test_info
 
             train_weights = _stack_train_weights(checkpoint["train_infos"]).numpy()
             learning_rate = float(checkpoint.get("learning_rate", 1.0))

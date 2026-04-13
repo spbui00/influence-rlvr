@@ -100,7 +100,7 @@ class CheckpointSummary:
 @dataclass
 class MatrixManifest:
     tracin: str = TRACIN_MATRIX_FILE
-    datainf: str = DATAINF_MATRIX_FILE
+    datainf: str | None = DATAINF_MATRIX_FILE
     fisher: str | None = None
     tracin_steps: dict[str, str] = field(default_factory=dict)
     datainf_steps: dict[str, str] = field(default_factory=dict)
@@ -111,9 +111,14 @@ class MatrixManifest:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "MatrixManifest":
+        if "datainf" in data:
+            raw_di = data.get("datainf")
+            datainf = None if raw_di is None else str(raw_di)
+        else:
+            datainf = DATAINF_MATRIX_FILE
         return cls(
             tracin=data.get("tracin", TRACIN_MATRIX_FILE),
-            datainf=data.get("datainf", DATAINF_MATRIX_FILE),
+            datainf=datainf,
             fisher=data.get("fisher"),
             tracin_steps=dict(data.get("tracin_steps", {})),
             datainf_steps=dict(data.get("datainf_steps", {})),
@@ -353,7 +358,7 @@ class LoadedResults:
     root_dir: Path
     manifest: InfluenceResultsManifest
     tracin_matrix: Any
-    datainf_matrix: Any
+    datainf_matrix: Any | None
     tracin_step_matrices: dict[int, Any]
     datainf_step_matrices: dict[int, Any]
     fisher_matrix: Any = None

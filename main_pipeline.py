@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from datasets import load_dataset
+from datasets import concatenate_datasets, load_dataset
 from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import GRPOConfig
@@ -58,7 +58,15 @@ from influence_rlvr.prompts import (
     build_r1_math_prompt,
     extract_gsm8k_target,
 )
-from influence_rlvr.rewards import format_guardrail_reward_func
+from influence_rlvr.rewards import (
+    extract_math_final_answer,
+    format_guardrail_reward_func,
+    humaneval_execution_reward_func,
+    mixed_format_guardrail_grpo_reward,
+    mixed_math_accuracy_grpo_reward,
+    mixed_code_execution_grpo_reward,
+)
+from influence_rlvr.taco_convert import load_tac_mbpp_slice
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Configuration — edit these before launching
@@ -86,6 +94,12 @@ N_MATH = 300
 N_CODE = 10
 N_TRAIN_REPLAY = 200
 N_CODE_TRAIN = N_MATH
+NUMINA_DATASET = "AI-MO/NuminaMath-CoT"
+N_NUMINA = 300
+N_TACO = 300
+N_HUMANEVAL = None
+MIXED_TRAIN_SHUFFLE_SEED = 42
+HUMANEVAL_DATASET = "openai/openai_humaneval"
 TRAIN_REPLAY_SUBSET_SEED = None
 LORA_R = 8
 LORA_ALPHA = 16
@@ -101,6 +115,7 @@ CODE_EVAL_PERCENT = 0
 EVAL_MAX_NEW_TOKENS = 1024
 VLLM_GPU_MEMORY_UTILIZATION = 0.3
 INFLUENCE_MODE = InfluenceMode.HISTORICAL
+# For NuminaMath-CoT + TACO training and HumanEval g_test replay, set MIXED_GRPO.
 EXPERIMENT_MODE = ExperimentMode.MATH_GRPO
 GENERATION_BACKEND = GenerationBackend.VLLM
 VLLM_CONFIG = VLLMConfig(gpu_memory_utilization=VLLM_GPU_MEMORY_UTILIZATION)
@@ -124,6 +139,7 @@ REPLAY_GRADIENT_CONFIG = ReplayGradientConfig(
 
 SKIP_TRAINING = True
 ENABLE_GRAD_CACHE = False
+ENABLE_DATAINF = False
 RESULTS_REUSE_POLICY = "ask"
 
 APPEARANCE_MINIMUM = 10
@@ -156,7 +172,8 @@ def _run_config_json_path() -> Path:
 def _apply_training_run_config(cfg: dict, path: Path) -> None:
     global MODEL_ID, LEARNING_RATE, MAX_STEPS, SAVE_STEPS, PER_DEVICE_BATCH, GRAD_ACCUM_STEPS
     global GRPO_BETA, GRPO_EPSILON, G_TRAIN, GENERATION_BATCH_SIZE, TRAIN_GRAD_SEED
-    global N_MATH, LORA_R, LORA_ALPHA, LORA_TARGET_MODULES
+    global N_MATH, N_NUMINA, N_TACO, N_HUMANEVAL, MIXED_TRAIN_SHUFFLE_SEED
+    global LORA_R, LORA_ALPHA, LORA_TARGET_MODULES
     global GENERATION_BACKEND, VLLM_CONFIG, REPLAY_GRADIENT_CONFIG, EVAL_MAX_NEW_TOKENS
     global MAX_COMPLETION_LENGTH, _MATH_PROMPT_MATCHES_TRAINING_SCRIPT
     global TRAINING_RUN_CONFIG, TRAINING_RUN_CONFIG_PATH
@@ -192,6 +209,11 @@ def _apply_training_run_config(cfg: dict, path: Path) -> None:
         EVAL_MAX_NEW_TOKENS = int(ev)
 
     N_MATH = int(cfg.get("n_math", N_MATH))
+    N_NUMINA = int(cfg.get("n_numina", N_NUMINA))
+    N_TACO = int(cfg.get("n_taco", N_TACO))
+    if "n_humaneval" in cfg:
+        N_HUMANEVAL = int(cfg["n_humaneval"])
+    MIXED_TRAIN_SHUFFLE_SEED = int(cfg.get("mixed_train_shuffle_seed", MIXED_TRAIN_SHUFFLE_SEED))
 
     LORA_R = int(cfg.get("lora_r", LORA_R))
     LORA_ALPHA = int(cfg.get("lora_alpha", LORA_ALPHA))
@@ -240,9 +262,9 @@ if _run_config_path.is_file():
         raise RuntimeError(
             f"Invalid run_config.json at {_run_config_path}: {exc}"
         ) from exc
-    if EXPERIMENT_MODE != ExperimentMode.MATH_GRPO:
+    if EXPERIMENT_MODE not in (ExperimentMode.MATH_GRPO, ExperimentMode.MIXED_GRPO):
         print(
-            "Ignoring run_config.json: EXPERIMENT_MODE must be MATH_GRPO "
+            "Ignoring run_config.json: EXPERIMENT_MODE must be MATH_GRPO or MIXED_GRPO "
             f"(got {EXPERIMENT_MODE!r})."
         )
     else:
@@ -271,7 +293,7 @@ def normalize_experiment_mode(mode):
     except ValueError as exc:
         raise ValueError(
             f"Unsupported EXPERIMENT_MODE={mode!r}. "
-            "Use ExperimentMode.MATH_GRPO, CODE_GRPO, or BASE_EVAL."
+            "Use ExperimentMode.MATH_GRPO, CODE_GRPO, MIXED_GRPO, or BASE_EVAL."
         ) from exc
 
 
@@ -492,13 +514,113 @@ def _pipeline_main():
 
 
     print("\nLoading datasets...")
-    _math_train_split = "train" if N_MATH <= 0 else f"train[:{N_MATH}]"
-    math_train_data = load_dataset("openai/gsm8k", "main", split=_math_train_split)
-    math_train_dataset = math_train_data.map(format_math, with_indices=True)
-    code_train_data = load_dataset("mbpp", split=f"{CODE_TRAIN_SPLIT}[:{N_CODE_TRAIN}]")
-    code_train_dataset = code_train_data.map(format_code, with_indices=True)
-    code_test_data = load_dataset("mbpp", split=f"test[:{N_CODE}]")
-    test_dataset = code_test_data.map(format_code)
+    _humaneval_n = N_HUMANEVAL if N_HUMANEVAL is not None else N_CODE
+
+    def format_humaneval_row(example, idx=None):
+        p = example["prompt"]
+        row = {
+            "prompt": build_code_prompt(p),
+            "he_prompt": p,
+            "test": example["test"],
+            "entry_point": example["entry_point"],
+            "task_id": example.get("task_id", ""),
+        }
+        if idx is not None:
+            row["train_index"] = idx
+        return row
+
+    if EXPERIMENT_MODE == ExperimentMode.MIXED_GRPO:
+        if N_NUMINA <= 0 or N_TACO <= 0:
+            raise ValueError("MIXED_GRPO requires N_NUMINA > 0 and N_TACO > 0.")
+        numina_files = [
+            f"hf://datasets/{NUMINA_DATASET}/data/train-{i:05d}-of-00005.parquet"
+            for i in range(5)
+        ]
+        _numina_split = f"train[:{N_NUMINA}]"
+        numina_raw = load_dataset("parquet", data_files=numina_files, split=_numina_split)
+
+        def format_numina(example, _idx):
+            prob = example["problem"]
+            ref = example.get("solution") or ""
+            gold = extract_math_final_answer(ref) or ""
+            if _MATH_PROMPT_MATCHES_TRAINING_SCRIPT:
+                prompt = append_suffix_to_final_user_message(
+                    build_r1_math_prompt(prob),
+                    _TRAINING_SCRIPT_MATH_FORMAT_SUFFIX,
+                )
+            else:
+                prompt = build_r1_math_prompt(prob)
+            return {
+                "prompt": prompt,
+                "solution": gold,
+                "test_list": [],
+                "test_setup_code": "",
+                "challenge_test_list": [],
+                "task_type": "math",
+            }
+
+        numina_ds = numina_raw.map(
+            format_numina,
+            with_indices=True,
+            remove_columns=numina_raw.column_names,
+        )
+        _numina_before = len(numina_ds)
+        numina_ds = numina_ds.filter(lambda x: bool(str(x.get("solution", "")).strip()))
+        print(
+            f"  NuminaMath-CoT: {len(numina_ds)} / {_numina_before} rows with extractable gold "
+            f"(slice requested up to {N_NUMINA})."
+        )
+
+        taco_train_dataset, taco_scanned, taco_kept = load_tac_mbpp_slice(N_TACO)
+        print(
+            f"  TACO: {taco_kept} convertible rows (scanned {taco_scanned} raw rows, target {N_TACO})."
+        )
+
+        training_dataset = concatenate_datasets([numina_ds, taco_train_dataset])
+        training_dataset = training_dataset.shuffle(seed=MIXED_TRAIN_SHUFFLE_SEED)
+        training_dataset = training_dataset.map(
+            lambda _, idx: {"train_index": idx},
+            with_indices=True,
+        )
+        training_domain = "Mixed"
+        if _MATH_PROMPT_MATCHES_TRAINING_SCRIPT:
+            training_reward_funcs = [
+                mixed_format_guardrail_grpo_reward,
+                mixed_math_accuracy_grpo_reward,
+                mixed_code_execution_grpo_reward,
+            ]
+        else:
+            training_reward_funcs = [
+                mixed_math_accuracy_grpo_reward,
+                mixed_code_execution_grpo_reward,
+            ]
+
+        math_train_dataset = numina_ds
+        _he_split = "test" if _humaneval_n <= 0 else f"test[:{_humaneval_n}]"
+        he_raw = load_dataset(HUMANEVAL_DATASET, split=_he_split)
+        test_dataset = he_raw.map(format_humaneval_row)
+        code_train_dataset = taco_train_dataset
+    else:
+        _math_train_split = "train" if N_MATH <= 0 else f"train[:{N_MATH}]"
+        math_train_data = load_dataset("openai/gsm8k", "main", split=_math_train_split)
+        math_train_dataset = math_train_data.map(format_math, with_indices=True)
+        code_train_data = load_dataset("mbpp", split=f"{CODE_TRAIN_SPLIT}[:{N_CODE_TRAIN}]")
+        code_train_dataset = code_train_data.map(format_code, with_indices=True)
+        code_test_data = load_dataset("mbpp", split=f"test[:{N_CODE}]")
+        test_dataset = code_test_data.map(format_code)
+
+        if EXPERIMENT_MODE == ExperimentMode.CODE_GRPO:
+            training_domain = "Code"
+            training_dataset = code_train_dataset
+            training_reward_funcs = [mbpp_execution_reward_func]
+        else:
+            training_domain = "Math"
+            training_dataset = math_train_dataset
+            if _MATH_PROMPT_MATCHES_TRAINING_SCRIPT:
+                training_reward_funcs = [format_guardrail_reward_func, accuracy_reward_func]
+            else:
+                training_reward_funcs = [accuracy_reward_func]
+
     math_eval_split = percent_slice(MATH_EVAL_SPLIT, MATH_EVAL_PERCENT)
     math_eval_dataset = None
     if math_eval_split is not None:
@@ -509,18 +631,6 @@ def _pipeline_main():
     if code_eval_split is not None:
         code_eval_data = load_dataset("mbpp", split=code_eval_split)
         code_eval_dataset = code_eval_data.map(format_code)
-
-    if EXPERIMENT_MODE == ExperimentMode.CODE_GRPO:
-        training_domain = "Code"
-        training_dataset = code_train_dataset
-        training_reward_funcs = [mbpp_execution_reward_func]
-    else:
-        training_domain = "Math"
-        training_dataset = math_train_dataset
-        if _MATH_PROMPT_MATCHES_TRAINING_SCRIPT:
-            training_reward_funcs = [format_guardrail_reward_func, accuracy_reward_func]
-        else:
-            training_reward_funcs = [accuracy_reward_func]
 
     replay_train_dataset = training_dataset
     train_replay_pool_size = len(replay_train_dataset)
@@ -543,11 +653,17 @@ def _pipeline_main():
         train_replay_effective_n = len(replay_train_dataset)
     else:
         train_replay_effective_n = None
-    test_domain = "Code"
+    if EXPERIMENT_MODE == ExperimentMode.MIXED_GRPO:
+        test_domain = "HumanEval"
+    else:
+        test_domain = "Code"
 
     print(f"  RL train ({training_domain}): {len(training_dataset)} samples")
     print(f"  Replay test ({test_domain}): {len(test_dataset)} samples")
-    print(f"  Code train pool ({CODE_TRAIN_SPLIT}): {len(code_train_dataset)} samples")
+    if EXPERIMENT_MODE == ExperimentMode.MIXED_GRPO:
+        print(f"  TACO train pool: {len(code_train_dataset)} samples")
+    else:
+        print(f"  Code train pool ({CODE_TRAIN_SPLIT}): {len(code_train_dataset)} samples")
     if math_eval_dataset is not None:
         print(f"  Held-out math eval ({MATH_EVAL_SPLIT}): {len(math_eval_dataset)} samples")
     if code_eval_dataset is not None:
@@ -734,10 +850,43 @@ def _pipeline_main():
         ]
 
 
-    if EXPERIMENT_MODE == ExperimentMode.CODE_GRPO:
+    def build_mixed_reward_fns(sample, num_generations):
+        if sample.get("task_type") == "math":
+            solution = sample["solution"]
+            acc = partial(accuracy_reward_func, solution=[solution] * num_generations)
+            if _MATH_PROMPT_MATCHES_TRAINING_SCRIPT:
+                return [format_guardrail_reward_func, acc]
+            return [acc]
+        return [
+            partial(
+                mbpp_execution_reward_func,
+                test_list=sample["test_list"],
+                test_setup_code=sample["test_setup_code"],
+                challenge_test_list=sample.get("challenge_test_list"),
+            ),
+        ]
+
+
+    def build_humaneval_reward_fns(sample, num_generations):
+        return [
+            partial(
+                humaneval_execution_reward_func,
+                prompt_prefix=sample["he_prompt"],
+                test=sample["test"],
+                entry_point=sample["entry_point"],
+            ),
+        ]
+
+
+    if EXPERIMENT_MODE == ExperimentMode.MIXED_GRPO:
+        replay_reward_fn_builder = build_mixed_reward_fns
+        test_reward_fn_builder = build_humaneval_reward_fns
+    elif EXPERIMENT_MODE == ExperimentMode.CODE_GRPO:
         replay_reward_fn_builder = build_code_reward_fns
+        test_reward_fn_builder = build_code_reward_fns
     else:
         replay_reward_fn_builder = build_math_reward_fns
+        test_reward_fn_builder = build_code_reward_fns
 
 
     RESULTS_CONFIG = {
@@ -760,6 +909,12 @@ def _pipeline_main():
         "g_test": G_TEST,
         "generation_batch_size": GENERATION_BATCH_SIZE,
         "n_math": N_MATH,
+        "n_numina": N_NUMINA,
+        "n_taco": N_TACO,
+        "n_humaneval": _humaneval_n,
+        "mixed_train_shuffle_seed": MIXED_TRAIN_SHUFFLE_SEED,
+        "numina_dataset": NUMINA_DATASET,
+        "humaneval_dataset": HUMANEVAL_DATASET,
         "n_code": N_CODE,
         "n_code_train": N_CODE_TRAIN,
         "n_train_replay": train_replay_effective_n,
@@ -791,6 +946,7 @@ def _pipeline_main():
             if effective_influence_mode == InfluenceMode.HISTORICAL
             else "global_thinning"
         ),
+        "enable_datainf": ENABLE_DATAINF,
         "lambda_damp": LAMBDA_DAMP,
         "train_grad_seed": TRAIN_GRAD_SEED,
         "device": str(DEVICE),
@@ -836,6 +992,12 @@ def _pipeline_main():
         "g_test": G_TEST,
         "generation_batch_size": GENERATION_BATCH_SIZE,
         "n_math": N_MATH,
+        "n_numina": N_NUMINA,
+        "n_taco": N_TACO,
+        "n_humaneval": _humaneval_n,
+        "mixed_train_shuffle_seed": MIXED_TRAIN_SHUFFLE_SEED,
+        "numina_dataset": NUMINA_DATASET,
+        "humaneval_dataset": HUMANEVAL_DATASET,
         "n_code": N_CODE,
         "n_code_train": N_CODE_TRAIN,
         "n_train_replay": train_replay_effective_n,
@@ -867,6 +1029,7 @@ def _pipeline_main():
             if effective_influence_mode == InfluenceMode.HISTORICAL
             else "global_thinning"
         ),
+        "enable_datainf": ENABLE_DATAINF,
         "train_grad_seed": TRAIN_GRAD_SEED,
         "batch_history_fingerprint": batch_history_fingerprint,
         "train_domain": training_domain,
@@ -895,7 +1058,7 @@ def _pipeline_main():
             train_limit=train_replay_effective_n,
             include_debug=False,
             base_seed=TRAIN_GRAD_SEED,
-            test_reward_fn_builder=build_code_reward_fns,
+            test_reward_fn_builder=test_reward_fn_builder,
             test_G=G_TEST,
             epsilon=GRPO_EPSILON,
             beta=GRPO_BETA,
@@ -918,6 +1081,7 @@ def _pipeline_main():
             grad_cache_dir=GRAD_CACHE_DIR if ENABLE_GRAD_CACHE else None,
             cache_fingerprint=CACHE_FINGERPRINT,
             cache_config=CACHE_CONFIG,
+            compute_datainf=ENABLE_DATAINF,
         )
         elapsed = time.time() - t0
         print(f"\nTrajectory replay completed in {elapsed:.1f}s")
@@ -1016,12 +1180,16 @@ def _pipeline_main():
         checkpoint_infos, return_breakdown=True,
     )
 
-    trajectory_datainf = TrajectoryDataInfInfluence(
-        lambda_damp=LAMBDA_DAMP, normalize=False,
-    )
-    datainf_matrix, datainf_breakdown = trajectory_datainf.compute_matrix(
-        checkpoint_infos, return_breakdown=True,
-    )
+    if ENABLE_DATAINF:
+        trajectory_datainf = TrajectoryDataInfInfluence(
+            lambda_damp=LAMBDA_DAMP, normalize=False,
+        )
+        datainf_matrix, datainf_breakdown = trajectory_datainf.compute_matrix(
+            checkpoint_infos, return_breakdown=True,
+        )
+    else:
+        datainf_matrix = None
+        datainf_breakdown = None
 
     trajectory_fisher = TrajectoryFisherInfluence(
         lambda_damp=LAMBDA_DAMP,
@@ -1036,9 +1204,12 @@ def _pipeline_main():
     print(f"  max |score| = {np.abs(tracin_matrix).max():.6e}")
     print(tracin_matrix)
 
-    print(f"\nTrajectory DataInf shape: {datainf_matrix.shape}")
-    print(f"  max |score| = {np.abs(datainf_matrix).max():.6e}")
-    print(datainf_matrix)
+    if ENABLE_DATAINF:
+        print(f"\nTrajectory DataInf shape: {datainf_matrix.shape}")
+        print(f"  max |score| = {np.abs(datainf_matrix).max():.6e}")
+        print(datainf_matrix)
+    else:
+        print("\nDataInf: skipped (ENABLE_DATAINF=False).")
 
     print(f"\nTrajectory Fisher shape: {fisher_matrix.shape}")
     print(f"  max |score| = {np.abs(fisher_matrix).max():.6e}")

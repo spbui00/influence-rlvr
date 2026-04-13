@@ -243,6 +243,7 @@ def _hf_generate_rollout_batch(
     do_sample: bool,
     temperature: float,
     top_p: float,
+    seed: int | None = None,
 ) -> RolloutBatch:
     sampling_model.eval()
     batch_size = int(prompt_ids.shape[0])
@@ -260,6 +261,10 @@ def _hf_generate_rollout_batch(
             "top_p": top_p,
             "num_return_sequences": num_samples,
         })
+        if seed is not None:
+            g = torch.Generator()
+            g.manual_seed(int(seed))
+            generate_kwargs["generator"] = g
     with torch.inference_mode():
         generated = sampling_model.generate(**generate_kwargs)
 
@@ -523,6 +528,7 @@ def generate_rollout_batch(
             do_sample=do_sample,
             temperature=temperature,
             top_p=top_p,
+            seed=seed,
         )
 
     return _vllm_generate_rollout_batch(

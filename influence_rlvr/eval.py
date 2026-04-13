@@ -31,6 +31,7 @@ def _generate_completions(
     temperature=0.6,
     top_p=0.95,
     num_samples=1,
+    seed=None,
     enable_vllm=False,
     generation_backend=None,
     vllm_config=None,
@@ -52,6 +53,7 @@ def _generate_completions(
         do_sample=do_sample,
         temperature=temperature,
         top_p=top_p,
+        seed=seed,
         vllm_config=VLLMConfig() if vllm_config is None else vllm_config,
         adapter_path=adapter_path,
         model_id=model_id,
@@ -68,6 +70,7 @@ def evaluate_math_dataset(
     max_new_tokens=256,
     progress=False,
     progress_prefix="",
+    base_seed=None,
     enable_vllm=False,
     generation_backend=None,
     vllm_config=None,
@@ -79,12 +82,14 @@ def evaluate_math_dataset(
 
     for idx in range(count):
         sample = dataset[idx]
+        gen_seed = base_seed + idx if base_seed is not None else None
         completions = _generate_completions(
             peft_model,
             tokenizer,
             sample["prompt"],
             device,
             max_new_tokens=max_new_tokens,
+            seed=gen_seed,
             enable_vllm=enable_vllm,
             generation_backend=generation_backend,
             vllm_config=vllm_config,
@@ -121,6 +126,7 @@ def evaluate_code_dataset(
     temperature=0.6,
     top_p=0.95,
     num_samples=1,
+    base_seed=None,
     enable_vllm=False,
     generation_backend=None,
     vllm_config=None,
@@ -134,6 +140,7 @@ def evaluate_code_dataset(
 
     for idx in range(count):
         sample = dataset[idx]
+        gen_seed = base_seed + idx if base_seed is not None else None
         completions = _generate_completions(
             peft_model,
             tokenizer,
@@ -144,6 +151,7 @@ def evaluate_code_dataset(
             temperature=temperature,
             top_p=top_p,
             num_samples=num_samples,
+            seed=gen_seed,
             enable_vllm=enable_vllm,
             generation_backend=generation_backend,
             vllm_config=vllm_config,
