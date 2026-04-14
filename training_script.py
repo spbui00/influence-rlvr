@@ -12,6 +12,7 @@ import torch
 from datasets import concatenate_datasets, load_dataset
 from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
+from transformers.trainer_utils import get_last_checkpoint
 from trl import GRPOConfig
 
 from influence_rlvr import (
@@ -558,6 +559,35 @@ def _args_to_jsonable(args: argparse.Namespace) -> dict:
     return d
 
 
+def _resume_step_from_checkpoint(checkpoint_path: Path) -> int:
+    name = checkpoint_path.name
+    if not name.startswith("checkpoint-"):
+        raise ValueError(f"Not a checkpoint directory: {checkpoint_path}")
+    return int(name.split("-", 1)[1])
+
+
+def _resolve_resume_checkpoint(
+    resume_spec: str | None,
+    output_dir: Path,
+) -> Path | None:
+    if resume_spec is None:
+        return None
+    if resume_spec == "latest":
+        latest = get_last_checkpoint(str(output_dir))
+        if latest is None:
+            raise SystemExit(
+                f"--resume-from-checkpoint=latest requested, but no checkpoint-* "
+                f"directories were found under {output_dir}"
+            )
+        return Path(latest).resolve()
+    checkpoint = Path(resume_spec).expanduser()
+    if not checkpoint.is_absolute():
+        checkpoint = (Path.cwd() / checkpoint).resolve()
+    if not checkpoint.is_dir():
+        raise SystemExit(f"Resume checkpoint not found: {checkpoint}")
+    return checkpoint
+
+
 _TRAINING_SCRIPT_EPILOG = """
 vLLM modes: 'colocate' runs vLLM in-process on the training GPU(s).
 'server' expects a TRL vLLM server (see `trl vllm-serve`).
@@ -737,6 +767,16 @@ def parse_args():
         help="When --vllm-mode=server, e.g. http://127.0.0.1:8000",
     )
     p.add_argument(
+        "--resume-from-checkpoint",
+        nargs="?",
+        const="latest",
+        default=None,
+        help=(
+            "Resume trainer/model/optimizer state from a checkpoint path. "
+            "Pass with no value to resume from the latest checkpoint under --output-dir."
+        ),
+    )
+    p.add_argument(
         "--skip-eval",
         action="store_true",
         help=(
@@ -824,10 +864,22 @@ def main():
     (out / "run_config.json").write_text(
         json.dumps(_args_to_jsonable(args), indent=2) + "\n"
     )
+    resume_checkpoint = _resolve_resume_checkpoint(
+        args.resume_from_checkpoint,
+        out,
+    )
+    resume_step = None
+    if resume_checkpoint is not None:
+        resume_step = _resume_step_from_checkpoint(resume_checkpoint)
 
     print(f"Device: {device} | use_vllm={use_vllm} | vllm_mode={args.vllm_mode if use_vllm else 'n/a'}")
     print(f"Seed: {args.seed}")
     print(f"Output: {out}")
+    if resume_checkpoint is not None:
+        print(
+            f"Resume checkpoint: {resume_checkpoint} "
+            f"(global_step={resume_step})"
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
     tokenizer.pad_token = tokenizer.eos_token
@@ -849,9 +901,12 @@ def main():
     model = get_peft_model(base_model, lora_config)
     model.print_trainable_parameters()
 
-    save_base_checkpoint(model, tokenizer, out)
+    if resume_checkpoint is None:
+        save_base_checkpoint(model, tokenizer, out)
+    else:
+        print("Skipping save_base_checkpoint while resuming.")
 
-    if not args.skip_eval:
+    if not args.skip_eval and resume_checkpoint is None:
         run_all_non_skip_evals(
             model,
             tokenizer,
@@ -859,6 +914,8 @@ def main():
             args,
             phase="baseline",
         )
+    elif resume_checkpoint is not None and not args.skip_eval:
+        print("Skipping baseline eval while resuming from checkpoint.")
 
     if args.mixed:
         print("\nLoading mixed train (NuminaMath-CoT + TACO)...")
@@ -924,12 +981,29 @@ def main():
         processing_class=tokenizer,
         history_output_dir=out,
     )
+    if resume_checkpoint is not None:
+        loaded_history, dropped_history = trainer.load_existing_history(
+            max_step=resume_step,
+        )
+        print(
+            f"Loaded {loaded_history} historical batch steps up to "
+            f"checkpoint step {resume_step}."
+        )
+        if dropped_history:
+            print(
+                f"Dropped {dropped_history} historical batch step(s) beyond the "
+                "resume checkpoint because they were recorded after the last "
+                "saved model snapshot."
+            )
 
     print("\n" + "=" * 80)
     print("GRPO training")
     print("=" * 80)
     t0 = time.time()
-    trainer.train()
+    train_kwargs = {}
+    if resume_checkpoint is not None:
+        train_kwargs["resume_from_checkpoint"] = str(resume_checkpoint)
+    trainer.train(**train_kwargs)
     print(f"\nTraining finished in {time.time() - t0:.1f}s")
     clear_cache(device)
 
