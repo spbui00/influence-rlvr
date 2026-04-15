@@ -145,6 +145,25 @@ def _resolve_checkpoint_dir(run_dir: Path, run_cfg: dict[str, Any], checkpoint_a
     return Path(checkpoint_arg).expanduser().resolve()
 
 
+def _resolve_checkpoint_targets(
+    run_dir: Path,
+    run_cfg: dict[str, Any],
+    checkpoint_arg: str | None,
+) -> list[tuple[str, Path]]:
+    if checkpoint_arg in (None, "both"):
+        targets: list[tuple[str, Path]] = []
+        checkpoint_zero = (run_dir / "checkpoint-0").resolve()
+        if checkpoint_zero.is_dir():
+            targets.append(("checkpoint_0", checkpoint_zero))
+        latest = _resolve_checkpoint_dir(run_dir, run_cfg, "latest")
+        if not targets or latest != targets[-1][1]:
+            targets.append(("latest", latest))
+        return targets
+    checkpoint_dir = _resolve_checkpoint_dir(run_dir, run_cfg, checkpoint_arg)
+    label = checkpoint_dir.name.replace("-", "_")
+    return [(label, checkpoint_dir)]
+
+
 def _load_model_and_tokenizer(checkpoint_dir: Path, run_cfg: dict[str, Any], device: torch.device):
     model_id = run_cfg.get("model_id", "HuggingFaceTB/SmolLM2-1.7B-Instruct")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -391,8 +410,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint-dir",
         type=str,
-        default="latest",
-        help="Checkpoint path to evaluate, or 'latest' to auto-resolve under --rlvr-output.",
+        default="both",
+        help="Checkpoint path to evaluate, or one of: latest, both.",
     )
     parser.add_argument("--num-samples", type=int, default=4)
     parser.add_argument("--max-new-tokens", type=int, default=None)
@@ -409,14 +428,109 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _run_phase_eval(
+    *,
+    phase_name: str,
+    checkpoint_dir: Path,
+    run_cfg: dict[str, Any],
+    model,
+    tokenizer,
+    numina_test: Dataset,
+    taco_test: Dataset,
+    humaneval_ds: Dataset,
+    device: torch.device,
+    num_samples: int,
+    max_new_tokens: int,
+    use_vllm: bool,
+    vllm_config: VLLMConfig,
+    model_id: str,
+    responses_root: Path,
+) -> dict[str, Any]:
+    print("\n" + "#" * 100, flush=True)
+    print(f"Evaluating phase={phase_name} checkpoint={checkpoint_dir}", flush=True)
+    print("#" * 100, flush=True)
+
+    phase_dir = responses_root / phase_name
+    phase_dir.mkdir(parents=True, exist_ok=True)
+    summary = {
+        "checkpoint_dir": str(checkpoint_dir),
+        "phase": phase_name,
+        "num_samples": int(num_samples),
+        "max_new_tokens": int(max_new_tokens),
+        "use_vllm": bool(use_vllm),
+        "datasets": {},
+    }
+
+    summary["datasets"]["numina_test"] = evaluate_numina_test(
+        model,
+        tokenizer,
+        numina_test,
+        device=device,
+        num_samples=num_samples,
+        max_new_tokens=max_new_tokens,
+        use_vllm=use_vllm,
+        vllm_config=vllm_config,
+        checkpoint_dir=checkpoint_dir,
+        model_id=model_id,
+        output_path=phase_dir / "numina_test.json",
+    )
+    print(
+        f"[{phase_name}] Numina test {summary['datasets']['numina_test']['pass_metric']}: "
+        f"{summary['datasets']['numina_test']['pass_rate']:.4f}",
+        flush=True,
+    )
+
+    summary["datasets"]["taco_test"] = evaluate_taco_test(
+        model,
+        tokenizer,
+        taco_test,
+        device=device,
+        num_samples=num_samples,
+        max_new_tokens=max_new_tokens,
+        use_vllm=use_vllm,
+        vllm_config=vllm_config,
+        checkpoint_dir=checkpoint_dir,
+        model_id=model_id,
+        output_path=phase_dir / "taco_test.json",
+    )
+    print(
+        f"[{phase_name}] TACO test {summary['datasets']['taco_test']['pass_metric']}: "
+        f"{summary['datasets']['taco_test']['pass_rate']:.4f} | "
+        f"{summary['datasets']['taco_test']['compile_metric']}: "
+        f"{summary['datasets']['taco_test']['compile_rate']:.4f}",
+        flush=True,
+    )
+
+    summary["datasets"]["humaneval_test"] = evaluate_humaneval(
+        model,
+        tokenizer,
+        humaneval_ds,
+        device=device,
+        num_samples=num_samples,
+        max_new_tokens=max_new_tokens,
+        use_vllm=use_vllm,
+        vllm_config=vllm_config,
+        checkpoint_dir=checkpoint_dir,
+        model_id=model_id,
+        output_path=phase_dir / "humaneval_test.json",
+    )
+    print(
+        f"[{phase_name}] HumanEval {summary['datasets']['humaneval_test']['pass_metric']}: "
+        f"{summary['datasets']['humaneval_test']['pass_rate']:.4f}",
+        flush=True,
+    )
+    return summary
+
+
 def main() -> None:
     args = parse_args()
     run_dir = args.rlvr_output.expanduser().resolve()
     run_cfg = _load_run_config(run_dir)
 
-    checkpoint_dir = _resolve_checkpoint_dir(run_dir, run_cfg, args.checkpoint_dir)
-    if not checkpoint_dir.is_dir():
-        raise SystemExit(f"Checkpoint directory not found: {checkpoint_dir}")
+    checkpoint_targets = _resolve_checkpoint_targets(run_dir, run_cfg, args.checkpoint_dir)
+    for _, checkpoint_dir in checkpoint_targets:
+        if not checkpoint_dir.is_dir():
+            raise SystemExit(f"Checkpoint directory not found: {checkpoint_dir}")
 
     model_id = str(run_cfg.get("model_id", "HuggingFaceTB/SmolLM2-1.7B-Instruct"))
     numina_n = int(args.n_numina)
@@ -442,8 +556,6 @@ def main() -> None:
         training_use_vllm=use_vllm,
     )
 
-    model, tokenizer = _load_model_and_tokenizer(checkpoint_dir, run_cfg, device)
-
     print("Loading eval datasets...", flush=True)
     numina_test = load_numina_test_dataset(numina_n)
     taco_test, taco_scanned, taco_kept = load_taco_test_dataset(taco_n)
@@ -458,83 +570,42 @@ def main() -> None:
     summary_path = (
         args.output_json.expanduser().resolve()
         if args.output_json is not None
-        else run_dir / f"eval_mixed_sets_{checkpoint_dir.name}.json"
+        else run_dir / "eval_mixed_test_sets_summary.json"
     )
     responses_dir = summary_path.parent / f"{summary_path.stem}_responses"
     responses_dir.mkdir(parents=True, exist_ok=True)
 
-    summary = {
-        "checkpoint_dir": str(checkpoint_dir),
+    all_summaries: dict[str, Any] = {
         "num_samples": int(args.num_samples),
         "max_new_tokens": int(max_new_tokens),
         "use_vllm": bool(use_vllm),
-        "datasets": {},
+        "phases": {},
     }
+    for phase_name, checkpoint_dir in checkpoint_targets:
+        model, tokenizer = _load_model_and_tokenizer(checkpoint_dir, run_cfg, device)
+        all_summaries["phases"][phase_name] = _run_phase_eval(
+            phase_name=phase_name,
+            checkpoint_dir=checkpoint_dir,
+            run_cfg=run_cfg,
+            model=model,
+            tokenizer=tokenizer,
+            numina_test=numina_test,
+            taco_test=taco_test,
+            humaneval_ds=humaneval_ds,
+            device=device,
+            num_samples=args.num_samples,
+            max_new_tokens=max_new_tokens,
+            use_vllm=use_vllm,
+            vllm_config=vllm_config,
+            model_id=model_id,
+            responses_root=responses_dir,
+        )
+        del model
+        clear_vllm_engine_cache()
 
-    summary["datasets"]["numina_test"] = evaluate_numina_test(
-        model,
-        tokenizer,
-        numina_test,
-        device=device,
-        num_samples=args.num_samples,
-        max_new_tokens=max_new_tokens,
-        use_vllm=use_vllm,
-        vllm_config=vllm_config,
-        checkpoint_dir=checkpoint_dir,
-        model_id=model_id,
-        output_path=responses_dir / "numina_test.json",
-    )
-    print(
-        f"Numina test {summary['datasets']['numina_test']['pass_metric']}: "
-        f"{summary['datasets']['numina_test']['pass_rate']:.4f}",
-        flush=True,
-    )
-
-    summary["datasets"]["taco_test"] = evaluate_taco_test(
-        model,
-        tokenizer,
-        taco_test,
-        device=device,
-        num_samples=args.num_samples,
-        max_new_tokens=max_new_tokens,
-        use_vllm=use_vllm,
-        vllm_config=vllm_config,
-        checkpoint_dir=checkpoint_dir,
-        model_id=model_id,
-        output_path=responses_dir / "taco_test.json",
-    )
-    print(
-        f"TACO test {summary['datasets']['taco_test']['pass_metric']}: "
-        f"{summary['datasets']['taco_test']['pass_rate']:.4f} | "
-        f"{summary['datasets']['taco_test']['compile_metric']}: "
-        f"{summary['datasets']['taco_test']['compile_rate']:.4f}",
-        flush=True,
-    )
-
-    summary["datasets"]["humaneval_test"] = evaluate_humaneval(
-        model,
-        tokenizer,
-        humaneval_ds,
-        device=device,
-        num_samples=args.num_samples,
-        max_new_tokens=max_new_tokens,
-        use_vllm=use_vllm,
-        vllm_config=vllm_config,
-        checkpoint_dir=checkpoint_dir,
-        model_id=model_id,
-        output_path=responses_dir / "humaneval_test.json",
-    )
-    print(
-        f"HumanEval {summary['datasets']['humaneval_test']['pass_metric']}: "
-        f"{summary['datasets']['humaneval_test']['pass_rate']:.4f}",
-        flush=True,
-    )
-
-    summary_path.write_text(json.dumps(summary, indent=2) + "\n")
+    summary_path.write_text(json.dumps(all_summaries, indent=2) + "\n")
     print(f"Wrote summary: {summary_path}", flush=True)
     print(f"Wrote responses under: {responses_dir}", flush=True)
-
-    clear_vllm_engine_cache()
 
 
 if __name__ == "__main__":
