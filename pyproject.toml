@@ -17,6 +17,7 @@ dependencies = [
     "accelerate>=1.0",
     "numpy>=1.26",
     "matplotlib>=3.9",
+    "requests>=2.32.5",
 ]
 
 [project.optional-dependencies]
