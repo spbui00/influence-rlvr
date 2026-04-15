@@ -23,7 +23,7 @@ from influence_rlvr.rewards import (
     accuracy_reward_func,
     extract_math_final_answer,
     humaneval_best_reward_for_response,
-    mbpp_execution_rewards_and_codes,
+    taco_execution_rewards_and_codes,
 )
 from influence_rlvr.taco_convert import tac_try_convert_row
 from influence_rlvr.utils import detect_device
@@ -299,11 +299,14 @@ def evaluate_taco_test(
             adapter_path=str(checkpoint_dir),
             model_id=model_id,
         )
-        rewards, extracted_codes = mbpp_execution_rewards_and_codes(
+        rewards, extracted_codes = taco_execution_rewards_and_codes(
             completions,
+            code_task_format=sample.get("code_task_format", "call"),
             test_list=sample["test_list"],
             test_setup_code=sample["test_setup_code"],
             challenge_test_list=sample.get("challenge_test_list"),
+            stdio_inputs=sample.get("stdio_inputs"),
+            stdio_outputs=sample.get("stdio_outputs"),
         )
         pass_score = 1.0 if any(score >= 0.999 for score in rewards) else 0.0
         compile_score = 1.0 if any(score > 0.0 for score in rewards) else 0.0

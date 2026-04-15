@@ -34,6 +34,8 @@ from .rewards import (
     accuracy_reward_func,
     mbpp_execution_reward_func,
     mbpp_execution_rewards_and_codes,
+    taco_execution_reward_func,
+    taco_execution_rewards_and_codes,
 )
 from .checkpoint_schedule import (
     build_checkpoint_schedule,
@@ -94,6 +96,8 @@ __all__ = [
     "accuracy_reward_func",
     "mbpp_execution_reward_func",
     "mbpp_execution_rewards_and_codes",
+    "taco_execution_reward_func",
+    "taco_execution_rewards_and_codes",
     "collect_reward_infos",
     "HistoricalBatchGRPOTrainer",
     "detect_device",

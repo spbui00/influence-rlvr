@@ -28,7 +28,7 @@ from influence_rlvr.prompts import (
 )
 from influence_rlvr.rewards import (
     _DEFAULT_MBPP_TIMEOUT_SECONDS,
-    _mbpp_best_reward_for_response,
+    _taco_best_reward_for_response,
     extract_math_final_answer,
     format_guardrail_reward_func,
     math_answer_equivalence_key,
@@ -36,7 +36,7 @@ from influence_rlvr.rewards import (
     mixed_math_accuracy_grpo_reward,
     mixed_code_execution_grpo_reward,
 )
-from influence_rlvr.taco_convert import load_tac_mbpp_slice, tac_try_convert_row
+from influence_rlvr.taco_convert import load_tac_code_slice, tac_try_convert_row
 
 
 NUMINA_DATASET = "AI-MO/NuminaMath-CoT"
@@ -384,7 +384,7 @@ def run_tac_test_eval(
     title = "Baseline eval (before GRPO)" if phase == "baseline" else "Post-training eval"
     print("\n" + "=" * 80)
     print(
-        f"{title} — TACO test (exec reward), greedy | "
+        f"{title} — TACO test (native exec reward), greedy | "
         f"kept {kept} / scanned {scanned} (target {n})"
     )
     print("=" * 80)
@@ -404,11 +404,14 @@ def run_tac_test_eval(
             top_p=1.0,
         )
         ctl = row.get("challenge_test_list") or []
-        r, _ = _mbpp_best_reward_for_response(
+        r, _ = _taco_best_reward_for_response(
             completion_texts[0],
-            row["test_list"],
-            row["test_setup_code"] or "",
-            ctl if ctl is not None else [],
+            code_task_format=row.get("code_task_format", "call"),
+            test_list=row["test_list"],
+            test_setup_code=row["test_setup_code"] or "",
+            challenge_test_list=ctl if ctl is not None else [],
+            stdio_inputs=row.get("stdio_inputs") or [],
+            stdio_outputs=row.get("stdio_outputs") or [],
             timeout_seconds=_DEFAULT_MBPP_TIMEOUT_SECONDS,
         )
         rewards.append(r)
@@ -532,9 +535,9 @@ def load_mixed_train_dataset(args):
         f"  NuminaMath-CoT: {len(numina_ds)} / {before} rows with extractable gold "
         f"(slice up to {args.n_numina})."
     )
-    taco_ds, scanned, kept = load_tac_mbpp_slice(args.n_taco)
+    taco_ds, scanned, kept = load_tac_code_slice(args.n_taco, split="train")
     print(
-        f"  TACO: {kept} convertible rows (scanned {scanned} raw, target {args.n_taco})."
+        f"  TACO: {kept} native-executable rows (scanned {scanned} raw, target {args.n_taco})."
     )
     ds = concatenate_datasets([numina_ds, taco_ds])
     ds = ds.shuffle(seed=args.mixed_shuffle_seed)
@@ -669,8 +672,8 @@ def parse_args():
         "--mixed",
         action="store_true",
         help=(
-            "Train on NuminaMath-CoT + TACO (filtered to MBPP-style tests) with mixed GRPO rewards, "
-            "same as main_pipeline MIXED_GRPO Phase 1."
+            "Train on NuminaMath-CoT + TACO (native executable subset) with mixed GRPO rewards, "
+            "using native TACO execution when possible, same as main_pipeline MIXED_GRPO Phase 1."
         ),
     )
     p.add_argument(
@@ -688,7 +691,7 @@ def parse_args():
         "--n-taco",
         type=int,
         default=300,
-        help="TACO train rows to convert (mixed mode only).",
+        help="TACO train rows to keep after native execution conversion (mixed mode only).",
     )
     p.add_argument(
         "--mixed-shuffle-seed",

@@ -1,30 +1,40 @@
+import json
 import unittest
-
-from datasets import load_dataset
 
 from influence_rlvr.rewards import _humaneval_run_once
 from influence_rlvr.taco_convert import tac_try_convert_row
 
 
 class MixedDatasetTests(unittest.TestCase):
-    def test_humaneval_runner_accepts_canonical(self):
-        ds = load_dataset("openai/openai_humaneval", split="test")
-        ex = ds[0]
-        full = ex["prompt"] + ex["canonical_solution"]
+    def test_humaneval_runner_accepts_simple_solution(self):
+        prompt_prefix = "def add(a, b):\n"
+        body = "    return a + b\n"
+        test = "def check(candidate):\n    assert candidate(2, 3) == 5\n"
         self.assertTrue(
-            _humaneval_run_once(full, ex["test"], ex["entry_point"], 15.0)
+            _humaneval_run_once(prompt_prefix + body, test, "add", 15.0)
         )
 
     def test_tac_convert_fn_io_row(self):
-        url = "hf://datasets/BAAI/TACO/train/data-00000-of-00009.arrow"
-        ds = load_dataset("arrow", data_files=url, split="train")
-        for i in range(len(ds)):
-            c = tac_try_convert_row(ds[i])
-            if c is not None:
-                self.assertEqual(c["task_type"], "code")
-                self.assertGreaterEqual(len(c["test_list"]), 1)
-                return
-        self.fail("no convertible row in shard")
+        converted = tac_try_convert_row(
+            {
+                "question": "Return whether two words are anagrams.",
+                "solutions": json.dumps(
+                    ["def is_anagram(test, original):\n    return sorted(test.lower()) == sorted(original.lower())"]
+                ),
+                "input_output": json.dumps(
+                    {
+                        "fn_name": "is_anagram",
+                        "inputs": [["foefet", "toffee"], ["dumble", "bumble"]],
+                        "outputs": [[True], [False]],
+                    }
+                ),
+            }
+        )
+        self.assertIsNotNone(converted)
+        assert converted is not None
+        self.assertEqual(converted["task_type"], "code")
+        self.assertEqual(converted["code_task_format"], "call")
+        self.assertGreaterEqual(len(converted["test_list"]), 1)
 
 
 if __name__ == "__main__":

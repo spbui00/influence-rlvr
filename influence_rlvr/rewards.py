@@ -83,6 +83,58 @@ else:
 print({json.dumps(_MBPP_RESULT_PREFIX)} + json.dumps(result))
 """
 
+_TACO_STDIO_RESULT_PREFIX = "__TACO_STDIO_RESULT__"
+_TACO_STDIO_RUNNER = f"""
+import builtins
+import contextlib
+import io
+import json
+import sys
+
+payload = json.loads(sys.stdin.read())
+stdin_buffer = io.StringIO(payload["stdin"])
+stdout_buffer = io.StringIO()
+
+def _input(prompt=None):
+    line = stdin_buffer.readline()
+    if line == "":
+        raise EOFError("No more input.")
+    return line.rstrip("\\n")
+
+class _ReadableStdin(io.TextIOBase):
+    def read(self, *args, **kwargs):
+        return stdin_buffer.read(*args, **kwargs)
+
+    def readline(self, *args, **kwargs):
+        return stdin_buffer.readline(*args, **kwargs)
+
+    def readlines(self, *args, **kwargs):
+        return stdin_buffer.readlines(*args, **kwargs)
+
+namespace = {{"__builtins__": builtins.__dict__, "__name__": "__main__"}}
+builtins.input = _input
+sys.stdin = _ReadableStdin()
+
+try:
+    with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(io.StringIO()):
+        exec(compile(payload["code"], "<user>", "exec"), namespace, namespace)
+    result = {{
+        "ok": True,
+        "stdout": stdout_buffer.getvalue(),
+        "error_type": None,
+        "error": None,
+    }}
+except Exception as exc:
+    result = {{
+        "ok": False,
+        "stdout": stdout_buffer.getvalue(),
+        "error_type": type(exc).__name__,
+        "error": str(exc),
+    }}
+
+print({json.dumps(_TACO_STDIO_RESULT_PREFIX)} + json.dumps(result))
+"""
+
 
 def _extract_responses(completions):
     return [completion[0]["content"] for completion in completions]
@@ -258,6 +310,10 @@ def _extract_python_code(text):
     return cand[0] if cand else ""
 
 
+def _normalize_program_output(text):
+    return " ".join(str(text).strip().split())
+
+
 def _mbpp_reward_single_code(
     code,
     test_list,
@@ -357,6 +413,114 @@ def _run_code_tests(code, test_setup_code, tests, timeout_seconds):
     return execution_result["passed"], True
 
 
+def _run_stdio_code(code, stdin_text, timeout_seconds):
+    payload = json.dumps({
+        "code": code,
+        "stdin": stdin_text,
+    })
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", _TACO_STDIO_RUNNER],
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(
+            f"TACO stdio execution timed out after {timeout_seconds:.1f}s."
+        ) from exc
+
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip()
+        if not message:
+            message = f"TACO stdio subprocess exited with code {result.returncode}."
+        raise RuntimeError(message)
+
+    result_line = None
+    for line in reversed(result.stdout.splitlines()):
+        if line.startswith(_TACO_STDIO_RESULT_PREFIX):
+            result_line = line[len(_TACO_STDIO_RESULT_PREFIX):]
+            break
+    if result_line is None:
+        raise RuntimeError("TACO stdio subprocess did not return a result payload.")
+
+    execution_result = json.loads(result_line)
+    return (
+        bool(execution_result.get("ok")),
+        str(execution_result.get("stdout", "")),
+        execution_result,
+    )
+
+
+def _stdio_reward_single_code(
+    code,
+    inputs,
+    outputs,
+    *,
+    timeout_seconds,
+):
+    if not code or not inputs or len(inputs) != len(outputs):
+        return 0.0
+
+    passed = 0
+    ran = False
+    for stdin_text, expected in zip(inputs, outputs, strict=True):
+        ok, stdout_text, _ = _run_stdio_code(code, stdin_text, timeout_seconds)
+        ran = ran or ok
+        if not ok:
+            break
+        if _normalize_program_output(stdout_text) == _normalize_program_output(expected):
+            passed += 1
+
+    if passed > 0:
+        return _MBPP_COMPILES_BONUS + (1.0 - _MBPP_COMPILES_BONUS) * (passed / len(inputs))
+    if ran:
+        return _MBPP_COMPILES_BONUS
+    return 0.0
+
+
+def _taco_best_reward_for_response(
+    response,
+    *,
+    code_task_format,
+    test_list,
+    test_setup_code,
+    challenge_test_list,
+    stdio_inputs,
+    stdio_outputs,
+    timeout_seconds,
+):
+    best_r = 0.0
+    best_code = ""
+    for code in _extract_python_code_candidates(response):
+        if code_task_format == "call":
+            r = _mbpp_reward_single_code(
+                code,
+                test_list,
+                test_setup_code,
+                challenge_test_list,
+                timeout_seconds=timeout_seconds,
+            )
+        elif code_task_format == "stdio":
+            try:
+                r = _stdio_reward_single_code(
+                    code,
+                    stdio_inputs,
+                    stdio_outputs,
+                    timeout_seconds=timeout_seconds,
+                )
+            except Exception:
+                r = 0.0
+        else:
+            r = 0.0
+        if r > best_r:
+            best_r = r
+            best_code = code
+    return best_r, best_code
+
+
 def format_reward_func(completions, **kwargs):
     return [
         1.0 if _has_r1_reasoning_format(response) else 0.0
@@ -419,6 +583,60 @@ def mbpp_execution_reward_func(
         test_list,
         test_setup_code=test_setup_code,
         challenge_test_list=challenge_test_list,
+        timeout_seconds=timeout_seconds,
+    )
+    return rewards
+
+
+def taco_execution_rewards_and_codes(
+    completions,
+    *,
+    code_task_format,
+    test_list=None,
+    test_setup_code="",
+    challenge_test_list=None,
+    stdio_inputs=None,
+    stdio_outputs=None,
+    timeout_seconds=_DEFAULT_MBPP_TIMEOUT_SECONDS,
+):
+    rewards = []
+    codes = []
+    for response in _extract_responses(completions):
+        r, code = _taco_best_reward_for_response(
+            response,
+            code_task_format=code_task_format,
+            test_list=test_list or [],
+            test_setup_code=test_setup_code or "",
+            challenge_test_list=challenge_test_list or [],
+            stdio_inputs=stdio_inputs or [],
+            stdio_outputs=stdio_outputs or [],
+            timeout_seconds=timeout_seconds,
+        )
+        rewards.append(r)
+        codes.append(code)
+    return rewards, codes
+
+
+def taco_execution_reward_func(
+    completions,
+    *,
+    code_task_format,
+    test_list=None,
+    test_setup_code="",
+    challenge_test_list=None,
+    stdio_inputs=None,
+    stdio_outputs=None,
+    timeout_seconds=_DEFAULT_MBPP_TIMEOUT_SECONDS,
+    **kwargs,
+):
+    rewards, _ = taco_execution_rewards_and_codes(
+        completions,
+        code_task_format=code_task_format,
+        test_list=test_list,
+        test_setup_code=test_setup_code,
+        challenge_test_list=challenge_test_list,
+        stdio_inputs=stdio_inputs,
+        stdio_outputs=stdio_outputs,
         timeout_seconds=timeout_seconds,
     )
     return rewards
@@ -580,9 +798,12 @@ def mixed_code_execution_grpo_reward(
     completions,
     completion_ids=None,
     task_type=None,
+    code_task_format=None,
     test_list=None,
     test_setup_code=None,
     challenge_test_list=None,
+    stdio_inputs=None,
+    stdio_outputs=None,
     **kwargs,
 ):
     if task_type is None or test_list is None:
@@ -598,16 +819,34 @@ def mixed_code_execution_grpo_reward(
         if task_type[i] != "code":
             rewards.append(0.0)
             continue
+        task_format = (
+            code_task_format[i]
+            if code_task_format is not None and i < len(code_task_format)
+            else "call"
+        )
         ts = test_setup_code[i] if i < len(test_setup_code) else ""
         ctl_raw = None
         if challenge_test_list is not None and i < len(challenge_test_list):
             ctl_raw = challenge_test_list[i]
         ctl = ctl_raw if ctl_raw is not None else []
-        r, _ = _mbpp_best_reward_for_response(
+        row_stdio_inputs = (
+            stdio_inputs[i]
+            if stdio_inputs is not None and i < len(stdio_inputs)
+            else []
+        )
+        row_stdio_outputs = (
+            stdio_outputs[i]
+            if stdio_outputs is not None and i < len(stdio_outputs)
+            else []
+        )
+        r, _ = _taco_best_reward_for_response(
             text,
-            test_list[i],
-            ts or "",
-            ctl,
+            code_task_format=task_format,
+            test_list=test_list[i],
+            test_setup_code=ts or "",
+            challenge_test_list=ctl,
+            stdio_inputs=row_stdio_inputs,
+            stdio_outputs=row_stdio_outputs,
             timeout_seconds=_DEFAULT_MBPP_TIMEOUT_SECONDS,
         )
         rewards.append(r)
