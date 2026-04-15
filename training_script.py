@@ -777,6 +777,24 @@ def parse_args():
         ),
     )
     p.add_argument(
+        "--cache-rollouts",
+        action="store_true",
+        help=(
+            "Save minimal rollout bundles only for checkpoint-aligned optimizer steps "
+            "(prompt token ids, completion token ids, advantages, train_index) under "
+            "output_dir/rollout_cache for later historical replay reuse."
+        ),
+    )
+    p.add_argument(
+        "--rollout-cache-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional cache directory for --cache-rollouts. Defaults to "
+            "--output-dir/rollout_cache."
+        ),
+    )
+    p.add_argument(
         "--skip-eval",
         action="store_true",
         help=(
@@ -980,6 +998,41 @@ def main():
         train_dataset=train_dataset,
         processing_class=tokenizer,
         history_output_dir=out,
+        rollout_cache_dir=(
+            None
+            if args.rollout_cache_dir is None
+            else args.rollout_cache_dir.resolve()
+        ),
+        enable_rollout_cache=args.cache_rollouts,
+        rollout_cache_config={
+            "model_id": args.model_id,
+            "seed": args.seed,
+            "mixed": args.mixed,
+            "n_numina": args.n_numina,
+            "n_taco": args.n_taco,
+            "n_math": args.n_math,
+            "mixed_shuffle_seed": args.mixed_shuffle_seed,
+            "max_steps": args.max_steps,
+            "save_steps": args.save_steps,
+            "learning_rate": args.learning_rate,
+            "per_device_batch": args.per_device_batch,
+            "grad_accum": args.grad_accum,
+            "g_train": args.g_train,
+            "max_completion_length": args.max_completion_length,
+            "grpo_beta": args.grpo_beta,
+            "grpo_epsilon": args.grpo_epsilon,
+            "use_vllm": use_vllm,
+            "vllm_mode": args.vllm_mode if use_vllm else None,
+            "vllm_gpu_memory_utilization": (
+                args.vllm_gpu_memory_utilization if use_vllm else None
+            ),
+            "vllm_tensor_parallel_size": (
+                args.vllm_tensor_parallel_size if use_vllm else None
+            ),
+            "vllm_max_model_length": (
+                args.vllm_max_model_length if use_vllm else None
+            ),
+        },
     )
     if resume_checkpoint is not None:
         loaded_history, dropped_history = trainer.load_existing_history(
