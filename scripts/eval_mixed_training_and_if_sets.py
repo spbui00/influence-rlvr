@@ -25,7 +25,7 @@ from influence_rlvr.rewards import (
     humaneval_best_reward_for_response,
     mbpp_execution_rewards_and_codes,
 )
-from influence_rlvr.taco_convert import load_tac_mbpp_slice
+from influence_rlvr.taco_convert import tac_try_convert_row
 from influence_rlvr.utils import detect_device
 from influence_rlvr.eval import _generate_completions
 
@@ -65,15 +65,52 @@ def _format_humaneval(example: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def load_numina_train_dataset(n_numina: int) -> Dataset:
-    numina_files = [
-        f"hf://datasets/{NUMINA_DATASET}/data/train-{i:05d}-of-00005.parquet"
-        for i in range(5)
-    ]
-    split = f"train[:{n_numina}]"
-    raw = load_dataset("parquet", data_files=numina_files, split=split)
+def load_numina_test_dataset(limit: int) -> Dataset:
+    split = "train" if limit <= 0 else f"train[:{limit}]"
+    raw = load_dataset(
+        "parquet",
+        data_files=f"hf://datasets/{NUMINA_DATASET}/data/test-00000-of-00001.parquet",
+        split=split,
+    )
     ds = raw.map(_format_numina, remove_columns=raw.column_names)
     return ds.filter(lambda x: bool(str(x.get("solution", "")).strip()))
+
+
+def _list_tac_test_arrow_uris() -> list[str]:
+    try:
+        from huggingface_hub import HfFileSystem
+
+        fs = HfFileSystem()
+        paths = sorted(fs.glob("datasets/BAAI/TACO/test/*.arrow"))
+        return [f"hf://{p}" for p in paths]
+    except Exception:
+        return []
+
+
+def load_taco_test_dataset(limit: int) -> tuple[Dataset, int, int]:
+    if limit <= 0:
+        raise ValueError("limit must be positive for TACO test evaluation")
+    rows: list[dict[str, Any]] = []
+    scanned = 0
+    uris = _list_tac_test_arrow_uris()
+    if not uris:
+        uris = ["hf://datasets/BAAI/TACO/test/data-00000-of-00001.arrow"]
+    for uri in uris:
+        if len(rows) >= limit:
+            break
+        try:
+            ds = load_dataset("arrow", data_files=uri, split="train")
+        except Exception:
+            continue
+        for i in range(len(ds)):
+            if len(rows) >= limit:
+                break
+            scanned += 1
+            converted = tac_try_convert_row(ds[i])
+            if converted is None:
+                continue
+            rows.append(converted)
+    return Dataset.from_list(rows), scanned, len(rows)
 
 
 def load_humaneval_dataset(limit: int) -> Dataset:
@@ -133,7 +170,24 @@ def _math_pass_at_k(completions: list[list[dict[str, str]]], gold: str) -> tuple
     return (1.0 if passed else 0.0), responses, rewards
 
 
-def evaluate_numina_train(
+def _print_example_block(dataset_name: str, row: dict[str, Any]) -> None:
+    print("\n" + "=" * 100, flush=True)
+    print(f"{dataset_name} example {row['index']}", flush=True)
+    for key in ("task_id", "gold", "pass", "compile", "rewards", "parsed_answers", "entry_point"):
+        if key in row:
+            print(f"{key}: {row[key]}", flush=True)
+    for text_key in ("problem", "prompt_prefix", "prompt"):
+        if text_key in row:
+            print(f"--- {text_key} ---\n{row[text_key]}", flush=True)
+    responses = row.get("responses") or []
+    extracted_codes = row.get("extracted_codes") or []
+    for ridx, response in enumerate(responses, start=1):
+        print(f"--- response[{ridx}] ---\n{response}", flush=True)
+        if ridx - 1 < len(extracted_codes):
+            print(f"--- extracted_code[{ridx}] ---\n{extracted_codes[ridx - 1]}", flush=True)
+
+
+def evaluate_numina_test(
     model,
     tokenizer,
     dataset: Dataset,
@@ -179,6 +233,7 @@ def evaluate_numina_train(
             "parsed_answers": [extract_math_final_answer(resp) for resp in responses],
             "responses": responses,
         })
+        _print_example_block("numina_test", rows[-1])
 
     output_path.write_text(json.dumps(rows, indent=2) + "\n")
     return {
@@ -189,7 +244,7 @@ def evaluate_numina_train(
     }
 
 
-def evaluate_taco_train(
+def evaluate_taco_test(
     model,
     tokenizer,
     dataset: Dataset,
@@ -245,6 +300,7 @@ def evaluate_taco_train(
             "extracted_codes": extracted_codes,
             "test_list": sample["test_list"],
         })
+        _print_example_block("taco_test", rows[-1])
 
     output_path.write_text(json.dumps(rows, indent=2) + "\n")
     return {
@@ -313,6 +369,7 @@ def evaluate_humaneval(
             "responses": responses,
             "entry_point": sample["entry_point"],
         })
+        _print_example_block("humaneval_test", rows[-1])
 
     output_path.write_text(json.dumps(rows, indent=2) + "\n")
     return {
@@ -326,8 +383,8 @@ def evaluate_humaneval(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate a mixed-run checkpoint on the trained domains (Numina train, TACO train) "
-            "and the influence target domain (HumanEval), saving raw responses for inspection."
+            "Evaluate a mixed-run checkpoint on test splits only "
+            "(Numina test, TACO test, HumanEval test), saving and printing raw responses."
         )
     )
     parser.add_argument("--rlvr-output", type=Path, required=True)
@@ -339,8 +396,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--num-samples", type=int, default=4)
     parser.add_argument("--max-new-tokens", type=int, default=None)
-    parser.add_argument("--n-numina", type=int, default=None)
-    parser.add_argument("--n-taco", type=int, default=None)
+    parser.add_argument("--n-numina", type=int, default=200)
+    parser.add_argument("--n-taco", type=int, default=200)
     parser.add_argument("--n-humaneval", type=int, default=None)
     parser.add_argument("--hf", action="store_true", help="Use HF generation instead of vLLM.")
     parser.add_argument(
@@ -362,8 +419,8 @@ def main() -> None:
         raise SystemExit(f"Checkpoint directory not found: {checkpoint_dir}")
 
     model_id = str(run_cfg.get("model_id", "HuggingFaceTB/SmolLM2-1.7B-Instruct"))
-    numina_n = args.n_numina if args.n_numina is not None else int(run_cfg.get("n_numina", 3000))
-    taco_n = args.n_taco if args.n_taco is not None else int(run_cfg.get("n_taco", 3000))
+    numina_n = int(args.n_numina)
+    taco_n = int(args.n_taco)
     humaneval_n = args.n_humaneval if args.n_humaneval is not None else int(run_cfg.get("n_humaneval", 500))
     max_new_tokens = (
         args.max_new_tokens
@@ -388,12 +445,12 @@ def main() -> None:
     model, tokenizer = _load_model_and_tokenizer(checkpoint_dir, run_cfg, device)
 
     print("Loading eval datasets...", flush=True)
-    numina_train = load_numina_train_dataset(numina_n)
-    taco_train, taco_scanned, taco_kept = load_tac_mbpp_slice(taco_n)
+    numina_test = load_numina_test_dataset(numina_n)
+    taco_test, taco_scanned, taco_kept = load_taco_test_dataset(taco_n)
     humaneval_ds = load_humaneval_dataset(humaneval_n)
     print(
-        f"Numina train={len(numina_train)} | "
-        f"TACO train={len(taco_train)} (scanned={taco_scanned}, kept={taco_kept}) | "
+        f"Numina test={len(numina_test)} | "
+        f"TACO test={len(taco_test)} (scanned={taco_scanned}, kept={taco_kept}) | "
         f"HumanEval={len(humaneval_ds)}",
         flush=True,
     )
@@ -414,10 +471,10 @@ def main() -> None:
         "datasets": {},
     }
 
-    summary["datasets"]["numina_train"] = evaluate_numina_train(
+    summary["datasets"]["numina_test"] = evaluate_numina_test(
         model,
         tokenizer,
-        numina_train,
+        numina_test,
         device=device,
         num_samples=args.num_samples,
         max_new_tokens=max_new_tokens,
@@ -425,18 +482,18 @@ def main() -> None:
         vllm_config=vllm_config,
         checkpoint_dir=checkpoint_dir,
         model_id=model_id,
-        output_path=responses_dir / "numina_train.json",
+        output_path=responses_dir / "numina_test.json",
     )
     print(
-        f"Numina train {summary['datasets']['numina_train']['pass_metric']}: "
-        f"{summary['datasets']['numina_train']['pass_rate']:.4f}",
+        f"Numina test {summary['datasets']['numina_test']['pass_metric']}: "
+        f"{summary['datasets']['numina_test']['pass_rate']:.4f}",
         flush=True,
     )
 
-    summary["datasets"]["taco_train"] = evaluate_taco_train(
+    summary["datasets"]["taco_test"] = evaluate_taco_test(
         model,
         tokenizer,
-        taco_train,
+        taco_test,
         device=device,
         num_samples=args.num_samples,
         max_new_tokens=max_new_tokens,
@@ -444,13 +501,13 @@ def main() -> None:
         vllm_config=vllm_config,
         checkpoint_dir=checkpoint_dir,
         model_id=model_id,
-        output_path=responses_dir / "taco_train.json",
+        output_path=responses_dir / "taco_test.json",
     )
     print(
-        f"TACO train {summary['datasets']['taco_train']['pass_metric']}: "
-        f"{summary['datasets']['taco_train']['pass_rate']:.4f} | "
-        f"{summary['datasets']['taco_train']['compile_metric']}: "
-        f"{summary['datasets']['taco_train']['compile_rate']:.4f}",
+        f"TACO test {summary['datasets']['taco_test']['pass_metric']}: "
+        f"{summary['datasets']['taco_test']['pass_rate']:.4f} | "
+        f"{summary['datasets']['taco_test']['compile_metric']}: "
+        f"{summary['datasets']['taco_test']['compile_rate']:.4f}",
         flush=True,
     )
 
