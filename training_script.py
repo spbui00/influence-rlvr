@@ -492,6 +492,14 @@ def _args_to_jsonable(args: argparse.Namespace) -> dict:
     return d
 
 
+def _model_dtype_for_device(device: torch.device) -> torch.dtype:
+    if device.type == "cuda":
+        return torch.bfloat16
+    if device.type == "mps":
+        return torch.float32
+    return torch.float32
+
+
 def _resume_step_from_checkpoint(checkpoint_path: Path) -> int:
     name = checkpoint_path.name
     if not name.startswith("checkpoint-"):
@@ -558,7 +566,8 @@ def parse_args():
     p = argparse.ArgumentParser(
         description=(
             "Standalone GRPO training matching main_pipeline Phase 1: GSM8K math (default) or "
-            "mixed NuminaMath-CoT + TACO (--mixed). "
+            "mixed NuminaMath-CoT + TACO (--mixed), or a local benchmark JSONL "
+            "(--benchmark-train-jsonl). "
             "Default: vLLM colocated generation via TRL (requires Linux + CUDA + vllm extra)."
         ),
         epilog=_TRAINING_SCRIPT_EPILOG,
@@ -604,6 +613,15 @@ def parse_args():
         help=(
             "Train on NuminaMath-CoT + TACO (native executable subset) with mixed GRPO rewards, "
             "using native TACO execution when possible, same as main_pipeline MIXED_GRPO Phase 1."
+        ),
+    )
+    p.add_argument(
+        "--benchmark-train-jsonl",
+        default=None,
+        help=(
+            "Path to a local training benchmark JSONL. When set, training uses that file "
+            "instead of GSM8K or --mixed datasets. Expected row schema matches the "
+            "IF perturbation benchmark train.jsonl format."
         ),
     )
     p.add_argument(
@@ -784,11 +802,26 @@ def main():
     args = parse_args()
     if args.eval_majority_votes < 1:
         raise SystemExit("--eval-majority-votes must be >= 1")
+    if args.benchmark_train_jsonl is not None and args.mixed:
+        raise SystemExit(
+            "--benchmark-train-jsonl cannot be combined with --mixed. "
+            "Use one training data source."
+        )
     os.environ["WANDB_PROJECT"] = (
-        "influence-rlvr-mixed" if args.mixed else "influence-rlvr-math"
+        "influence-rlvr-benchmark"
+        if args.benchmark_train_jsonl is not None
+        else ("influence-rlvr-mixed" if args.mixed else "influence-rlvr-math")
     )
     os.environ["WANDB_NAME"] = (
-        f"smollm2-mixed-seed{args.seed}" if args.mixed else f"smollm2-run-seed{args.seed}"
+        (
+            f"smollm2-benchmark-seed{args.seed}"
+            if args.benchmark_train_jsonl is not None
+            else (
+                f"smollm2-mixed-seed{args.seed}"
+                if args.mixed
+                else f"smollm2-run-seed{args.seed}"
+            )
+        )
     )
     os.environ["PYTHONHASHSEED"] = str(args.seed)
     set_seed(args.seed)
@@ -836,9 +869,12 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
+    model_dtype = _model_dtype_for_device(device)
+    print(f"Model dtype: {model_dtype}")
+
     base_model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=model_dtype,
     ).to(device)
 
     lora_targets = _parse_lora_target_modules(args.lora_target_modules)
@@ -857,7 +893,11 @@ def main():
     else:
         print("Skipping save_base_checkpoint while resuming.")
 
-    if not args.skip_eval and resume_checkpoint is None:
+    if (
+        not args.skip_eval
+        and resume_checkpoint is None
+        and args.benchmark_train_jsonl is None
+    ):
         run_all_non_skip_evals(
             model,
             tokenizer,
@@ -867,8 +907,12 @@ def main():
         )
     elif resume_checkpoint is not None and not args.skip_eval:
         print("Skipping baseline eval while resuming from checkpoint.")
+    elif args.benchmark_train_jsonl is not None and not args.skip_eval:
+        print("Skipping built-in evals for --benchmark-train-jsonl.")
 
-    if args.mixed:
+    if args.benchmark_train_jsonl is not None:
+        print("\nLoading benchmark train JSONL...")
+    elif args.mixed:
         print("\nLoading mixed train (NuminaMath-CoT + TACO)...")
     else:
         print("\nLoading GSM8K train slice...")
@@ -982,7 +1026,7 @@ def main():
     print(f"\nTraining finished in {time.time() - t0:.1f}s")
     clear_cache(device)
 
-    if not args.skip_eval:
+    if not args.skip_eval and args.benchmark_train_jsonl is None:
         run_all_non_skip_evals(
             model,
             tokenizer,
@@ -990,6 +1034,8 @@ def main():
             args,
             phase="after_train",
         )
+    elif args.benchmark_train_jsonl is not None and not args.skip_eval:
+        print("Skipping post-train built-in evals for --benchmark-train-jsonl.")
 
 
 if __name__ == "__main__":

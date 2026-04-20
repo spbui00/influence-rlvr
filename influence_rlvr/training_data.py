@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 from datasets import Dataset, concatenate_datasets, load_dataset
@@ -103,7 +105,66 @@ def _load_mixed_train_dataset(args) -> Dataset:
     return dataset
 
 
+def _normalize_benchmark_row(row, idx):
+    task_type = row.get("task_type")
+    if task_type not in {"math", "code"}:
+        raise ValueError(
+            f"Benchmark row at index {idx} must have task_type 'math' or 'code'; got {task_type!r}."
+        )
+
+    normalized = dict(row)
+    normalized["train_index"] = idx
+    normalized["solution"] = normalized.get("solution") or ""
+    normalized["task_type"] = task_type
+
+    if task_type == "math":
+        normalized["test_list"] = []
+        normalized["test_setup_code"] = ""
+        normalized["challenge_test_list"] = []
+        normalized["code_task_format"] = None
+        normalized["stdio_inputs"] = []
+        normalized["stdio_outputs"] = []
+        normalized["fn_name"] = None
+    else:
+        normalized["test_list"] = list(normalized.get("test_list") or [])
+        normalized["test_setup_code"] = normalized.get("test_setup_code") or ""
+        normalized["challenge_test_list"] = list(normalized.get("challenge_test_list") or [])
+        normalized["code_task_format"] = normalized.get("code_task_format") or "call"
+        normalized["stdio_inputs"] = list(normalized.get("stdio_inputs") or [])
+        normalized["stdio_outputs"] = list(normalized.get("stdio_outputs") or [])
+        normalized["fn_name"] = normalized.get("fn_name")
+    return normalized
+
+
+def _load_benchmark_train_dataset(args) -> Dataset:
+    benchmark_path = Path(args.benchmark_train_jsonl).expanduser().resolve()
+    rows = []
+    with benchmark_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(json.loads(line))
+    raw = Dataset.from_list(rows)
+    dataset = raw.map(_normalize_benchmark_row, with_indices=True)
+    print(f"  Benchmark JSONL: {benchmark_path}")
+    print(f"  Benchmark rows: {len(dataset)}")
+    return dataset
+
+
 def load_training_data_bundle(args) -> TrainingDataBundle:
+    if args.benchmark_train_jsonl is not None:
+        return TrainingDataBundle(
+            mode_name="benchmark",
+            train_dataset=_load_benchmark_train_dataset(args),
+            reward_funcs=[
+                mixed_format_guardrail_grpo_reward,
+                mixed_math_accuracy_grpo_reward,
+                mixed_code_execution_grpo_reward,
+            ],
+            eval_mode="none",
+        )
+
     if args.mixed:
         return TrainingDataBundle(
             mode_name="mixed",
