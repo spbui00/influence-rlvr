@@ -216,3 +216,4 @@ results/
 
 .DS_Store
 wandb/
+tmp/

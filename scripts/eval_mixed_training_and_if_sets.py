@@ -1,3 +1,6 @@
+"""
+Evaluate a mixed-run checkpoint on test splits only (Numina test, TACO test, HumanEval test), saving and printing raw responses.
+"""
 #!/usr/bin/env python3
 from __future__ import annotations
 

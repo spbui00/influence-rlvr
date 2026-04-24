@@ -53,6 +53,22 @@ from .trajectory import (
     collect_checkpoint_infos,
 )
 from .training import HistoricalBatchGRPOTrainer
+from .toy_grpo import (
+    AutoregressiveLogisticRegression,
+    ToyGRPOExample,
+    ToyHistoricalInfluenceSummary,
+    ToyRolloutMode,
+    ToySandboxDataset,
+    build_user_plan_sandbox,
+    compute_toy_fisher_influence,
+    compute_toy_gradient_bundle,
+    compute_toy_historical_fisher_influence,
+    compute_toy_test_loss,
+    exact_expected_reward,
+    initialize_toy_model,
+    train_toy_grpo,
+    validate_toy_influence_with_preconditioned_step,
+)
 from .utils import detect_device, clear_cache
 
 __all__ = [
@@ -100,6 +116,20 @@ __all__ = [
     "taco_execution_rewards_and_codes",
     "collect_reward_infos",
     "HistoricalBatchGRPOTrainer",
+    "AutoregressiveLogisticRegression",
+    "ToyGRPOExample",
+    "ToyHistoricalInfluenceSummary",
+    "ToyRolloutMode",
+    "ToySandboxDataset",
+    "build_user_plan_sandbox",
+    "compute_toy_fisher_influence",
+    "compute_toy_gradient_bundle",
+    "compute_toy_historical_fisher_influence",
+    "compute_toy_test_loss",
+    "exact_expected_reward",
+    "initialize_toy_model",
+    "train_toy_grpo",
+    "validate_toy_influence_with_preconditioned_step",
     "detect_device",
     "clear_cache",
 ]

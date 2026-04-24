@@ -5,6 +5,12 @@ from .base import BaseInfluenceMethod
 from .tracin import _stack_train_weights
 
 
+def _influence_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
 def _geometry_weight_vector(infos):
     if not infos:
         return torch.zeros(0, dtype=torch.float32)
@@ -25,6 +31,7 @@ def _geometry_weight_vector(infos):
 class FisherInfluence(BaseInfluenceMethod):
     def __init__(self, train_infos: list, lambda_damp: float = 0.1, normalize: bool = False):
         with torch.no_grad():
+            self.device = _influence_device()
             self.lambda_damp = lambda_damp
             self.normalize = normalize
             self._train_grad_list = [info["grad"] for info in train_infos]
@@ -41,10 +48,10 @@ class FisherInfluence(BaseInfluenceMethod):
                 raise ValueError("train_infos grad and geometry_feature counts differ.")
 
             if n > 0 and normalize:
-                norms = torch.empty(n, dtype=torch.float32, device="cuda")
+                norms = torch.empty(n, dtype=torch.float32, device=self.device)
                 for i in range(n):
                     gi = self._train_grad_list[i].to(
-                        device="cuda", dtype=torch.float32
+                        device=self.device, dtype=torch.float32
                     )
                     norms[i] = gi.norm().clamp(min=1e-12)
                     del gi
@@ -53,10 +60,10 @@ class FisherInfluence(BaseInfluenceMethod):
                 self._grad_norms = None
 
             if n > 0 and normalize:
-                geom_norms = torch.empty(n, dtype=torch.float32, device="cuda")
+                geom_norms = torch.empty(n, dtype=torch.float32, device=self.device)
                 for i in range(n):
                     xi = self._geometry_list[i].to(
-                        device="cuda", dtype=torch.float32
+                        device=self.device, dtype=torch.float32
                     )
                     geom_norms[i] = xi.norm().clamp(min=1e-12)
                     del xi
@@ -64,7 +71,7 @@ class FisherInfluence(BaseInfluenceMethod):
             else:
                 self._geometry_norms = None
 
-            self.geometry_weights = _geometry_weight_vector(train_infos).to("cuda")
+            self.geometry_weights = _geometry_weight_vector(train_infos).to(self.device)
 
             chunk_size = 10
             if n == 0:
@@ -92,7 +99,7 @@ class FisherInfluence(BaseInfluenceMethod):
     def _geometry_weighted_chunk(self, start: int, end: int) -> torch.Tensor:
         chunk = torch.stack(
             [
-                self._geometry_list[k].to(device="cuda", dtype=torch.float32)
+                self._geometry_list[k].to(device=self.device, dtype=torch.float32)
                 for k in range(start, end)
             ]
         )
@@ -103,20 +110,20 @@ class FisherInfluence(BaseInfluenceMethod):
 
     def _precondition(self, g_test: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
-            g = g_test.to(device="cuda", dtype=torch.float32)
+            g = g_test.to(device=self.device, dtype=torch.float32)
             if self.normalize:
                 g = g / (g.norm() + 1e-12)
             n = len(self._geometry_list)
             chunk_size = 10
             if n == 0:
                 return (1.0 / self.lambda_damp) * g
-            features_g = torch.empty(n, dtype=torch.float32, device="cuda")
+            features_g = torch.empty(n, dtype=torch.float32, device=self.device)
             for i in range(0, n, chunk_size):
                 i_end = min(i + chunk_size, n)
                 chunk = self._geometry_weighted_chunk(i, i_end)
                 features_g[i:i_end] = chunk @ g
                 del chunk
-            temp = self.inverse_small.to("cuda") @ features_g
+            temp = self.inverse_small.to(self.device) @ features_g
             del features_g
             correction = torch.zeros_like(g)
             for i in range(0, n, chunk_size):
@@ -143,7 +150,7 @@ class FisherInfluence(BaseInfluenceMethod):
                 chunk = torch.stack(
                     [
                         self._train_grad_list[k].to(
-                            device="cuda", dtype=torch.float32
+                            device=self.device, dtype=torch.float32
                         )
                         for k in range(i, i_end)
                     ]
@@ -157,7 +164,7 @@ class FisherInfluence(BaseInfluenceMethod):
     def compute_score(self, test_info: dict, train_info: dict) -> float:
         with torch.no_grad():
             g_train = train_info["grad"].to(
-                device="cuda", dtype=torch.float32
+                device=self.device, dtype=torch.float32
             )
             if self.normalize:
                 g_train = g_train / (g_train.norm() + 1e-12)
@@ -182,6 +189,7 @@ class TrajectoryFisherInfluence:
             n_test = len(checkpoint["test_infos"])
             n_train = len(checkpoint["train_infos"])
             if checkpoint.get("fisher_checkpoint_matrix") is not None:
+                # precomputed matrix for this checkpoint, just load it
                 matrix = np.asarray(
                     checkpoint["fisher_checkpoint_matrix"],
                     dtype=np.float32,
