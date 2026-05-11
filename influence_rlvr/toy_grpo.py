@@ -29,6 +29,17 @@ class ToyRolloutMode(str, Enum):
         return cls(str(value).strip().lower())
 
 
+class ToyHistoricalWeightMode(str, Enum):
+    ACTIVE_ONLY = "active_only"
+    ALL_SAMPLES = "all_samples"
+
+    @classmethod
+    def parse(cls, value: ToyHistoricalWeightMode | str) -> ToyHistoricalWeightMode:
+        if isinstance(value, cls):
+            return value
+        return cls(str(value).strip().lower())
+
+
 @dataclass(frozen=True)
 class ToyGRPOExample:
     name: str
@@ -85,13 +96,13 @@ def build_user_plan_sandbox() -> ToySandboxDataset:
                 name="helpful_feature_a",
                 z=(1, 0, 0),
                 target=(1, 0),
-                expected_influence="negative",
+                expected_influence="helpful",
             ),
             ToyGRPOExample(
                 name="harmful_shared_noise",
                 z=(0, 1, 1),
                 target=(0, 1),
-                expected_influence="positive",
+                expected_influence="harmful",
             ),
             ToyGRPOExample(
                 name="neutral_feature_b_only",
@@ -236,7 +247,7 @@ def sequence_labels(sequences: torch.Tensor) -> list[str]:
 
 
 def exact_expected_reward(
-    model: AutoregressiveLogisticRegression,
+    model: nn.Module,
     example: ToyGRPOExample,
 ) -> float:
     sequences, probs = model.exact_sequence_distribution(example.z_tensor(device=model.device))
@@ -245,7 +256,7 @@ def exact_expected_reward(
 
 
 def rollout_token_sequences(
-    model: AutoregressiveLogisticRegression,
+    model: nn.Module,
     example: ToyGRPOExample,
     *,
     G: int = 4,
@@ -275,7 +286,7 @@ def rollout_token_sequences(
 
 
 def _toy_objective_and_debug(
-    model: AutoregressiveLogisticRegression,
+    model: nn.Module,
     example: ToyGRPOExample,
     *,
     G: int,
@@ -283,8 +294,8 @@ def _toy_objective_and_debug(
     seed: int | None,
     epsilon: float,
     beta: float,
-    old_model: AutoregressiveLogisticRegression | None,
-    ref_model: AutoregressiveLogisticRegression | None,
+    old_model: nn.Module | None,
+    ref_model: nn.Module | None,
     advantage_eps: float,
     objective_mode: GradientObjective | str,
 ):
@@ -368,7 +379,7 @@ def _toy_objective_and_debug(
 
 
 def compute_toy_gradient_bundle(
-    model: AutoregressiveLogisticRegression,
+    model: nn.Module,
     example: ToyGRPOExample,
     *,
     G: int = 4,
@@ -376,8 +387,8 @@ def compute_toy_gradient_bundle(
     seed: int | None = None,
     epsilon: float = 0.2,
     beta: float = 0.0,
-    old_model: AutoregressiveLogisticRegression | None = None,
-    ref_model: AutoregressiveLogisticRegression | None = None,
+    old_model: nn.Module | None = None,
+    ref_model: nn.Module | None = None,
     advantage_eps: float = 1e-4,
     objective_mode: GradientObjective | str = GradientObjective.GRPO_TRAIN,
     geometry_feature_mode: GeometryFeatureMode | str = GeometryFeatureMode.NONE,
@@ -507,7 +518,7 @@ def dense_policy_score_fisher(
 
 
 def compute_toy_fisher_influence(
-    model: AutoregressiveLogisticRegression,
+    model: nn.Module,
     *,
     train_examples: Sequence[ToyGRPOExample],
     test_example: ToyGRPOExample,
@@ -518,6 +529,7 @@ def compute_toy_fisher_influence(
     beta: float = 0.0,
     advantage_eps: float = 1e-4,
     seed: int = 0,
+    fisher_solver: str = "woodbury",
 ) -> dict:
     train_infos = []
     for idx, example in enumerate(train_examples):
@@ -572,6 +584,7 @@ def compute_toy_fisher_influence(
     trajectory_fisher = TrajectoryFisherInfluence(
         lambda_damp=lambda_damp,
         normalize=False,
+        solver=fisher_solver,
     )
     matrix, breakdown = trajectory_fisher.compute_matrix(
         checkpoint_infos,
@@ -598,6 +611,7 @@ def compute_toy_fisher_influence(
         "loss_influence_scores": -repo_scores,
         "dense_repo_scores": dense_repo_scores.numpy(),
         "dense_fisher": dense_fisher,
+        "fisher_solver": fisher_solver,
     }
 
 
@@ -614,6 +628,7 @@ def validate_toy_influence_with_preconditioned_step(
     beta: float = 0.0,
     advantage_eps: float = 1e-4,
     seed: int = 0,
+    fisher_solver: str = "woodbury",
 ) -> dict:
     influence = compute_toy_fisher_influence(
         model,
@@ -626,6 +641,7 @@ def validate_toy_influence_with_preconditioned_step(
         beta=beta,
         advantage_eps=advantage_eps,
         seed=seed,
+        fisher_solver=fisher_solver,
     )
     dense_fisher = influence["dense_fisher"]
     base_loss = float(influence["test_info"]["debug"]["policy_loss"])
@@ -722,7 +738,10 @@ def compute_toy_historical_fisher_influence(
     beta: float = 0.0,
     advantage_eps: float = 1e-4,
     seed: int = 0,
+    historical_weight_mode: ToyHistoricalWeightMode | str = ToyHistoricalWeightMode.ACTIVE_ONLY,
+    fisher_solver: str = "woodbury",
 ) -> dict:
+    historical_weight_mode = ToyHistoricalWeightMode.parse(historical_weight_mode)
     if end_step is None:
         end_step = max((int(row["step"]) for row in train_history), default=0)
     if end_step < 0:
@@ -732,8 +751,10 @@ def compute_toy_historical_fisher_influence(
     truncated_history = [row for row in train_history if int(row["step"]) <= end_step]
     checkpoint_infos = []
 
-    for row in truncated_history:
+    for i, row in enumerate(truncated_history):
         step = int(row["step"])
+        if i % 50 == 0:
+            print(f"    Processing trajectory step {step}/{end_step}...")
         pre_step = step - 1
         if pre_step not in checkpoints:
             raise ValueError(
@@ -771,7 +792,11 @@ def compute_toy_historical_fisher_influence(
                     ),
                     "name": example.name,
                     "expected_influence": example.expected_influence,
-                    "historical_weight": 1.0 if example.name == used_example_name else 0.0,
+                    "historical_weight": (
+                        1.0
+                        if historical_weight_mode == ToyHistoricalWeightMode.ALL_SAMPLES
+                        else (1.0 if example.name == used_example_name else 0.0)
+                    ),
                 }
             )
 
@@ -808,6 +833,7 @@ def compute_toy_historical_fisher_influence(
     trajectory_fisher = TrajectoryFisherInfluence(
         lambda_damp=lambda_damp,
         normalize=False,
+        solver=fisher_solver,
     )
     matrix, breakdown = trajectory_fisher.compute_matrix(
         checkpoint_infos,
@@ -816,8 +842,12 @@ def compute_toy_historical_fisher_influence(
     repo_scores = matrix[0] if len(checkpoint_infos) > 0 else torch.zeros(len(train_examples)).numpy()
 
     occurrence_count = {example.name: 0 for example in train_examples}
-    for row in truncated_history:
-        occurrence_count[str(row["example_name"])] += 1
+    if historical_weight_mode == ToyHistoricalWeightMode.ALL_SAMPLES:
+        for example in train_examples:
+            occurrence_count[example.name] = len(truncated_history)
+    else:
+        for row in truncated_history:
+            occurrence_count[str(row["example_name"])] += 1
 
     initial_model = clone_toy_model(model_template)
     initial_model.load_state_dict(checkpoints[0])
@@ -877,4 +907,6 @@ def compute_toy_historical_fisher_influence(
         "initial_test_expected_reward": initial_test_reward,
         "final_test_expected_reward": final_test_reward,
         "actual_total_reward_delta": float(final_test_reward - initial_test_reward),
+        "historical_weight_mode": historical_weight_mode.value,
+        "fisher_solver": fisher_solver,
     }

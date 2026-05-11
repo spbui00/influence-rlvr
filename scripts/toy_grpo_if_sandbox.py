@@ -4,11 +4,13 @@ import argparse
 import csv
 import json
 from pathlib import Path
+import time
 
 import matplotlib.pyplot as plt
 
 from influence_rlvr.toy_grpo import (
     AutoregressiveLogisticRegression,
+    ToyHistoricalWeightMode,
     ToyRolloutMode,
     build_user_plan_sandbox,
     clone_toy_model,
@@ -90,6 +92,25 @@ def build_parser() -> argparse.ArgumentParser:
         default="tmp/toy_grpo_if",
         help="Directory where checkpoint-wise IF trajectories are written.",
     )
+    parser.add_argument(
+        "--historical-weight-mode",
+        choices=[mode.value for mode in ToyHistoricalWeightMode],
+        default=ToyHistoricalWeightMode.ACTIVE_ONLY.value,
+        help=(
+            "How historical trajectory Fisher weights train examples at each step: "
+            "`active_only` keeps only the example actually used at that step; "
+            "`all_samples` includes every train example at every step."
+        ),
+    )
+    parser.add_argument(
+        "--fisher-solver",
+        choices=["woodbury", "full"],
+        default="woodbury",
+        help=(
+            "Fisher inverse backend. `woodbury` is the existing n x n solve; "
+            "`full` builds and inverts the full D x D Fisher matrix."
+        ),
+    )
     return parser
 
 
@@ -169,11 +190,22 @@ def _plot_total_deltas(
 
 
 def main() -> None:
+    start_time = time.time()
     args = build_parser().parse_args()
     sandbox = build_user_plan_sandbox()
     rollout_mode = ToyRolloutMode.parse(args.rollout_mode)
+    historical_weight_mode = ToyHistoricalWeightMode.parse(args.historical_weight_mode)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    historical_suffix = historical_weight_mode.value
+    solver_suffix = args.fisher_solver
+    local_csv_path = output_dir / f"local_if_{solver_suffix}.csv"
+    local_json_path = output_dir / f"local_if_{solver_suffix}.json"
+    local_plot_path = output_dir / f"local_if_repo_score_{solver_suffix}.png"
+    historical_csv_path = output_dir / f"historical_if_{historical_suffix}_{solver_suffix}.csv"
+    historical_json_path = output_dir / f"historical_if_{historical_suffix}_{solver_suffix}.json"
+    historical_plot_path = output_dir / f"historical_if_repo_score_{historical_suffix}_{solver_suffix}.png"
+    historical_totals_plot_path = output_dir / f"historical_total_deltas_{historical_suffix}_{solver_suffix}.png"
 
     model = AutoregressiveLogisticRegression(use_bias=args.use_bias)
     initialize_toy_model(
@@ -183,20 +215,13 @@ def main() -> None:
         scale=args.init_scale,
     )
     
-    # accuracy before training 
-    print("Initial model")
+    print("--- PRE-TRAINING STATS ---") 
     for example in sandbox.train_examples:
-        preview_g = 4 if rollout_mode == ToyRolloutMode.EXHAUSTIVE else 1
-        response_ids = rollout_token_sequences(
-            model,
-            example,
-            G=preview_g,
-            rollout_mode=rollout_mode,
-            seed=args.seed,
-        )
-        print(f"Prompt: {example.z}")
-        print(f"Correct: {example.target}")
-        print(f"Response: {sequence_labels(response_ids)[0]}")
+        acc = exact_expected_reward(model, example)
+        print(f"Train example {example.name}: expected reward {acc:.6f}")
+    test_acc = exact_expected_reward(model, sandbox.test_example)
+    print(f"Test example {sandbox.test_example.name}: expected reward {test_acc:.6f}")
+    print()
 
     train_result = train_toy_grpo(
         model,
@@ -209,6 +234,18 @@ def main() -> None:
         checkpoint_steps=range(args.steps + 1),
         seed=args.seed,
     )
+
+    print("--- TRAINING COMPLETE ---")
+    print(f"Total training time: {time.time() - start_time:.2f} seconds\n")
+
+    print("--- AFTER-TRAINING STATS ---")
+    for example in sandbox.train_examples:
+        acc = exact_expected_reward(model, example)
+        print(f"Train example {example.name}: expected reward {acc:.6f}")
+    test_acc = exact_expected_reward(model, sandbox.test_example)
+    print(f"Test example {sandbox.test_example.name}: expected reward {test_acc:.6f}")
+    print()
+
     checkpoints = train_result["checkpoints"]
     checkpoint_steps = sorted(checkpoints)
 
@@ -219,6 +256,8 @@ def main() -> None:
     historical_totals_rows = []
     final_local = None
     final_historical = None
+
+    if_timer = time.time()
 
     for checkpoint_step in checkpoint_steps:
         checkpoint_model = clone_toy_model(model)
@@ -234,6 +273,7 @@ def main() -> None:
             epsilon=args.epsilon,
             beta=args.beta,
             seed=args.seed,
+            fisher_solver=args.fisher_solver,
         )
         if checkpoint_step == checkpoint_steps[-1]:
             final_local = local
@@ -310,6 +350,8 @@ def main() -> None:
             epsilon=args.epsilon,
             beta=args.beta,
             seed=args.seed,
+            historical_weight_mode=historical_weight_mode,
+            fisher_solver=args.fisher_solver,
         )
         if checkpoint_step == checkpoint_steps[-1]:
             final_historical = historical
@@ -345,6 +387,8 @@ def main() -> None:
             }
         )
 
+    print(f"Computed IF trajectories for {len(checkpoint_steps)} checkpoints in {time.time() - if_timer:.2f} seconds\n")
+
     print("Toy GRPO IF sandbox")
     print(
         f"  rollout_mode={rollout_mode.value} use_bias={args.use_bias} "
@@ -354,6 +398,8 @@ def main() -> None:
         f"  checkpoints=0..{args.steps} lambda_damp={args.lambda_damp} "
         f"epsilon={args.epsilon} beta={args.beta}"
     )
+    print(f"  historical_weight_mode={historical_weight_mode.value}")
+    print(f"  fisher_solver={args.fisher_solver}")
     print(f"  output_dir={output_dir}")
     print()
 
@@ -401,6 +447,10 @@ def main() -> None:
 
     print(f"Historical trajectory Fisher up to final step ({final_checkpoint_step})")
     print("  repo_fisher_score > 0 still means helpful in the repo convention.")
+    if historical_weight_mode == ToyHistoricalWeightMode.ALL_SAMPLES:
+        print("  all_samples mode: every train sample contributes at every training step.")
+    else:
+        print("  active_only mode: only the actually used train sample contributes at each step.")
     for row in final_historical["historical_scores"]:
         print(
             f"  {row.train_name:24s} count={row.occurrence_count:2d} "
@@ -417,7 +467,7 @@ def main() -> None:
     )
 
     _write_csv(
-        output_dir / "local_if.csv",
+        local_csv_path,
         local_rows,
         [
             "checkpoint_step",
@@ -428,7 +478,7 @@ def main() -> None:
         ],
     )
     _write_csv(
-        output_dir / "historical_if.csv",
+        historical_csv_path,
         historical_rows,
         [
             "checkpoint_step",
@@ -438,9 +488,9 @@ def main() -> None:
             "repo_fisher_score",
         ],
     )
-    with (output_dir / "local_if.json").open("w") as handle:
+    with local_json_path.open("w") as handle:
         json.dump(local_json, handle, indent=2)
-    with (output_dir / "historical_if.json").open("w") as handle:
+    with historical_json_path.open("w") as handle:
         json.dump(historical_json, handle, indent=2)
     with (output_dir / "summary.json").open("w") as handle:
         json.dump(
@@ -456,10 +506,12 @@ def main() -> None:
                     "epsilon": args.epsilon,
                     "beta": args.beta,
                     "use_bias": args.use_bias,
+                    "historical_weight_mode": historical_weight_mode.value,
+                    "fisher_solver": args.fisher_solver,
                 },
                 "final_checkpoint_step": final_checkpoint_step,
-                "local_if_csv": str(output_dir / "local_if.csv"),
-                "historical_if_csv": str(output_dir / "historical_if.csv"),
+                "local_if_csv": str(local_csv_path),
+                "historical_if_csv": str(historical_csv_path),
             },
             handle,
             indent=2,
@@ -469,26 +521,26 @@ def main() -> None:
         value_key="repo_fisher_score",
         title="Checkpoint-Local IF",
         ylabel="Repo Fisher Score",
-        output_path=output_dir / "local_if_repo_score.png",
+        output_path=local_plot_path,
     )
     _plot_if_trajectories(
         historical_rows,
         value_key="repo_fisher_score",
         title="Historical Cumulative IF",
         ylabel="Repo Fisher Score",
-        output_path=output_dir / "historical_if_repo_score.png",
+        output_path=historical_plot_path,
     )
     _plot_total_deltas(
         historical_totals_rows,
-        output_path=output_dir / "historical_total_deltas.png",
+        output_path=historical_totals_plot_path,
     )
     print()
     print("Saved trajectory files")
-    print(f"  local IF by checkpoint: {output_dir / 'local_if.csv'}")
-    print(f"  historical cumulative IF: {output_dir / 'historical_if.csv'}")
-    print(f"  local IF plot: {output_dir / 'local_if_repo_score.png'}")
-    print(f"  historical IF plot: {output_dir / 'historical_if_repo_score.png'}")
-    print(f"  total delta plot: {output_dir / 'historical_total_deltas.png'}")
+    print(f"  local IF by checkpoint: {local_csv_path}")
+    print(f"  historical cumulative IF: {historical_csv_path}")
+    print(f"  local IF plot: {local_plot_path}")
+    print(f"  historical IF plot: {historical_plot_path}")
+    print(f"  total delta plot: {historical_totals_plot_path}")
     print(f"  json summary: {output_dir / 'summary.json'}")
 
 

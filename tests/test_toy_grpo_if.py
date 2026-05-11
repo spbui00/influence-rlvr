@@ -3,6 +3,7 @@ import unittest
 from influence_rlvr.modes import GeometryFeatureMode, GradientObjective
 from influence_rlvr.toy_grpo import (
     AutoregressiveLogisticRegression,
+    ToyHistoricalWeightMode,
     ToyRolloutMode,
     build_user_plan_sandbox,
     compute_toy_fisher_influence,
@@ -102,6 +103,39 @@ class ToyGRPOInfluenceTests(unittest.TestCase):
             sum(row.repo_fisher_score for row in historical["historical_scores"]),
             float(historical["repo_scores"].sum()),
             places=6,
+        )
+
+    def test_historical_all_samples_mode_counts_every_step(self):
+        sandbox = build_user_plan_sandbox()
+        model = AutoregressiveLogisticRegression(use_bias=False)
+        initialize_toy_model(model, mode="zero")
+
+        result = train_toy_grpo(
+            model,
+            sandbox.train_examples,
+            steps=3,
+            lr=0.1,
+            rollout_mode=ToyRolloutMode.EXHAUSTIVE,
+            checkpoint_steps=(0, 1, 2, 3),
+        )
+
+        historical = compute_toy_historical_fisher_influence(
+            model,
+            checkpoints=result["checkpoints"],
+            train_history=result["history"],
+            train_examples=sandbox.train_examples,
+            test_example=sandbox.test_example,
+            learning_rate=0.1,
+            end_step=3,
+            rollout_mode=ToyRolloutMode.EXHAUSTIVE,
+            lambda_damp=0.25,
+            historical_weight_mode=ToyHistoricalWeightMode.ALL_SAMPLES,
+        )
+
+        self.assertEqual(historical["historical_weight_mode"], "all_samples")
+        self.assertEqual(
+            [row.occurrence_count for row in historical["historical_scores"]],
+            [3, 3, 3],
         )
 
 

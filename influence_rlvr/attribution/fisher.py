@@ -28,7 +28,7 @@ def _geometry_weight_vector(infos):
     )
 
 
-class FisherInfluence(BaseInfluenceMethod):
+class FisherWoodburyInfluence(BaseInfluenceMethod):
     def __init__(self, train_infos: list, lambda_damp: float = 0.1, normalize: bool = False):
         with torch.no_grad():
             self.device = _influence_device()
@@ -172,10 +172,113 @@ class FisherInfluence(BaseInfluenceMethod):
             return torch.dot(h_inv_g, g_train).item()
 
 
+class FisherInfluence(BaseInfluenceMethod):
+    """Full Fisher inverse"""
+    def __init__(self, train_infos: list, lambda_damp: float = 0.1, normalize: bool = False):
+        with torch.no_grad():
+            self.device = _influence_device()
+            self.lambda_damp = lambda_damp
+            self.normalize = normalize
+            self._train_grad_list = [info["grad"] for info in train_infos]
+            self._geometry_list = []
+            for info in train_infos:
+                gf = info.get("geometry_feature")
+                if gf is None:
+                    raise ValueError(
+                        "Fisher influence requires 'geometry_feature' on each train info."
+                    )
+                self._geometry_list.append(gf)
+
+            n = len(self._train_grad_list)
+            if n != len(self._geometry_list):
+                raise ValueError("train_infos grad and geometry_feature counts differ.")
+
+            if n == 0:
+                self._grad_norms = None
+                self._geometry_norms = None
+                self.inverse_fisher = None
+                return
+
+            if normalize:
+                self._grad_norms = torch.empty(n, dtype=torch.float32, device=self.device)
+                self._geometry_norms = torch.empty(n, dtype=torch.float32, device=self.device)
+                for i in range(n):
+                    gi = self._train_grad_list[i].to(device=self.device, dtype=torch.float32)
+                    xi = self._geometry_list[i].to(device=self.device, dtype=torch.float32)
+                    self._grad_norms[i] = gi.norm().clamp(min=1e-12)
+                    self._geometry_norms[i] = xi.norm().clamp(min=1e-12)
+            else:
+                self._grad_norms = None
+                self._geometry_norms = None
+
+            geometry_weights = _geometry_weight_vector(train_infos).to(self.device)
+            features = torch.stack(
+                [
+                    self._geometry_list[i].to(device=self.device, dtype=torch.float32)
+                    for i in range(n)
+                ]
+            )
+            if normalize:
+                features = features / self._geometry_norms.unsqueeze(1)
+            features = features * geometry_weights.sqrt().unsqueeze(1)
+
+            dim = int(features.shape[1])
+            fisher = features.T @ features
+            fisher = fisher + lambda_damp * torch.eye(dim, dtype=torch.float32, device=self.device)
+            self.inverse_fisher = torch.linalg.inv(fisher)
+
+    def _precondition(self, g_test: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            g = g_test.to(device=self.device, dtype=torch.float32)
+            if self.normalize:
+                g = g / (g.norm() + 1e-12)
+            if self.inverse_fisher is None:
+                return (1.0 / self.lambda_damp) * g
+            return self.inverse_fisher @ g
+
+    def compute_all_scores(self, test_info: dict) -> np.ndarray:
+        with torch.no_grad():
+            n = len(self._train_grad_list)
+            if n == 0:
+                return np.zeros(0, dtype=np.float32)
+            h_inv_g = self._precondition(test_info["grad"])
+            out = np.empty(n, dtype=np.float32)
+            for i in range(n):
+                g_train = self._train_grad_list[i].to(device=self.device, dtype=torch.float32)
+                if self.normalize:
+                    g_train = g_train / self._grad_norms[i]
+                out[i] = torch.dot(h_inv_g, g_train).detach().cpu().item()
+            return out
+
+    def compute_score(self, test_info: dict, train_info: dict) -> float:
+        with torch.no_grad():
+            g_train = train_info["grad"].to(device=self.device, dtype=torch.float32)
+            if self.normalize:
+                g_train = g_train / (g_train.norm() + 1e-12)
+            h_inv_g = self._precondition(test_info["grad"])
+            return torch.dot(h_inv_g, g_train).item()
+
+
 class TrajectoryFisherInfluence:
-    def __init__(self, lambda_damp: float = 0.1, normalize: bool = False):
+    def __init__(
+        self,
+        lambda_damp: float = 0.1,
+        normalize: bool = False,
+        solver: str = "woodbury",
+    ):
         self.lambda_damp = lambda_damp
         self.normalize = normalize
+        self.solver = str(solver).strip().lower()
+        if self.solver not in {"woodbury", "full"}:
+            raise ValueError(f"Unsupported Fisher solver: {solver!r}. Use 'woodbury' or 'full'.")
+
+    def _build_fisher(self, train_infos: list) -> BaseInfluenceMethod:
+        cls = FisherInfluence if self.solver == "full" else FisherWoodburyInfluence
+        return cls(
+            train_infos,
+            lambda_damp=self.lambda_damp,
+            normalize=self.normalize,
+        )
 
     def compute_matrix(self, checkpoint_infos: list, return_breakdown: bool = False):
         if not checkpoint_infos:
@@ -195,11 +298,7 @@ class TrajectoryFisherInfluence:
                     dtype=np.float32,
                 )
             else:
-                fisher = FisherInfluence(
-                    checkpoint["train_infos"],
-                    lambda_damp=self.lambda_damp,
-                    normalize=self.normalize,
-                )
+                fisher = self._build_fisher(checkpoint["train_infos"])
                 matrix = np.zeros((n_test, n_train), dtype=np.float32)
                 for idx, test_info in enumerate(checkpoint["test_infos"]):
                     matrix[idx] = fisher.compute_all_scores(test_info) # IF of all train examples for test example test_info
@@ -220,6 +319,7 @@ class TrajectoryFisherInfluence:
                     "matrix": matrix,
                     "weighted_matrix": weighted_matrix,
                     "train_weights": train_weights,
+                    "solver": self.solver,
                 })
 
         return (total_matrix, breakdown) if return_breakdown else total_matrix

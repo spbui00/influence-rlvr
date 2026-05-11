@@ -3,7 +3,11 @@ import unittest
 import numpy as np
 import torch
 
-from influence_rlvr.attribution.fisher import TrajectoryFisherInfluence
+from influence_rlvr.attribution.fisher import (
+    FisherInfluence,
+    FisherWoodburyInfluence,
+    TrajectoryFisherInfluence,
+)
 
 
 class FisherInfluenceTests(unittest.TestCase):
@@ -43,6 +47,58 @@ class FisherInfluenceTests(unittest.TestCase):
         np.testing.assert_allclose(matrix[0], expected, rtol=1e-5, atol=1e-5)
         self.assertEqual(len(breakdown), 1)
         self.assertEqual(int(breakdown[0]["step"]), 5)
+
+    def test_full_and_woodbury_fisher_match_on_small_problem(self):
+        train_infos = [
+            {
+                "grad": torch.tensor([2.0, 0.0], dtype=torch.float32),
+                "geometry_feature": torch.tensor([1.0, 0.0], dtype=torch.float32),
+            },
+            {
+                "grad": torch.tensor([0.0, 3.0], dtype=torch.float32),
+                "geometry_feature": torch.tensor([0.0, 2.0], dtype=torch.float32),
+            },
+        ]
+        test_info = {"grad": torch.tensor([1.0, 2.0], dtype=torch.float32)}
+
+        full = FisherInfluence(train_infos, lambda_damp=0.5, normalize=False)
+        woodbury = FisherWoodburyInfluence(train_infos, lambda_damp=0.5, normalize=False)
+
+        np.testing.assert_allclose(
+            full.compute_all_scores(test_info),
+            woodbury.compute_all_scores(test_info),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+    def test_trajectory_full_solver_matches_woodbury_solver(self):
+        checkpoint_infos = [{
+            "step": 5,
+            "learning_rate": 0.1,
+            "test_infos": [{
+                "grad": torch.tensor([1.0, 2.0], dtype=torch.float32),
+            }],
+            "train_infos": [
+                {
+                    "grad": torch.tensor([2.0, 0.0], dtype=torch.float32),
+                    "geometry_feature": torch.tensor([1.0, 0.0], dtype=torch.float32),
+                },
+                {
+                    "grad": torch.tensor([0.0, 3.0], dtype=torch.float32),
+                    "geometry_feature": torch.tensor([0.0, 2.0], dtype=torch.float32),
+                },
+            ],
+        }]
+
+        woodbury = TrajectoryFisherInfluence(lambda_damp=0.5, normalize=False, solver="woodbury")
+        full = TrajectoryFisherInfluence(lambda_damp=0.5, normalize=False, solver="full")
+
+        np.testing.assert_allclose(
+            full.compute_matrix(checkpoint_infos),
+            woodbury.compute_matrix(checkpoint_infos),
+            rtol=1e-5,
+            atol=1e-5,
+        )
 
 
 if __name__ == "__main__":
