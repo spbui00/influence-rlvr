@@ -722,6 +722,42 @@ def compute_toy_test_loss(
     return float(bundle["debug"]["policy_loss"])
 
 
+def compute_toy_preference_gradient(
+    model: nn.Module,
+    ref_model: nn.Module,
+    example: ToyGRPOExample,
+) -> torch.Tensor:
+    responses = _ALL_TWO_TOKEN_SEQUENCES.to(model.device)
+    N = responses.shape[0]
+    z = example.z_tensor(device=model.device)
+    target = example.target_tensor(device=model.device)
+    
+    # Ground truth rewards
+    with torch.no_grad():
+        r_phi = reward_for_sequences(responses, target)
+        mu_phi = r_phi.mean()
+        sigma_phi = r_phi.std(unbiased=False).clamp(min=1e-8)
+        r_phi_prime = (r_phi - mu_phi) / sigma_phi
+    
+    # Implicit rewards
+    lp = model.sequence_log_probs(z, responses)
+    with torch.no_grad():
+        lp_ref = ref_model.sequence_log_probs(z.to(ref_model.device), responses.to(ref_model.device)).to(model.device)
+        r_hat = lp.detach() - lp_ref
+        mu_hat = r_hat.mean()
+        sigma_hat = r_hat.std(unbiased=False).clamp(min=1e-8)
+        r_hat_prime = (r_hat - mu_hat) / sigma_hat
+    
+    # g_train = - (2/N) * sum( (r_phi' - r_hat_prime) * grad log pi )
+    # Note: Using the sign that aligns with reward-based LDS in the toy sandbox.
+    weights = - (2.0 / N) * (r_phi_prime - r_hat_prime)
+    weighted_lp = (weights * lp).sum()
+    
+    grads = torch.autograd.grad(weighted_lp, model.parameters())
+    g_train = torch.cat([g.flatten() for g in grads]).to(dtype=torch.float32)
+    return g_train
+
+
 def compute_toy_historical_fisher_influence(
     model_template: AutoregressiveLogisticRegression,
     *,
@@ -740,6 +776,7 @@ def compute_toy_historical_fisher_influence(
     seed: int = 0,
     historical_weight_mode: ToyHistoricalWeightMode | str = ToyHistoricalWeightMode.ACTIVE_ONLY,
     fisher_solver: str = "woodbury",
+    method: str = "historical",
 ) -> dict:
     historical_weight_mode = ToyHistoricalWeightMode.parse(historical_weight_mode)
     if end_step is None:
@@ -750,6 +787,11 @@ def compute_toy_historical_fisher_influence(
     train_example_by_name = {example.name: example for example in train_examples}
     truncated_history = [row for row in train_history if int(row["step"]) <= end_step]
     checkpoint_infos = []
+
+    ref_model = None
+    if method == "preference-styled":
+        ref_model = clone_toy_model(model_template)
+        ref_model.load_state_dict(checkpoints[0])
 
     for i, row in enumerate(truncated_history):
         step = int(row["step"])
@@ -769,27 +811,54 @@ def compute_toy_historical_fisher_influence(
 
         train_infos = []
         for idx, example in enumerate(train_examples):
-            old_model = clone_toy_model(checkpoint_model)
+            if method == "historical":
+                old_model = clone_toy_model(checkpoint_model)
+                bundle = compute_toy_gradient_bundle(
+                    checkpoint_model,
+                    example,
+                    G=G,
+                    rollout_mode=rollout_mode,
+                    seed=(
+                        seed + 1000 * step + idx
+                        if ToyRolloutMode.parse(rollout_mode) == ToyRolloutMode.SAMPLED
+                        else None
+                    ),
+                    epsilon=epsilon,
+                    beta=beta,
+                    old_model=old_model,
+                    ref_model=None,
+                    advantage_eps=advantage_eps,
+                    objective_mode=GradientObjective.GRPO_TRAIN,
+                    geometry_feature_mode=GeometryFeatureMode.POLICY_SCORE,
+                )
+            elif method == "preference-styled":
+                # Geometry feature is still Fisher (mean grad log pi)
+                bundle = compute_toy_gradient_bundle(
+                    checkpoint_model,
+                    example,
+                    G=G,
+                    rollout_mode=rollout_mode,
+                    seed=(
+                        seed + 1000 * step + idx
+                        if ToyRolloutMode.parse(rollout_mode) == ToyRolloutMode.SAMPLED
+                        else None
+                    ),
+                    epsilon=epsilon,
+                    beta=beta,
+                    old_model=None,
+                    ref_model=None,
+                    advantage_eps=advantage_eps,
+                    objective_mode=GradientObjective.EXPECTED_REWARD_PG, # Dummy objective
+                    geometry_feature_mode=GeometryFeatureMode.POLICY_SCORE,
+                )
+                # Replace grad with preference-styled gradient
+                bundle["grad"] = compute_toy_preference_gradient(checkpoint_model, ref_model, example)
+            else:
+                raise ValueError(f"Unknown method: {method}")
+
             train_infos.append(
                 {
-                    **compute_toy_gradient_bundle(
-                        checkpoint_model,
-                        example,
-                        G=G,
-                        rollout_mode=rollout_mode,
-                        seed=(
-                            seed + 1000 * step + idx
-                            if ToyRolloutMode.parse(rollout_mode) == ToyRolloutMode.SAMPLED
-                            else None
-                        ),
-                        epsilon=epsilon,
-                        beta=beta,
-                        old_model=old_model,
-                        ref_model=None,
-                        advantage_eps=advantage_eps,
-                        objective_mode=GradientObjective.GRPO_TRAIN,
-                        geometry_feature_mode=GeometryFeatureMode.POLICY_SCORE,
-                    ),
+                    **bundle,
                     "name": example.name,
                     "expected_influence": example.expected_influence,
                     "historical_weight": (

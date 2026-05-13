@@ -357,37 +357,24 @@ def main():
 
     print(f"Computing Influence Functions (method={args.if_calculation})...")
     test_ifs = []
-    if args.if_calculation == "historical":
-        print(f"  Using Historical Trajectory Influence (mode={hist_weight_mode.value})...")
-        for i, test_ex in enumerate(test_examples):
-            hist_inf = compute_toy_historical_fisher_influence(
-                full_model,
-                checkpoints=train_result["checkpoints"],
-                train_history=train_result["history"],
-                train_examples=train_examples,
-                test_example=test_ex,
-                learning_rate=args.lr,
-                lambda_damp=args.lambda_damp,
-                rollout_mode=ToyRolloutMode.EXHAUSTIVE,
-                historical_weight_mode=hist_weight_mode
-            )
-            scores = hist_inf["repo_scores"]
-            print(f"  Test Example {i} Trajectory IF stats: Mean={scores.mean():.4f}, Std={scores.std():.4f}, Max={scores.max():.4f}")
-            test_ifs.append(scores)
-    else:
-        print(f"  Using Preference-Styled Influence...")
-        ref_model = ToyAutoregressiveMLP(hidden_dim=args.hidden_dim)
-        ref_model.load_state_dict(train_result["checkpoints"][0])
-        for i, test_ex in enumerate(test_examples):
-            scores = compute_toy_preference_influence(
-                full_model,
-                ref_model,
-                train_examples,
-                test_ex,
-                lambda_damp=args.lambda_damp
-            )
-            print(f"  Test Example {i} Preference-Styled IF stats: Mean={scores.mean():.4f}, Std={scores.std():.4f}, Max={scores.max():.4f}")
-            test_ifs.append(scores.numpy())
+    # Both 'historical' and 'preference-styled' now use the historical trajectory logic
+    print(f"  Method: {args.if_calculation} (Historical Trajectory mode={hist_weight_mode.value})...")
+    for i, test_ex in enumerate(test_examples):
+        hist_inf = compute_toy_historical_fisher_influence(
+            full_model,
+            checkpoints=train_result["checkpoints"],
+            train_history=train_result["history"],
+            train_examples=train_examples,
+            test_example=test_ex,
+            learning_rate=args.lr,
+            lambda_damp=args.lambda_damp,
+            rollout_mode=ToyRolloutMode.EXHAUSTIVE,
+            historical_weight_mode=hist_weight_mode,
+            method=args.if_calculation
+        )
+        scores = hist_inf["repo_scores"]
+        print(f"  Test Example {i} IF stats: Mean={scores.mean():.4f}, Std={scores.std():.4f}, Max={scores.max():.4f}")
+        test_ifs.append(scores)
 
     print(f"Training {args.m_subsets} subset models for LDS verification...")
     actual_rewards = np.zeros((args.n_test, args.m_subsets))
