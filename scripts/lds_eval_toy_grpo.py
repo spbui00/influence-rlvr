@@ -36,7 +36,8 @@ from influence_rlvr.toy_grpo import (
     _ALL_TWO_TOKEN_SEQUENCES,
     GradientObjective,
     _toy_objective_and_debug,
-    ToyHistoricalWeightMode
+    ToyHistoricalWeightMode,
+    compute_toy_gradient_bundle
 )
 
 
@@ -196,6 +197,86 @@ def train_model_with_history(
     }
 
 
+def compute_toy_preference_influence(
+    model: nn.Module,
+    ref_model: nn.Module,
+    train_examples: Sequence[ToyGRPOExample],
+    test_example: ToyGRPOExample,
+    lambda_damp: float = 1.0,
+) -> torch.Tensor:
+    model.eval()
+    ref_model.eval()
+    
+    # 1. Compute test gradient g_test
+    test_bundle = compute_toy_gradient_bundle(
+        model,
+        test_example,
+        G=4,
+        rollout_mode=ToyRolloutMode.EXHAUSTIVE,
+        objective_mode=GradientObjective.EXPECTED_REWARD_PG,
+    )
+    g_test = test_bundle["grad"].to(dtype=torch.float32)
+
+    # 2. Compute training gradients g_train and geometry features
+    train_grads = []
+    geometry_features = []
+    
+    responses = _ALL_TWO_TOKEN_SEQUENCES.to(model.device)
+    N = responses.shape[0]
+    
+    for ex in train_examples:
+        z = ex.z_tensor(device=model.device)
+        target = ex.target_tensor(device=model.device)
+        
+        # Ground truth rewards
+        with torch.no_grad():
+            r_phi = reward_for_sequences(responses, target)
+            mu_phi = r_phi.mean()
+            sigma_phi = r_phi.std(unbiased=False).clamp(min=1e-8)
+            r_phi_prime = (r_phi - mu_phi) / sigma_phi
+        
+        # Implicit rewards
+        lp = model.sequence_log_probs(z, responses)
+        with torch.no_grad():
+            lp_ref = ref_model.sequence_log_probs(z.to(ref_model.device), responses.to(ref_model.device)).to(model.device)
+            r_hat = lp.detach() - lp_ref
+            mu_hat = r_hat.mean()
+            sigma_hat = r_hat.std(unbiased=False).clamp(min=1e-8)
+            r_hat_prime = (r_hat - mu_hat) / sigma_hat
+        
+        # g_train = - (2/N) * sum( (r_phi' - r_hat_prime) * grad log pi )
+        weights = - (2.0 / N) * (r_phi_prime - r_hat_prime)
+        weighted_lp = (weights * lp).sum()
+        
+        grads = torch.autograd.grad(weighted_lp, model.parameters(), retain_graph=True)
+        g_train = torch.cat([g.flatten() for g in grads]).to(dtype=torch.float32)
+        train_grads.append(g_train)
+        
+        # Geometry feature: mean grad log pi for Fisher
+        mean_lp = lp.mean()
+        g_logp_list = torch.autograd.grad(mean_lp, model.parameters())
+        g_logp = torch.cat([g.flatten() for g in g_logp_list]).to(dtype=torch.float32)
+        geometry_features.append(g_logp)
+
+    # 3. Compute Fisher and solve
+    X = torch.stack(geometry_features)
+    dim = X.shape[1]
+    # TrajectoryFisherInfluence typically normalizes by n_train, let's do the same
+    F = (X.T @ X) / len(train_examples)
+    F = F + lambda_damp * torch.eye(dim, device=F.device)
+    
+    h_inv_g_test = torch.linalg.solve(F, g_test)
+    
+    # Influence = g_test^T F^-1 g_train
+    # (Removed the leading minus from the user's formula to align with reward-based LDS)
+    scores = []
+    for gt in train_grads:
+        score = torch.dot(h_inv_g_test, gt).item()
+        scores.append(score)
+        
+    return torch.tensor(scores)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--n-train", type=int, default=200) 
@@ -219,6 +300,12 @@ def main():
         ),
     )
     parser.add_argument("--output-dir", type=str, default="outputs/lds_toy_grpo", help="Directory to save results.")
+    parser.add_argument(
+        "--if-calculation",
+        choices=["historical", "preference-styled"],
+        default="historical",
+        help="Method to use for influence calculation."
+    )
     args = parser.parse_args()
 
     use_adam = not args.no_adam
@@ -226,7 +313,7 @@ def main():
     
     # Setup output directory
     timestamp = time.strftime("%Y%m%d-%H%M%S")
-    run_dir = Path(args.output_dir) / timestamp
+    run_dir = Path(args.output_dir) / f"{args.if_calculation.replace('-', '_')}_{timestamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Results will be saved to: {run_dir}")
 
@@ -268,23 +355,39 @@ def main():
     accuracy = 100 * correct / args.n_train
     print(f"Full model training accuracy: {correct}/{args.n_train} ({accuracy:.1f}%)")
 
-    print(f"Computing Historical Trajectory Influence Functions (mode={hist_weight_mode.value})...")
+    print(f"Computing Influence Functions (method={args.if_calculation})...")
     test_ifs = []
-    for i, test_ex in enumerate(test_examples):
-        hist_inf = compute_toy_historical_fisher_influence(
-            full_model,
-            checkpoints=train_result["checkpoints"],
-            train_history=train_result["history"],
-            train_examples=train_examples,
-            test_example=test_ex,
-            learning_rate=args.lr,
-            lambda_damp=args.lambda_damp,
-            rollout_mode=ToyRolloutMode.EXHAUSTIVE,
-            historical_weight_mode=hist_weight_mode
-        )
-        scores = hist_inf["repo_scores"]
-        print(f"  Test Example {i} Trajectory IF stats: Mean={scores.mean():.4f}, Std={scores.std():.4f}, Max={scores.max():.4f}")
-        test_ifs.append(scores)
+    if args.if_calculation == "historical":
+        print(f"  Using Historical Trajectory Influence (mode={hist_weight_mode.value})...")
+        for i, test_ex in enumerate(test_examples):
+            hist_inf = compute_toy_historical_fisher_influence(
+                full_model,
+                checkpoints=train_result["checkpoints"],
+                train_history=train_result["history"],
+                train_examples=train_examples,
+                test_example=test_ex,
+                learning_rate=args.lr,
+                lambda_damp=args.lambda_damp,
+                rollout_mode=ToyRolloutMode.EXHAUSTIVE,
+                historical_weight_mode=hist_weight_mode
+            )
+            scores = hist_inf["repo_scores"]
+            print(f"  Test Example {i} Trajectory IF stats: Mean={scores.mean():.4f}, Std={scores.std():.4f}, Max={scores.max():.4f}")
+            test_ifs.append(scores)
+    else:
+        print(f"  Using Preference-Styled Influence...")
+        ref_model = ToyAutoregressiveMLP(hidden_dim=args.hidden_dim)
+        ref_model.load_state_dict(train_result["checkpoints"][0])
+        for i, test_ex in enumerate(test_examples):
+            scores = compute_toy_preference_influence(
+                full_model,
+                ref_model,
+                train_examples,
+                test_ex,
+                lambda_damp=args.lambda_damp
+            )
+            print(f"  Test Example {i} Preference-Styled IF stats: Mean={scores.mean():.4f}, Std={scores.std():.4f}, Max={scores.max():.4f}")
+            test_ifs.append(scores.numpy())
 
     print(f"Training {args.m_subsets} subset models for LDS verification...")
     actual_rewards = np.zeros((args.n_test, args.m_subsets))
@@ -318,7 +421,7 @@ def main():
             actual_rewards[i, j] = exact_expected_reward(sub_model, test_examples[i])
             predicted_rewards[i, j] = test_ifs[i][mask.numpy()].sum()
 
-    print("\nLDS Evaluation Results for Trajectory Influence:")
+    print(f"\nLDS Evaluation Results for {args.if_calculation} Influence:")
     corrs = []
     test_results = []
     for i in range(args.n_test):
