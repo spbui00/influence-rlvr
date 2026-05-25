@@ -758,6 +758,44 @@ def compute_toy_preference_gradient(
     return g_train
 
 
+def compute_toy_surrogate_gradient(
+    model: nn.Module,
+    ref_model: nn.Module,
+    example: ToyGRPOExample,
+    beta: float = 0.1,
+    K: int = 4,
+    seed: int | None = None,
+) -> tuple[torch.Tensor, list[torch.Tensor], torch.Tensor]:
+    # Sample K rollouts from model = π_{θˢ} (the MC assumption the surrogate derivation makes).
+    responses = rollout_token_sequences(
+        model,
+        example,
+        G=K,
+        rollout_mode=ToyRolloutMode.SAMPLED,
+        seed=seed,
+    )
+    z = example.z_tensor(device=model.device)
+    target = example.target_tensor(device=model.device)
+
+    r = reward_for_sequences(responses, target)
+
+    lp = model.sequence_log_probs(z, responses)
+    with torch.no_grad():
+        lp_ref = ref_model.sequence_log_probs(z.to(ref_model.device), responses.to(ref_model.device)).to(model.device)
+
+    # R_tilde(x, y) = r/beta - log(pi_{theta^s}/pi_ref)
+    r_tilde = r / beta - (lp.detach() - lp_ref)
+    w_hat = F.softmax(r_tilde, dim=0)
+
+    rollout_grads = []
+    for j in range(responses.shape[0]):
+        g = torch.autograd.grad(lp[j], model.parameters(), retain_graph=True)
+        rollout_grads.append(torch.cat([x.flatten() for x in g]).to(dtype=torch.float32))
+
+    g_surrogate = torch.stack(rollout_grads).T @ w_hat
+    return g_surrogate, rollout_grads, w_hat
+
+
 def compute_toy_historical_fisher_influence(
     model_template: AutoregressiveLogisticRegression,
     *,
@@ -777,6 +815,7 @@ def compute_toy_historical_fisher_influence(
     historical_weight_mode: ToyHistoricalWeightMode | str = ToyHistoricalWeightMode.ACTIVE_ONLY,
     fisher_solver: str = "woodbury",
     method: str = "historical",
+    surrogate_beta: float = 0.1,
 ) -> dict:
     historical_weight_mode = ToyHistoricalWeightMode.parse(historical_weight_mode)
     if end_step is None:
@@ -789,7 +828,7 @@ def compute_toy_historical_fisher_influence(
     checkpoint_infos = []
 
     ref_model = None
-    if method == "preference-styled":
+    if method in ["preference-styled", "surrogate"]:
         ref_model = clone_toy_model(model_template)
         ref_model.load_state_dict(checkpoints[0])
 
@@ -811,6 +850,8 @@ def compute_toy_historical_fisher_influence(
 
         train_infos = []
         for idx, example in enumerate(train_examples):
+            is_active = (example.name == used_example_name)
+            
             if method == "historical":
                 old_model = clone_toy_model(checkpoint_model)
                 bundle = compute_toy_gradient_bundle(
@@ -830,6 +871,18 @@ def compute_toy_historical_fisher_influence(
                     advantage_eps=advantage_eps,
                     objective_mode=GradientObjective.GRPO_TRAIN,
                     geometry_feature_mode=GeometryFeatureMode.POLICY_SCORE,
+                )
+                train_infos.append(
+                    {
+                        **bundle,
+                        "name": example.name,
+                        "expected_influence": example.expected_influence,
+                        "historical_weight": (
+                            1.0
+                            if historical_weight_mode == ToyHistoricalWeightMode.ALL_SAMPLES
+                            else (1.0 if is_active else 0.0)
+                        ),
+                    }
                 )
             elif method == "preference-styled":
                 # Geometry feature is still Fisher (mean grad log pi)
@@ -853,21 +906,52 @@ def compute_toy_historical_fisher_influence(
                 )
                 # Replace grad with preference-styled gradient
                 bundle["grad"] = compute_toy_preference_gradient(checkpoint_model, ref_model, example)
-            else:
-                raise ValueError(f"Unknown method: {method}")
-
-            train_infos.append(
-                {
-                    **bundle,
+                train_infos.append(
+                    {
+                        **bundle,
+                        "name": example.name,
+                        "expected_influence": example.expected_influence,
+                        "historical_weight": (
+                            1.0
+                            if historical_weight_mode == ToyHistoricalWeightMode.ALL_SAMPLES
+                            else (1.0 if is_active else 0.0)
+                        ),
+                    }
+                )
+            elif method == "surrogate":
+                g_surrogate, rollout_grads, w_hat = compute_toy_surrogate_gradient(
+                    checkpoint_model,
+                    ref_model,
+                    example,
+                    beta=surrogate_beta,
+                    K=G,
+                    seed=seed + 1000 * step + idx,
+                )
+                # 1. Info for score numerator
+                should_score = (historical_weight_mode == ToyHistoricalWeightMode.ALL_SAMPLES or is_active)
+                # Use loss-gradient sign convention to match the rest of the pipeline:
+                # L_surrogate = -Σ ŵ log π, so ∇L = -Σ ŵ ∇log π = -g_surrogate.
+                train_infos.append({
+                    "grad": -g_surrogate,
+                    "geometry_feature": torch.zeros_like(g_surrogate),
+                    "historical_weight": 0.0, # Don't contribute to Fisher
+                    "score_weight": 1.0 if should_score else 0.0,
                     "name": example.name,
                     "expected_influence": example.expected_influence,
-                    "historical_weight": (
-                        1.0
-                        if historical_weight_mode == ToyHistoricalWeightMode.ALL_SAMPLES
-                        else (1.0 if example.name == used_example_name else 0.0)
-                    ),
-                }
-            )
+                })
+                # 2. Infos for Fisher denominator
+                should_contribute_to_fisher = (historical_weight_mode == ToyHistoricalWeightMode.ALL_SAMPLES or is_active)
+                for j, g_rollout in enumerate(rollout_grads):
+                    train_infos.append({
+                        "grad": torch.zeros_like(g_surrogate),
+                        "geometry_feature": g_rollout,
+                        "historical_weight": float(w_hat[j]) if should_contribute_to_fisher else 0.0,
+                        "score_weight": 0.0,
+                        "name": f"{example.name}_rollout_{j}",
+                        "expected_influence": None,
+                    })
+            else:
+                raise ValueError(f"Unknown method: {method}")
 
         test_info = {
             **compute_toy_gradient_bundle(
@@ -921,7 +1005,10 @@ def compute_toy_historical_fisher_influence(
     initial_model = clone_toy_model(model_template)
     initial_model.load_state_dict(checkpoints[0])
     final_model = clone_toy_model(model_template)
-    final_model.load_state_dict(checkpoints[end_step])
+    
+    # Use the max available checkpoint step if end_step is not in checkpoints (e.g. for surrogate mode)
+    actual_end_step = end_step if end_step in checkpoints else max(checkpoints.keys())
+    final_model.load_state_dict(checkpoints[actual_end_step])
 
     sampled_mode = ToyRolloutMode.parse(rollout_mode) == ToyRolloutMode.SAMPLED
     initial_seed = seed + 900000 if sampled_mode else None

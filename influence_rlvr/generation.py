@@ -262,9 +262,11 @@ def _hf_generate_rollout_batch(
             "num_return_sequences": num_samples,
         })
         if seed is not None:
-            g = torch.Generator()
-            g.manual_seed(int(seed))
-            generate_kwargs["generator"] = g
+            # Newer transformers .generate() rejects a `generator` kwarg, so set the
+            # global RNG seed instead. Same observable effect for sampling.
+            torch.manual_seed(int(seed))
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(int(seed))
     with torch.inference_mode():
         generated = sampling_model.generate(**generate_kwargs)
 

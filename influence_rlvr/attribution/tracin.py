@@ -46,7 +46,7 @@ def tracin_base_matrix_from_infos(test_infos, train_infos, normalize: bool) -> n
 
 def _stack_train_weights(infos):
     return torch.tensor(
-        [float(info.get("historical_weight", 1.0)) for info in infos],
+        [float(info.get("score_weight", info.get("historical_weight", 1.0))) for info in infos],
         dtype=torch.float32,
     )
 

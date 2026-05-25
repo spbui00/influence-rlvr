@@ -11,11 +11,142 @@ from __future__ import annotations
 import argparse
 import time
 import copy
+import hashlib
 import json
 import csv
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Sequence
+
+
+def run_saturation_diagnostics(
+    full_model,
+    checkpoints,
+    train_examples,
+    ref_model,
+    args,
+    n_probe: int = 8,
+    n_grad_traj: int = 3,
+    n_checkpoints: int = 5,
+) -> dict:
+    """
+    Two probes to detect whether saturation is actually happening:
+
+    Probe 1: π(target|x) for the first `n_probe` training examples at θˢ.
+             1 − π(target|x) is the "headroom" in which the score function ∇log π
+             can be nonzero. Values like 1e-1 mean the model is not saturated;
+             values like 1e-4 or smaller mean the IF gradient is genuinely vanishing.
+
+    Probe 2: Gradient-norm trajectory for `n_grad_traj` training examples across
+             `n_checkpoints` checkpoints spread evenly through training. If the
+             norm starts high and ends near zero, that's the textbook saturation
+             curve and the early-checkpoint signal is what trajectory historical
+             would recover.
+    """
+    diag = {}
+
+    # ----- Probe 1: saturation at θˢ -----
+    print("\nSaturation probe at θˢ (1 - π(target|x) is the score-function headroom):")
+    sat_rows = []
+    with torch.no_grad():
+        for ex in train_examples[:n_probe]:
+            z = ex.z_tensor(device=full_model.device)
+            target = ex.target_tensor(device=full_model.device)
+            seqs, probs = full_model.exact_sequence_distribution(z)
+            r = reward_for_sequences(seqs, target)
+            p_target = float((probs * r).sum())
+            print(f"  {ex.name}: π(target|x) = {p_target:.6f}  →  1-p = {1 - p_target:.2e}")
+            sat_rows.append({"name": ex.name, "p_target": p_target, "headroom": 1 - p_target})
+    diag["saturation_at_theta_s"] = sat_rows
+
+    if sat_rows:
+        headrooms = [r["headroom"] for r in sat_rows]
+        mean_hr = sum(headrooms) / len(headrooms)
+        min_hr = min(headrooms)
+        max_hr = max(headrooms)
+        if max_hr < 1e-3:
+            verdict = "HEAVILY SATURATED — score function near-zero, IF gradients should vanish"
+        elif max_hr < 0.05:
+            verdict = "SATURATED — score function small; saturation pathology possible"
+        elif max_hr < 0.2:
+            verdict = "PARTIALLY SATURATED — model confident but gradients still alive"
+        else:
+            verdict = "NOT SATURATED — KL anchor / undertraining keeps π well below 1"
+        print(f"  → headroom mean={mean_hr:.4f}, range=[{min_hr:.4e}, {max_hr:.4e}]")
+        print(f"  → verdict: {verdict}")
+        diag["saturation_verdict"] = verdict
+        diag["headroom_mean"] = mean_hr
+        diag["headroom_min"] = min_hr
+        diag["headroom_max"] = max_hr
+
+    # ----- Probe 2: gradient norm trajectory -----
+    available_steps = sorted(int(s) for s in checkpoints.keys())
+    if len(available_steps) < 2:
+        print("\nGradient-norm trajectory: skipped (not enough checkpoints saved).")
+        return diag
+
+    # Pick `n_checkpoints` evenly-spaced steps including the final one.
+    idxs = [int(round(i * (len(available_steps) - 1) / (n_checkpoints - 1))) for i in range(n_checkpoints)]
+    probe_steps = sorted(set(available_steps[i] for i in idxs))
+
+    print(f"\nGradient-norm trajectory across {len(probe_steps)} checkpoints:")
+    grad_rows = {}
+    for ex_idx in range(min(n_grad_traj, len(train_examples))):
+        ex = train_examples[ex_idx]
+        norms = []
+        for step in probe_steps:
+            tmp_model = clone_toy_model(full_model)
+            tmp_model.load_state_dict(checkpoints[step])
+            old_model = clone_toy_model(tmp_model)
+            bundle = compute_toy_gradient_bundle(
+                tmp_model, ex,
+                G=4,
+                rollout_mode=ToyRolloutMode.EXHAUSTIVE,
+                objective_mode=GradientObjective.GRPO_TRAIN,
+                old_model=old_model,
+                beta=args.beta,
+                ref_model=ref_model,
+            )
+            norms.append(float(bundle["grad"].norm()))
+        steps_str = " ".join(f"step={s}: {n:.4f}" for s, n in zip(probe_steps, norms))
+        print(f"  {ex.name}: {steps_str}")
+        if norms[0] > 1e-9 and norms[-1] / norms[0] < 0.05:
+            shape = "DECAYED 20×+ over training (textbook saturation)"
+        elif norms[0] > 1e-9 and norms[-1] / norms[0] < 0.5:
+            shape = "decayed moderately"
+        elif norms[0] > 1e-9 and norms[-1] > norms[0] * 1.5:
+            shape = "GREW over training (unusual — model still ramping up on this example)"
+        else:
+            shape = "roughly flat"
+        print(f"    → {shape}")
+        grad_rows[ex.name] = {"steps": probe_steps, "norms": norms, "shape": shape}
+
+    diag["grad_norm_trajectory"] = grad_rows
+    return diag
+
+
+def _lds_cache_key(args) -> str:
+    """Hash of the args that affect actual_rewards / subset_masks (i.e., not the IF method)."""
+    relevant = {
+        "n_train": args.n_train,
+        "n_test": args.n_test,
+        "m_subsets": args.m_subsets,
+        "subset_steps": args.subset_steps,
+        "lr": args.lr,
+        "hidden_dim": args.hidden_dim,
+        "seed": args.seed,
+        "beta": args.beta,
+        "use_adam": not args.no_adam,
+        "dataset": getattr(args, "dataset", "iid"),
+        "n_clusters": getattr(args, "n_clusters", None) if getattr(args, "dataset", "iid") == "clustered" else None,
+        "per_cluster": getattr(args, "per_cluster", None) if getattr(args, "dataset", "iid") == "clustered" else None,
+        "test_cluster_ids": getattr(args, "test_cluster_ids", None) if getattr(args, "dataset", "iid") == "clustered" else None,
+        "cluster_signal": getattr(args, "cluster_signal", None) if getattr(args, "dataset", "iid") == "clustered" else None,
+        "alt_cluster_signal": getattr(args, "alt_cluster_signal", None) if getattr(args, "dataset", "iid") == "clustered" else None,
+        "n_alt_clusters": getattr(args, "n_alt_clusters", None) if getattr(args, "dataset", "iid") == "clustered" else None,
+        "cluster_target_mode": getattr(args, "cluster_target_mode", None) if getattr(args, "dataset", "iid") == "clustered" else None,
+    }
+    return hashlib.sha256(json.dumps(relevant, sort_keys=True).encode()).hexdigest()[:16]
 
 import torch
 import torch.nn as nn
@@ -122,7 +253,7 @@ def generate_dataset(n: int = 1000, input_dim: int = 20, seed: int = 42) -> list
     targets = torch.zeros(n, 2, dtype=torch.long)
     targets[rule_sum > 0] = torch.tensor([1, 0])
     targets[rule_sum <= 0] = torch.tensor([0, 1])
-    
+
     examples = []
     for i in range(n):
         examples.append(ToyGRPOExample(
@@ -133,38 +264,147 @@ def generate_dataset(n: int = 1000, input_dim: int = 20, seed: int = 42) -> list
     return examples
 
 
+def generate_clustered_dataset(
+    n_clusters: int = 50,
+    per_cluster: int = 4,
+    test_cluster_ids: Sequence[int] | None = None,
+    input_dim: int = 20,
+    signal_per_cluster: Sequence[float] | None = None,
+    cluster_signal: float = 3.0,
+    background_scale: float = 0.5,
+    target_mode: str = "parity",
+    seed: int = 42,
+) -> tuple[list[ToyGRPOExample], list[ToyGRPOExample], list[int], list[float], list[tuple[int, int]]]:
+    """
+    Non-iid dataset designed to probe saturation failure of single-checkpoint IFs.
+
+    Each cluster k has a one-hot signature in z[3 + k] with strength `signal_per_cluster[k]`,
+    and its own target (alternating (1,0)/(0,1) by cluster id parity). Training examples
+    are round-robin across clusters. With per_cluster small (e.g. 2-4), a 50% subset mask
+    has non-trivial probability of wiping a whole cluster.
+
+    Heterogeneous signals: pass per-cluster strengths so some clusters are "easy"
+    (high signal, model saturates) and others are "hard" (low signal, model can't fit).
+    Test cluster auto-selection picks from the *strong-signal* clusters by default —
+    that's where saturation matters most.
+
+    Returns (train_examples, test_examples, test_cluster_ids, signal_per_cluster).
+    """
+    if input_dim < 3 + n_clusters:
+        raise ValueError(
+            f"input_dim ({input_dim}) must be >= 3 + n_clusters ({3 + n_clusters})."
+        )
+    if signal_per_cluster is None:
+        signal_per_cluster = [cluster_signal] * n_clusters
+    signal_per_cluster = list(signal_per_cluster)
+    if len(signal_per_cluster) != n_clusters:
+        raise ValueError(
+            f"signal_per_cluster length ({len(signal_per_cluster)}) != n_clusters ({n_clusters})."
+        )
+
+    torch.manual_seed(seed)
+    n_train = n_clusters * per_cluster
+    cluster_assignment = torch.arange(n_train) % n_clusters
+
+    z_train = torch.randn(n_train, input_dim) * background_scale
+    for k in range(n_clusters):
+        mask = cluster_assignment == k
+        z_train[mask, 3 + k] += signal_per_cluster[k]
+
+    if target_mode == "parity":
+        cluster_targets = [(1, 0) if k % 2 == 0 else (0, 1) for k in range(n_clusters)]
+    elif target_mode == "random":
+        target_pool = [(0, 0), (0, 1), (1, 0), (1, 1)]
+        gen = torch.Generator().manual_seed(seed + 1000)
+        idxs = torch.randint(0, len(target_pool), (n_clusters,), generator=gen).tolist()
+        cluster_targets = [target_pool[i] for i in idxs]
+    else:
+        raise ValueError(f"Unsupported target_mode={target_mode!r}. Use 'parity' or 'random'.")
+
+    targets_train = torch.zeros(n_train, 2, dtype=torch.long)
+    for k in range(n_clusters):
+        mask = cluster_assignment == k
+        targets_train[mask] = torch.tensor(cluster_targets[k])
+
+    train_examples = [
+        ToyGRPOExample(
+            name=f"c{int(cluster_assignment[i])}_ex{i}",
+            z=tuple(z_train[i].tolist()),
+            target=tuple(targets_train[i].tolist()),
+        )
+        for i in range(n_train)
+    ]
+
+    if test_cluster_ids is None:
+        max_signal = max(signal_per_cluster)
+        strong_clusters = [k for k in range(n_clusters) if signal_per_cluster[k] >= max_signal - 1e-9]
+        pool = strong_clusters if strong_clusters else list(range(n_clusters))
+        step = max(1, len(pool) // 5)
+        test_cluster_ids = pool[::step][:5]
+    test_cluster_ids = list(test_cluster_ids)
+    for k in test_cluster_ids:
+        if k < 0 or k >= n_clusters:
+            raise ValueError(f"test_cluster_id {k} out of range [0, {n_clusters}).")
+
+    n_test = len(test_cluster_ids)
+    z_test = torch.randn(n_test, input_dim) * background_scale
+    targets_test = torch.zeros(n_test, 2, dtype=torch.long)
+    for i, k in enumerate(test_cluster_ids):
+        z_test[i, 3 + k] += signal_per_cluster[k]
+        targets_test[i] = torch.tensor(cluster_targets[k])
+
+    test_examples = [
+        ToyGRPOExample(
+            name=f"test_c{test_cluster_ids[i]}",
+            z=tuple(z_test[i].tolist()),
+            target=tuple(targets_test[i].tolist()),
+            split="test",
+        )
+        for i in range(n_test)
+    ]
+
+    return train_examples, test_examples, test_cluster_ids, signal_per_cluster, cluster_targets
+
+
 def train_model_with_history(
     dataset: Sequence[ToyGRPOExample],
     steps: int = 1000,
-    lr: float = 1e-3, 
+    lr: float = 1e-3,
     hidden_dim: int = 16,
     seed: int = 0,
     save_checkpoints: bool = True,
-    use_adam: bool = True
+    use_adam: bool = True,
+    beta: float = 0.0,
+    ref_model: nn.Module | None = None,
 ) -> dict:
     torch.manual_seed(seed)
     model = ToyAutoregressiveMLP(hidden_dim=hidden_dim)
-    for m in model.modules():
-        if isinstance(m, nn.Linear):
-            nn.init.orthogonal_(m.weight, gain=1.0)
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
-    
+    if ref_model is not None:
+        # Start every training run from the same reference state so π_ref is shared
+        # across full and subset training (matches the surrogate-IF derivation).
+        model.load_state_dict(ref_model.state_dict())
+    else:
+        for m in model.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=1.0)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
     if use_adam:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     else:
         optimizer = torch.optim.SGD(model.parameters(), lr=lr)
-    
+
     checkpoints = {}
     if save_checkpoints:
         checkpoints[0] = copy.deepcopy(model.state_dict())
-        
+
     history = []
     for step in range(1, steps + 1):
         example = dataset[(step - 1) % len(dataset)]
         old_model = clone_toy_model(model)
         optimizer.zero_grad()
-        
+
         objective, _, debug = _toy_objective_and_debug(
             model,
             example,
@@ -172,9 +412,9 @@ def train_model_with_history(
             rollout_mode=ToyRolloutMode.EXHAUSTIVE,
             seed=seed + step,
             epsilon=0.2,
-            beta=0.0,
-            old_model=old_model, 
-            ref_model=None,
+            beta=beta,
+            old_model=old_model,
+            ref_model=ref_model,
             advantage_eps=1e-4,
             objective_mode=GradientObjective.GRPO_TRAIN
         )
@@ -288,6 +528,16 @@ def main():
     parser.add_argument("--hidden-dim", type=int, default=16)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--lambda-damp", type=float, default=1.0)
+    parser.add_argument(
+        "--beta",
+        type=float,
+        default=0.1,
+        help=(
+            "KL temperature β. Used both as the GRPO training KL coefficient "
+            "(toward π_ref = the shared initial model) and as the surrogate "
+            "IF formula's β in r/β. The surrogate derivation requires these to match."
+        ),
+    )
     parser.add_argument("--no-adam", action="store_true")
     parser.add_argument(
         "--historical-weight-mode",
@@ -301,10 +551,91 @@ def main():
     )
     parser.add_argument("--output-dir", type=str, default="outputs/lds_toy_grpo", help="Directory to save results.")
     parser.add_argument(
+        "--dataset",
+        choices=["iid", "clustered"],
+        default="iid",
+        help=(
+            "iid: original `sign(z1+z2+z3)` rule with redundant examples. "
+            "clustered: non-iid one-hot-signature clusters with sparse per-cluster examples — "
+            "designed to make saturation a failure mode for single-checkpoint IF."
+        ),
+    )
+    parser.add_argument(
+        "--n-clusters",
+        type=int,
+        default=15,
+        help="(--dataset clustered) Number of distinct clusters. Must satisfy 3 + n_clusters <= input_dim (=20).",
+    )
+    parser.add_argument(
+        "--per-cluster",
+        type=int,
+        default=3,
+        help="(--dataset clustered) Training examples per cluster. P(cluster wiped by 50%% mask) = 0.5^per_cluster.",
+    )
+    parser.add_argument(
+        "--test-cluster-ids",
+        type=str,
+        default=None,
+        help="(--dataset clustered) Comma-separated cluster ids to test on (default: 5 evenly-spaced strong-signal clusters).",
+    )
+    parser.add_argument(
+        "--cluster-signal",
+        type=float,
+        default=3.0,
+        help="(--dataset clustered) Signal strength for the primary (`easy`) clusters.",
+    )
+    parser.add_argument(
+        "--alt-cluster-signal",
+        type=float,
+        default=None,
+        help=(
+            "(--dataset clustered) Signal strength for the last --n-alt-clusters clusters. "
+            "Set this lower than --cluster-signal to create `hard` clusters that the model "
+            "cannot fully saturate on — they act as unsaturated distractors for the IF."
+        ),
+    )
+    parser.add_argument(
+        "--n-alt-clusters",
+        type=int,
+        default=0,
+        help="(--dataset clustered) Number of trailing clusters that use --alt-cluster-signal.",
+    )
+    parser.add_argument(
+        "--cluster-target-mode",
+        choices=["parity", "random"],
+        default="parity",
+        help=(
+            "(--dataset clustered) How per-cluster targets are assigned. "
+            "`parity` (current): cluster k → (1,0) if k even, (0,1) if k odd — "
+            "lets the model GENERALIZE across same-parity clusters, so saturation tracks redundancy. "
+            "`random`: each cluster gets a uniformly random target from {(0,0),(0,1),(1,0),(1,1)} — "
+            "forces per-cluster memorization, decorrelates saturation from redundancy. "
+            "Use `random` to expose the IF saturation failure mode."
+        ),
+    )
+    parser.add_argument(
+        "--lds-cache-dir",
+        type=str,
+        default="outputs/lds_toy_grpo/_lds_cache",
+        help="Where to cache actual_rewards / subset_masks. Keyed by the args that affect them (not by --if-calculation), so different IF methods reuse the same LDS computation.",
+    )
+    parser.add_argument("--no-lds-cache", action="store_true", help="Disable LDS cache (always retrain subset models).")
+    parser.add_argument(
+        "--no-diagnostics",
+        action="store_true",
+        help="Skip the post-training saturation probes and gradient-norm trajectory diagnostics.",
+    )
+    parser.add_argument(
         "--if-calculation",
-        choices=["historical", "preference-styled"],
+        choices=["historical", "historical-last", "preference-styled", "surrogate"],
         default="historical",
-        help="Method to use for influence calculation."
+        help=(
+            "Method to use for influence calculation. "
+            "`historical` sums per-step IF over the full trajectory; "
+            "`historical-last` uses the historical gradient (GRPO loss) "
+            "evaluated only at the final checkpoint — apples-to-apples comparison "
+            "for `surrogate`, which also uses only the last checkpoint."
+        ),
     )
     args = parser.parse_args()
 
@@ -322,28 +653,91 @@ def main():
     with (run_dir / "config.json").open("w") as f:
         json.dump(config, f, indent=2)
 
-    print(f"Generating dataset N={args.n_train}...")
-    all_examples = generate_dataset(n=args.n_train + 200, seed=args.seed)
-    train_examples = all_examples[:args.n_train]
-    
-    hard_test_examples = []
-    for ex in all_examples[args.n_train:]:
-        val = abs(ex.z[0] + ex.z[1] + ex.z[2])
-        if val < 0.3:
-            hard_test_examples.append(ex)
-        if len(hard_test_examples) >= args.n_test:
-            break
-    test_examples = hard_test_examples
-    print(f"Selected {len(test_examples)} hard test examples.")
+    cluster_assignment_by_train_idx = None  # for per-subset coverage tracking
+    if args.dataset == "clustered":
+        test_cluster_ids = None
+        if args.test_cluster_ids is not None:
+            test_cluster_ids = [int(s) for s in args.test_cluster_ids.split(",") if s.strip()]
 
-    print(f"Training full model with history ({'Adam' if use_adam else 'SGD'}) for {args.steps} steps...")
+        # Build per-cluster signal: first (n_clusters - n_alt_clusters) get cluster_signal,
+        # last n_alt_clusters get alt_cluster_signal (if specified).
+        n_alt = max(0, min(args.n_alt_clusters, args.n_clusters))
+        alt_signal = args.alt_cluster_signal if args.alt_cluster_signal is not None else args.cluster_signal
+        signal_per_cluster = [args.cluster_signal] * (args.n_clusters - n_alt) + [alt_signal] * n_alt
+
+        print(
+            f"Generating clustered dataset: {args.n_clusters} clusters × {args.per_cluster} examples "
+            f"(target_mode={args.cluster_target_mode})..."
+        )
+        train_examples, test_examples, test_cluster_ids, signal_per_cluster, cluster_targets = generate_clustered_dataset(
+            n_clusters=args.n_clusters,
+            per_cluster=args.per_cluster,
+            test_cluster_ids=test_cluster_ids,
+            signal_per_cluster=signal_per_cluster,
+            cluster_signal=args.cluster_signal,
+            target_mode=args.cluster_target_mode,
+            seed=args.seed,
+        )
+        # Override n_train/n_test to actual sizes so the rest of the script is consistent.
+        args.n_train = len(train_examples)
+        args.n_test = len(test_examples)
+        print(
+            f"  Train: {args.n_train} examples; Test: {args.n_test} examples from clusters {test_cluster_ids}"
+        )
+        if n_alt > 0:
+            print(
+                f"  Heterogeneous signal: first {args.n_clusters - n_alt} clusters @ signal={args.cluster_signal}, "
+                f"last {n_alt} clusters @ signal={alt_signal}"
+            )
+        if args.cluster_target_mode == "random":
+            print(f"  Target assignment (cluster → target):")
+            for k_idx, k in enumerate(range(args.n_clusters)):
+                marker = " ← test" if k in test_cluster_ids else ""
+                print(f"    c{k}: {cluster_targets[k]}{marker}")
+        wipe_prob = 0.5 ** args.per_cluster
+        print(
+            f"  With 50% subset mask, P(cluster fully wiped) = 0.5^{args.per_cluster} = {wipe_prob:.4f}"
+        )
+
+        # Map each training example index → its cluster id for per-subset coverage analysis.
+        cluster_assignment_by_train_idx = [int(i % args.n_clusters) for i in range(args.n_train)]
+    else:
+        print(f"Generating dataset N={args.n_train}...")
+        all_examples = generate_dataset(n=args.n_train + 200, seed=args.seed)
+        train_examples = all_examples[:args.n_train]
+
+        hard_test_examples = []
+        for ex in all_examples[args.n_train:]:
+            val = abs(ex.z[0] + ex.z[1] + ex.z[2])
+            if val < 0.3:
+                hard_test_examples.append(ex)
+            if len(hard_test_examples) >= args.n_test:
+                break
+        test_examples = hard_test_examples
+        print(f"Selected {len(test_examples)} hard test examples.")
+
+    # Build the shared π_ref once. Both the full and subset trainings start from
+    # this state and KL-regularize toward it, so the surrogate IF's π_ref is
+    # well-defined and identical to the training anchor.
+    torch.manual_seed(args.seed)
+    ref_model = ToyAutoregressiveMLP(hidden_dim=args.hidden_dim)
+    for m in ref_model.modules():
+        if isinstance(m, nn.Linear):
+            nn.init.orthogonal_(m.weight, gain=1.0)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+    ref_model.eval()
+
+    print(f"Training full model with history ({'Adam' if use_adam else 'SGD'}) for {args.steps} steps (β={args.beta})...")
     train_result = train_model_with_history(
-        train_examples, 
-        steps=args.steps, 
-        lr=args.lr, 
-        hidden_dim=args.hidden_dim, 
+        train_examples,
+        steps=args.steps,
+        lr=args.lr,
+        hidden_dim=args.hidden_dim,
         seed=args.seed,
-        use_adam=use_adam
+        use_adam=use_adam,
+        beta=args.beta,
+        ref_model=ref_model,
     )
     full_model = train_result["model"]
     
@@ -355,24 +749,59 @@ def main():
     accuracy = 100 * correct / args.n_train
     print(f"Full model training accuracy: {correct}/{args.n_train} ({accuracy:.1f}%)")
 
+    if not args.no_diagnostics:
+        diagnostics = run_saturation_diagnostics(
+            full_model,
+            train_result["checkpoints"],
+            train_examples,
+            ref_model,
+            args,
+        )
+        with (run_dir / "diagnostics.json").open("w") as f:
+            json.dump(diagnostics, f, indent=2)
+        print(f"Diagnostics saved to {run_dir / 'diagnostics.json'}")
+
     print(f"Computing Influence Functions (method={args.if_calculation})...")
     test_ifs = []
-    # Both 'historical' and 'preference-styled' now use the historical trajectory logic
-    print(f"  Method: {args.if_calculation} (Historical Trajectory mode={hist_weight_mode.value})...")
+    # 'historical' and 'preference-styled' use the full trajectory.
+    # 'surrogate' uses only the final checkpoint.
+    print(f"  Method: {args.if_calculation}...")
+    # historical-last reuses the historical method's gradient logic, but only
+    # evaluates at the final checkpoint (same single-step trick as surrogate).
+    last_checkpoint_only = args.if_calculation in ("surrogate", "historical-last")
+    method_for_if = "historical" if args.if_calculation == "historical-last" else args.if_calculation
+
     for i, test_ex in enumerate(test_examples):
+        if last_checkpoint_only:
+            history_to_use = [{"step": args.steps + 1, "example_name": train_examples[0].name}]
+            mode_to_use = ToyHistoricalWeightMode.ALL_SAMPLES
+            lr_to_use = 1.0
+            print(f"    Evaluating at final checkpoint (step {args.steps})...")
+        else:
+            history_to_use = train_result["history"]
+            mode_to_use = hist_weight_mode
+            lr_to_use = args.lr
+            print(f"    Evaluating over full trajectory (mode={mode_to_use.value})...")
+
         hist_inf = compute_toy_historical_fisher_influence(
             full_model,
             checkpoints=train_result["checkpoints"],
-            train_history=train_result["history"],
+            train_history=history_to_use,
             train_examples=train_examples,
             test_example=test_ex,
-            learning_rate=args.lr,
+            learning_rate=lr_to_use,
             lambda_damp=args.lambda_damp,
             rollout_mode=ToyRolloutMode.EXHAUSTIVE,
-            historical_weight_mode=hist_weight_mode,
-            method=args.if_calculation
+            historical_weight_mode=mode_to_use,
+            method=method_for_if,
+            surrogate_beta=args.beta
         )
         scores = hist_inf["repo_scores"]
+        if args.if_calculation == "surrogate":
+            # Surrogate emits 5 entries per example (1 numerator + 4 rollout Fisher
+            # contributions). The numerator is at every 5th position.
+            scores = scores.reshape(args.n_train, 5)[:, 0]
+            
         print(f"  Test Example {i} IF stats: Mean={scores.mean():.4f}, Std={scores.std():.4f}, Max={scores.max():.4f}")
         test_ifs.append(scores)
 
@@ -380,33 +809,67 @@ def main():
     actual_rewards = np.zeros((args.n_test, args.m_subsets))
     predicted_rewards = np.zeros((args.n_test, args.m_subsets))
 
-    torch.manual_seed(args.seed + 1)
-    subset_masks = torch.randint(0, 2, (args.m_subsets, args.n_train), dtype=torch.bool)
+    cache_path = None
+    if not args.no_lds_cache:
+        cache_dir = Path(args.lds_cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = cache_dir / f"lds_{_lds_cache_key(args)}.npz"
+
+    cache_hit = False
+    if cache_path is not None and cache_path.exists():
+        cached = np.load(cache_path)
+        if (
+            cached["actual_rewards"].shape == (args.n_test, args.m_subsets)
+            and cached["subset_masks"].shape == (args.m_subsets, args.n_train)
+        ):
+            actual_rewards = cached["actual_rewards"]
+            subset_masks = torch.from_numpy(cached["subset_masks"]).bool()
+            cache_hit = True
+            print(f"  LDS cache hit: loaded actual_rewards from {cache_path}")
+        else:
+            print(f"  LDS cache at {cache_path} has wrong shape; recomputing.")
 
     start_time = time.time()
+    if not cache_hit:
+        torch.manual_seed(args.seed + 1)
+        subset_masks = torch.randint(0, 2, (args.m_subsets, args.n_train), dtype=torch.bool)
+        for j in range(args.m_subsets):
+            if j % 10 == 0 and j > 0:
+                elapsed = time.time() - start_time
+                print(f"  Subset {j}/{args.m_subsets} (Elapsed: {elapsed:.1f}s)...")
+
+            mask = subset_masks[j]
+            subset_train = [train_examples[i] for i in range(args.n_train) if mask[i]]
+            if not subset_train: continue
+
+            sub_res = train_model_with_history(
+                subset_train,
+                steps=args.subset_steps,
+                lr=args.lr,
+                hidden_dim=args.hidden_dim,
+                seed=args.seed + j + 100,
+                save_checkpoints=False,
+                use_adam=use_adam,
+                beta=args.beta,
+                ref_model=ref_model,
+            )
+            sub_model = sub_res["model"]
+
+            for i in range(args.n_test):
+                actual_rewards[i, j] = exact_expected_reward(sub_model, test_examples[i])
+
+        if cache_path is not None:
+            np.savez(cache_path, actual_rewards=actual_rewards, subset_masks=subset_masks.numpy())
+            print(f"  Saved LDS cache to {cache_path}")
+
+    # Predicted rewards depend on the IF method, so always recompute from test_ifs.
     for j in range(args.m_subsets):
-        if j % 10 == 0 and j > 0:
-            elapsed = time.time() - start_time
-            print(f"  Subset {j}/{args.m_subsets} (Elapsed: {elapsed:.1f}s)...")
-        
         mask = subset_masks[j]
-        subset_train = [train_examples[i] for i in range(args.n_train) if mask[i]]
-        if not subset_train: continue
-            
-        sub_res = train_model_with_history(
-            subset_train, 
-            steps=args.subset_steps, 
-            lr=args.lr, 
-            hidden_dim=args.hidden_dim, 
-            seed=args.seed + j + 100,
-            save_checkpoints=False,
-            use_adam=use_adam
-        )
-        sub_model = sub_res["model"]
-        
+        if not mask.any():
+            continue
+        mask_np = mask.numpy()
         for i in range(args.n_test):
-            actual_rewards[i, j] = exact_expected_reward(sub_model, test_examples[i])
-            predicted_rewards[i, j] = test_ifs[i][mask.numpy()].sum()
+            predicted_rewards[i, j] = test_ifs[i][mask_np].sum()
 
     print(f"\nLDS Evaluation Results for {args.if_calculation} Influence:")
     corrs = []
@@ -442,7 +905,9 @@ def main():
         "accuracy": accuracy,
         "average_correlation": float(avg_corr),
         "test_results": test_results,
-        "total_time": time.time() - start_time
+        "total_time": time.time() - start_time,
+        "lds_cache_hit": cache_hit,
+        "lds_cache_key": _lds_cache_key(args),
     }
     with (run_dir / "results.json").open("w") as f:
         json.dump(final_results, f, indent=2)
@@ -495,19 +960,65 @@ def main():
         else:
             f.write("\nNo valid correlations computed.")
 
-    # Save raw rewards for plotting
+    # Save raw rewards for plotting. For clustered datasets we also record, per subset,
+    # how many training examples of each test cluster survived the mask — so you can
+    # tell whether a high-error subset is one that wiped a test cluster.
+    test_cluster_id_per_test = None
+    if args.dataset == "clustered" and cluster_assignment_by_train_idx is not None:
+        # Recover test cluster ids from test example names ("test_c<k>").
+        test_cluster_id_per_test = [
+            int(ex.name.split("_c")[1]) for ex in test_examples
+        ]
+
     with (run_dir / "rewards.csv").open("w", newline="") as f:
         writer = csv.writer(f)
-        header = ["subset_idx"]
+        header = ["subset_idx", "subset_size"]
         for i in range(args.n_test):
             header.extend([f"actual_reward_{i}", f"predicted_reward_{i}"])
+        if test_cluster_id_per_test is not None:
+            for i in range(args.n_test):
+                header.append(f"n_train_in_cluster_{test_cluster_id_per_test[i]}")
         writer.writerow(header)
+
+        cluster_assignments_t = (
+            torch.tensor(cluster_assignment_by_train_idx, dtype=torch.long)
+            if cluster_assignment_by_train_idx is not None else None
+        )
         for j in range(args.m_subsets):
-            row = [j]
+            mask = subset_masks[j]
+            row = [j, int(mask.sum().item())]
             for i in range(args.n_test):
                 row.extend([actual_rewards[i, j], predicted_rewards[i, j]])
+            if cluster_assignments_t is not None and test_cluster_id_per_test is not None:
+                surviving_clusters = cluster_assignments_t[mask.bool()]
+                for k in test_cluster_id_per_test:
+                    row.append(int((surviving_clusters == k).sum().item()))
             writer.writerow(row)
     print(f"Raw rewards saved to {run_dir / 'rewards.csv'}")
+
+    if test_cluster_id_per_test is not None:
+        # Quick diagnostic: average actual reward per test, conditioned on whether
+        # that test's cluster is fully wiped from the subset.
+        print("\nCluster-wipe diagnostic (clustered dataset):")
+        cluster_assignments_t = torch.tensor(cluster_assignment_by_train_idx, dtype=torch.long)
+        for i in range(args.n_test):
+            k = test_cluster_id_per_test[i]
+            wiped = []
+            present = []
+            for j in range(args.m_subsets):
+                mask = subset_masks[j]
+                n_in_cluster = int((cluster_assignments_t[mask.bool()] == k).sum().item())
+                if n_in_cluster == 0:
+                    wiped.append(actual_rewards[i, j])
+                else:
+                    present.append(actual_rewards[i, j])
+            n_wiped = len(wiped)
+            mean_wiped = float(np.mean(wiped)) if wiped else float("nan")
+            mean_present = float(np.mean(present)) if present else float("nan")
+            print(
+                f"  Test {i} (cluster {k}): {n_wiped}/{args.m_subsets} subsets wiped "
+                f"this cluster | actual reward: wiped={mean_wiped:.3f}  present={mean_present:.3f}"
+            )
 
     # Generate and save plots
     if corrs:
