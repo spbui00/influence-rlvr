@@ -11,11 +11,9 @@ from __future__ import annotations
 import argparse
 import time
 import copy
-import hashlib
 import json
 import csv
 from pathlib import Path
-from dataclasses import dataclass
 from typing import Sequence
 
 
@@ -126,8 +124,15 @@ def run_saturation_diagnostics(
 
 
 def _lds_cache_key(args) -> str:
-    """Hash of the args that affect actual_rewards / subset_masks (i.e., not the IF method)."""
-    relevant = {
+    """Hash of the args that affect actual_rewards / subset_masks (i.e., not the IF method).
+
+    Anything that changes the subset-training behavior or the test set must go
+    in here. Anything that only changes IF computation must NOT — different IF
+    methods reuse the same cache file.
+    """
+    is_clustered = getattr(args, "dataset", "iid") == "clustered"
+    is_cont = getattr(args, "lds_mode", "from-scratch") == "continuation"
+    payload = {
         "n_train": args.n_train,
         "n_test": args.n_test,
         "m_subsets": args.m_subsets,
@@ -138,22 +143,24 @@ def _lds_cache_key(args) -> str:
         "beta": args.beta,
         "use_adam": not args.no_adam,
         "dataset": getattr(args, "dataset", "iid"),
-        "n_clusters": getattr(args, "n_clusters", None) if getattr(args, "dataset", "iid") == "clustered" else None,
-        "per_cluster": getattr(args, "per_cluster", None) if getattr(args, "dataset", "iid") == "clustered" else None,
-        "test_cluster_ids": getattr(args, "test_cluster_ids", None) if getattr(args, "dataset", "iid") == "clustered" else None,
-        "cluster_signal": getattr(args, "cluster_signal", None) if getattr(args, "dataset", "iid") == "clustered" else None,
-        "alt_cluster_signal": getattr(args, "alt_cluster_signal", None) if getattr(args, "dataset", "iid") == "clustered" else None,
-        "n_alt_clusters": getattr(args, "n_alt_clusters", None) if getattr(args, "dataset", "iid") == "clustered" else None,
-        "cluster_target_mode": getattr(args, "cluster_target_mode", None) if getattr(args, "dataset", "iid") == "clustered" else None,
+        "n_clusters": getattr(args, "n_clusters", None) if is_clustered else None,
+        "per_cluster": getattr(args, "per_cluster", None) if is_clustered else None,
+        "test_cluster_ids": getattr(args, "test_cluster_ids", None) if is_clustered else None,
+        "cluster_signal": getattr(args, "cluster_signal", None) if is_clustered else None,
+        "alt_cluster_signal": getattr(args, "alt_cluster_signal", None) if is_clustered else None,
+        "n_alt_clusters": getattr(args, "n_alt_clusters", None) if is_clustered else None,
+        "cluster_target_mode": getattr(args, "cluster_target_mode", None) if is_clustered else None,
+        "lds_mode": getattr(args, "lds_mode", "from-scratch"),
+        "lds_cont_steps": getattr(args, "lds_cont_steps", None) if is_cont else None,
+        "lds_cont_lr": getattr(args, "lds_cont_lr", None) if is_cont else None,
     }
-    return hashlib.sha256(json.dumps(relevant, sort_keys=True).encode()).hexdigest()[:16]
+    return compute_lds_cache_key(payload)
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.stats import spearmanr
 
 from influence_rlvr.toy_grpo import (
     ToyGRPOExample,
@@ -169,6 +176,12 @@ from influence_rlvr.toy_grpo import (
     _toy_objective_and_debug,
     ToyHistoricalWeightMode,
     compute_toy_gradient_bundle
+)
+from influence_rlvr.attribution import CGInfluence, policy_fisher_fvp_from_grad_cache
+from influence_rlvr.lds import (
+    compute_lds_cache_key,
+    run_extremes_test,
+    run_lds,
 )
 
 
@@ -376,10 +389,15 @@ def train_model_with_history(
     use_adam: bool = True,
     beta: float = 0.0,
     ref_model: nn.Module | None = None,
+    start_model: nn.Module | None = None,
 ) -> dict:
     torch.manual_seed(seed)
     model = ToyAutoregressiveMLP(hidden_dim=hidden_dim)
-    if ref_model is not None:
+    if start_model is not None:
+        # Continuation training: keep π_ref = ref_model as the KL anchor, but
+        # initialize from start_model (e.g. the full-training final checkpoint).
+        model.load_state_dict(start_model.state_dict())
+    elif ref_model is not None:
         # Start every training run from the same reference state so π_ref is shared
         # across full and subset training (matches the surrogate-IF derivation).
         model.load_state_dict(ref_model.state_dict())
@@ -435,6 +453,52 @@ def train_model_with_history(
         "history": history,
         "checkpoints": checkpoints
     }
+
+
+def _train_subset_for_lds(
+    args,
+    *,
+    ref_model: nn.Module,
+    full_model: nn.Module,
+    subset_train: Sequence[ToyGRPOExample],
+    seed: int,
+    use_adam: bool,
+) -> dict:
+    """
+    Train one subset model under the configured --lds-mode.
+
+    - from-scratch: train from π_ref for --subset-steps at --lr (the original
+      LDS protocol).
+    - continuation: start from the full-training endpoint θ_T (= full_model)
+      and continue training on the subset for --lds-cont-steps at --lds-cont-lr
+      (default --lr / 10). Stays in the local regime where the IF linearization
+      is most accurate.
+    """
+    if args.lds_mode == "continuation":
+        cont_lr = args.lds_cont_lr if args.lds_cont_lr is not None else (args.lr / 10.0)
+        return train_model_with_history(
+            subset_train,
+            steps=args.lds_cont_steps,
+            lr=cont_lr,
+            hidden_dim=args.hidden_dim,
+            seed=seed,
+            save_checkpoints=False,
+            use_adam=use_adam,
+            beta=args.beta,
+            ref_model=ref_model,
+            start_model=full_model,
+        )
+    return train_model_with_history(
+        subset_train,
+        steps=args.subset_steps,
+        lr=args.lr,
+        hidden_dim=args.hidden_dim,
+        seed=seed,
+        save_checkpoints=False,
+        use_adam=use_adam,
+        beta=args.beta,
+        ref_model=ref_model,
+    )
 
 
 def compute_toy_preference_influence(
@@ -517,6 +581,174 @@ def compute_toy_preference_influence(
     return torch.tensor(scores)
 
 
+def compute_toy_cg_influence(
+    model: nn.Module,
+    train_examples: Sequence[ToyGRPOExample],
+    test_example: ToyGRPOExample,
+    lambda_damp: float = 1.0,
+    cg_iters: int = 50,
+    cg_tol: float = 1e-6,
+    beta: float = 0.0,
+    ref_model: nn.Module | None = None,
+) -> tuple[torch.Tensor, dict]:
+    """
+    PBRF-style influence at the final checkpoint via CGInfluence (CG + FVP).
+
+    Builds per-(z, y) policy-score gradients for every training example, hands
+    them to `policy_fisher_fvp_from_grad_cache` to produce the FVP closure, and
+    routes the CG solve through `CGInfluence`. Scores each train example as
+    g_train^T h where g_train is the GRPO-train gradient at the final ckpt.
+    """
+    model.eval()
+    params = [p for p in model.parameters() if p.requires_grad]
+
+    test_bundle = compute_toy_gradient_bundle(
+        model,
+        test_example,
+        G=4,
+        rollout_mode=ToyRolloutMode.EXHAUSTIVE,
+        objective_mode=GradientObjective.EXPECTED_REWARD_PG,
+    )
+    g_test = test_bundle["grad"].to(dtype=torch.float32).detach()
+    D = g_test.numel()
+
+    sequences = _ALL_TWO_TOKEN_SEQUENCES.to(model.device)
+    n_seq = int(sequences.shape[0])
+    grad_cache: list[torch.Tensor] = []
+    prob_cache: list[torch.Tensor] = []
+    for ex in train_examples:
+        z = ex.z_tensor(device=model.device)
+        log_probs = model.sequence_log_probs(z, sequences)
+        probs = log_probs.detach().exp()
+        G_z = torch.zeros(n_seq, D, dtype=torch.float32, device=g_test.device)
+        for y_idx in range(n_seq):
+            grads = torch.autograd.grad(
+                log_probs[y_idx], params, retain_graph=(y_idx < n_seq - 1)
+            )
+            G_z[y_idx] = torch.cat([g.detach().flatten() for g in grads]).to(dtype=torch.float32)
+        grad_cache.append(G_z)
+        prob_cache.append(probs.to(dtype=torch.float32))
+
+    fvp_fn = policy_fisher_fvp_from_grad_cache(grad_cache, prob_cache)
+    cg = CGInfluence(
+        fvp_fn=fvp_fn,
+        lambda_damp=lambda_damp,
+        cg_iters=cg_iters,
+        cg_tol=cg_tol,
+    )
+
+    test_info = {"grad": g_test}
+    train_infos = []
+    for ex in train_examples:
+        old_model = clone_toy_model(model)
+        bundle = compute_toy_gradient_bundle(
+            model,
+            ex,
+            G=4,
+            rollout_mode=ToyRolloutMode.EXHAUSTIVE,
+            beta=beta,
+            old_model=old_model,
+            ref_model=ref_model,
+            objective_mode=GradientObjective.GRPO_TRAIN,
+        )
+        train_infos.append({"grad": bundle["grad"].to(dtype=torch.float32).detach()})
+
+    scores_np = cg.compute_all_scores(test_info, train_infos)
+    cg_info = cg.cg_info_for(test_info) or {}
+    return torch.from_numpy(scores_np), cg_info
+
+
+def compute_toy_cg_influence_historical(
+    model_template: nn.Module,
+    *,
+    checkpoints: dict[int, dict],
+    train_history: Sequence[dict],
+    train_examples: Sequence[ToyGRPOExample],
+    test_example: ToyGRPOExample,
+    learning_rate: float,
+    lambda_damp: float = 1.0,
+    cg_iters: int = 50,
+    cg_tol: float = 1e-6,
+    beta: float = 0.0,
+    ref_model: nn.Module | None = None,
+    historical_weight_mode: ToyHistoricalWeightMode | str = ToyHistoricalWeightMode.ALL_SAMPLES,
+    progress_every: int = 100,
+) -> tuple[torch.Tensor, dict]:
+    """
+    Trajectory-summed CG influence.
+
+    At each step in `train_history`, load the pre-step checkpoint, build the
+    policy-Fisher FVP (subject to `historical_weight_mode`), solve h via CG at
+    that checkpoint, score each train example, scale by learning rate, and
+    accumulate:
+
+        IF_i = Σ_c lr · w_i^(c) · g_train_i^(c)^T h_c
+
+    `historical_weight_mode`:
+      - ACTIVE_ONLY: at each step, only the active train example contributes
+        to both the Fisher batch and the score sum (cheap: O(n_y) backward
+        passes per step instead of O(n_train · n_y)).
+      - ALL_SAMPLES: every train example contributes to both at every step
+        (expensive but matches the original PBRF derivation more literally).
+    """
+    historical_weight_mode = ToyHistoricalWeightMode.parse(historical_weight_mode)
+    n_train = len(train_examples)
+    name_to_idx = {ex.name: i for i, ex in enumerate(train_examples)}
+
+    total_scores = torch.zeros(n_train, dtype=torch.float32)
+    per_step_residuals: list[float | None] = []
+    n_converged = 0
+
+    for step_idx, row in enumerate(train_history):
+        step = int(row["step"])
+        pre_step = step - 1
+        if pre_step not in checkpoints:
+            raise ValueError(
+                f"Trajectory CG needs checkpoint {pre_step}, but it was not saved."
+            )
+
+        checkpoint_model = clone_toy_model(model_template)
+        checkpoint_model.load_state_dict(checkpoints[pre_step])
+
+        if historical_weight_mode == ToyHistoricalWeightMode.ACTIVE_ONLY:
+            active_name = str(row["example_name"])
+            active_idx = name_to_idx[active_name]
+            sub_examples = [train_examples[active_idx]]
+        else:
+            sub_examples = list(train_examples)
+
+        step_scores, cg_info = compute_toy_cg_influence(
+            checkpoint_model,
+            train_examples=sub_examples,
+            test_example=test_example,
+            lambda_damp=lambda_damp,
+            cg_iters=cg_iters,
+            cg_tol=cg_tol,
+            beta=beta,
+            ref_model=ref_model,
+        )
+        if cg_info.get("converged"):
+            n_converged += 1
+        per_step_residuals.append(cg_info.get("final_residual"))
+
+        if historical_weight_mode == ToyHistoricalWeightMode.ACTIVE_ONLY:
+            total_scores[active_idx] = total_scores[active_idx] + learning_rate * step_scores[0]
+        else:
+            total_scores = total_scores + learning_rate * step_scores
+
+        if progress_every and step_idx > 0 and step_idx % progress_every == 0:
+            print(f"      CG trajectory step {step_idx}/{len(train_history)} "
+                  f"(converged so far: {n_converged}/{step_idx})")
+
+    info = {
+        "n_steps": len(train_history),
+        "n_converged": n_converged,
+        "per_step_final_residuals": per_step_residuals,
+        "historical_weight_mode": historical_weight_mode.value,
+    }
+    return total_scores, info
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--n-train", type=int, default=200) 
@@ -524,10 +756,68 @@ def main():
     parser.add_argument("--m-subsets", type=int, default=100)
     parser.add_argument("--steps", type=int, default=1000, help="Total GRPO steps for full model")
     parser.add_argument("--subset-steps", type=int, default=1000, help="GRPO steps for subset models")
+    parser.add_argument(
+        "--lds-mode",
+        choices=["from-scratch", "continuation"],
+        default="from-scratch",
+        help=(
+            "How subset models are produced for LDS verification. "
+            "`from-scratch` (default): train each subset model from π_ref for "
+            "--subset-steps, like the original LDS protocol. "
+            "`continuation`: start each subset model from the full-training "
+            "endpoint θ_T and continue training on the subset for "
+            "--lds-cont-steps at --lds-cont-lr. Stays in the local regime "
+            "where the IF linearization is most accurate."
+        ),
+    )
+    parser.add_argument(
+        "--lds-cont-steps",
+        type=int,
+        default=100,
+        help="(--lds-mode continuation) Continuation training steps from θ_T per subset.",
+    )
+    parser.add_argument(
+        "--lds-cont-lr",
+        type=float,
+        default=None,
+        help=(
+            "(--lds-mode continuation) Continuation learning rate. "
+            "Default: --lr / 10 (small to stay close to θ_T's local linearization "
+            "and reduce GRPO sampling noise)."
+        ),
+    )
+    parser.add_argument(
+        "--extremes-test",
+        action="store_true",
+        help=(
+            "Before the full M-subset LDS run, do a 3-point sanity check on each "
+            "test example: train (or continue) on the top-α subset by IF, the "
+            "bottom-α, and a random α-sized subset. Print rewards; a working IF "
+            "should yield R_pos > R_rand > R_neg."
+        ),
+    )
+    parser.add_argument(
+        "--subset-fraction",
+        type=float,
+        default=0.5,
+        help="α (subset fraction) used for the --extremes-test top/bottom/random subsets.",
+    )
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--hidden-dim", type=int, default=16)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--lambda-damp", type=float, default=1.0)
+    parser.add_argument(
+        "--cg-iters",
+        type=int,
+        default=50,
+        help="(--if-calculation cg) Max Conjugate Gradient iterations.",
+    )
+    parser.add_argument(
+        "--cg-tol",
+        type=float,
+        default=1e-6,
+        help="(--if-calculation cg) CG relative residual tolerance ||r||/||g_test||.",
+    )
     parser.add_argument(
         "--beta",
         type=float,
@@ -627,14 +917,20 @@ def main():
     )
     parser.add_argument(
         "--if-calculation",
-        choices=["historical", "historical-last", "preference-styled", "surrogate"],
+        choices=["historical", "historical-last", "preference-styled", "surrogate", "cg", "cg-last"],
         default="historical",
         help=(
             "Method to use for influence calculation. "
             "`historical` sums per-step IF over the full trajectory; "
             "`historical-last` uses the historical gradient (GRPO loss) "
             "evaluated only at the final checkpoint — apples-to-apples comparison "
-            "for `surrogate`, which also uses only the last checkpoint."
+            "for `surrogate`, which also uses only the last checkpoint; "
+            "`cg` solves (F+λI) h = g_test by Conjugate Gradient against the "
+            "true expected policy Fisher (FVP-only, F never materialized) at "
+            "every training checkpoint and sums the per-step IFs over the "
+            "trajectory (mirrors `historical`); "
+            "`cg-last` is the single-final-checkpoint variant of `cg` (mirrors "
+            "`historical-last`)."
         ),
     )
     args = parser.parse_args()
@@ -768,7 +1064,7 @@ def main():
     print(f"  Method: {args.if_calculation}...")
     # historical-last reuses the historical method's gradient logic, but only
     # evaluates at the final checkpoint (same single-step trick as surrogate).
-    last_checkpoint_only = args.if_calculation in ("surrogate", "historical-last")
+    last_checkpoint_only = args.if_calculation in ("surrogate", "historical-last", "cg-last")
     method_for_if = "historical" if args.if_calculation == "historical-last" else args.if_calculation
 
     for i, test_ex in enumerate(test_examples):
@@ -783,31 +1079,120 @@ def main():
             lr_to_use = args.lr
             print(f"    Evaluating over full trajectory (mode={mode_to_use.value})...")
 
-        hist_inf = compute_toy_historical_fisher_influence(
-            full_model,
-            checkpoints=train_result["checkpoints"],
-            train_history=history_to_use,
-            train_examples=train_examples,
-            test_example=test_ex,
-            learning_rate=lr_to_use,
-            lambda_damp=args.lambda_damp,
-            rollout_mode=ToyRolloutMode.EXHAUSTIVE,
-            historical_weight_mode=mode_to_use,
-            method=method_for_if,
-            surrogate_beta=args.beta
-        )
-        scores = hist_inf["repo_scores"]
-        if args.if_calculation == "surrogate":
-            # Surrogate emits 5 entries per example (1 numerator + 4 rollout Fisher
-            # contributions). The numerator is at every 5th position.
-            scores = scores.reshape(args.n_train, 5)[:, 0]
-            
+        if args.if_calculation == "cg-last":
+            print(f"    CG solve at final checkpoint (max {args.cg_iters} iters, tol={args.cg_tol:.0e})...")
+            cg_scores, cg_info = compute_toy_cg_influence(
+                full_model,
+                train_examples=train_examples,
+                test_example=test_ex,
+                lambda_damp=args.lambda_damp,
+                cg_iters=args.cg_iters,
+                cg_tol=args.cg_tol,
+                beta=args.beta,
+                ref_model=ref_model,
+            )
+            scores = cg_scores.numpy()
+            print(
+                f"    CG converged in {cg_info.get('n_iters', '?')} iters; "
+                f"final residual={cg_info.get('final_residual', float('nan')):.2e}; "
+                f"g_test·h={cg_info.get('g_test_dot_h', float('nan')):.4e} (>=0 if SPD)"
+            )
+        elif args.if_calculation == "cg":
+            print(
+                f"    CG trajectory over {len(train_result['history'])} steps "
+                f"(mode={hist_weight_mode.value}, max {args.cg_iters} iters/step, tol={args.cg_tol:.0e})..."
+            )
+            cg_scores, cg_info = compute_toy_cg_influence_historical(
+                full_model,
+                checkpoints=train_result["checkpoints"],
+                train_history=train_result["history"],
+                train_examples=train_examples,
+                test_example=test_ex,
+                learning_rate=args.lr,
+                lambda_damp=args.lambda_damp,
+                cg_iters=args.cg_iters,
+                cg_tol=args.cg_tol,
+                beta=args.beta,
+                ref_model=ref_model,
+                historical_weight_mode=hist_weight_mode,
+            )
+            scores = cg_scores.numpy()
+            n_steps = cg_info.get("n_steps", 0)
+            n_conv = cg_info.get("n_converged", 0)
+            print(f"    CG trajectory done: {n_conv}/{n_steps} per-step solves converged within tol.")
+        else:
+            hist_inf = compute_toy_historical_fisher_influence(
+                full_model,
+                checkpoints=train_result["checkpoints"],
+                train_history=history_to_use,
+                train_examples=train_examples,
+                test_example=test_ex,
+                learning_rate=lr_to_use,
+                lambda_damp=args.lambda_damp,
+                rollout_mode=ToyRolloutMode.EXHAUSTIVE,
+                historical_weight_mode=mode_to_use,
+                method=method_for_if,
+                surrogate_beta=args.beta
+            )
+            scores = hist_inf["repo_scores"]
+            if args.if_calculation == "surrogate":
+                # Surrogate emits 5 entries per example (1 numerator + 4 rollout Fisher
+                # contributions). The numerator is at every 5th position.
+                scores = scores.reshape(args.n_train, 5)[:, 0]
+
         print(f"  Test Example {i} IF stats: Mean={scores.mean():.4f}, Std={scores.std():.4f}, Max={scores.max():.4f}")
         test_ifs.append(scores)
 
-    print(f"Training {args.m_subsets} subset models for LDS verification...")
-    actual_rewards = np.zeros((args.n_test, args.m_subsets))
-    predicted_rewards = np.zeros((args.n_test, args.m_subsets))
+    # Wire the toy subset trainer into the generic LDS module. At LLM scale,
+    # replace `subset_trainer` with an LLM-aware continuation/from-scratch trainer
+    # that returns per-test-example rewards in the same shape.
+    def subset_trainer(subset_indices, seed):
+        subset_train = [train_examples[j] for j in subset_indices]
+        sub_res = _train_subset_for_lds(
+            args,
+            ref_model=ref_model,
+            full_model=full_model,
+            subset_train=subset_train,
+            seed=seed,
+            use_adam=use_adam,
+        )
+        return np.array(
+            [exact_expected_reward(sub_res["model"], te) for te in test_examples],
+            dtype=np.float64,
+        )
+
+    if args.extremes_test:
+        cont_str = f", K_cont={args.lds_cont_steps}" if args.lds_mode == "continuation" else ""
+        k_preview = max(1, int(round(args.subset_fraction * args.n_train)))
+        print(
+            f"\nExtremes test (top/random/bottom α={args.subset_fraction} → "
+            f"k={k_preview} examples per subset, mode={args.lds_mode}{cont_str}):"
+        )
+        extremes_rows = run_extremes_test(
+            test_ifs,
+            subset_trainer,
+            n_train=args.n_train,
+            n_test=args.n_test,
+            subset_fraction=args.subset_fraction,
+            seed=args.seed,
+        )
+        with (run_dir / "extremes_test.json").open("w") as f:
+            json.dump({
+                "subset_fraction": args.subset_fraction,
+                "k": extremes_rows[0].k if extremes_rows else None,
+                "lds_mode": args.lds_mode,
+                "lds_cont_steps": args.lds_cont_steps if args.lds_mode == "continuation" else None,
+                "lds_cont_lr": (args.lds_cont_lr if args.lds_cont_lr is not None else args.lr / 10.0) if args.lds_mode == "continuation" else None,
+                "results": [r.__dict__ for r in extremes_rows],
+            }, f, indent=2)
+        print(f"  Extremes test saved to {run_dir / 'extremes_test.json'}")
+
+    cont_str = (
+        f" (continuation: K_cont={args.lds_cont_steps}, "
+        f"lr={args.lds_cont_lr if args.lds_cont_lr is not None else args.lr / 10.0:.2e})"
+        if args.lds_mode == "continuation" else ""
+    )
+    print(f"Training {args.m_subsets} subset models for LDS verification [mode={args.lds_mode}]{cont_str}...")
 
     cache_path = None
     if not args.no_lds_cache:
@@ -815,88 +1200,34 @@ def main():
         cache_dir.mkdir(parents=True, exist_ok=True)
         cache_path = cache_dir / f"lds_{_lds_cache_key(args)}.npz"
 
-    cache_hit = False
-    if cache_path is not None and cache_path.exists():
-        cached = np.load(cache_path)
-        if (
-            cached["actual_rewards"].shape == (args.n_test, args.m_subsets)
-            and cached["subset_masks"].shape == (args.m_subsets, args.n_train)
-        ):
-            actual_rewards = cached["actual_rewards"]
-            subset_masks = torch.from_numpy(cached["subset_masks"]).bool()
-            cache_hit = True
-            print(f"  LDS cache hit: loaded actual_rewards from {cache_path}")
-        else:
-            print(f"  LDS cache at {cache_path} has wrong shape; recomputing.")
-
     start_time = time.time()
-    if not cache_hit:
-        torch.manual_seed(args.seed + 1)
-        subset_masks = torch.randint(0, 2, (args.m_subsets, args.n_train), dtype=torch.bool)
-        for j in range(args.m_subsets):
-            if j % 10 == 0 and j > 0:
-                elapsed = time.time() - start_time
-                print(f"  Subset {j}/{args.m_subsets} (Elapsed: {elapsed:.1f}s)...")
-
-            mask = subset_masks[j]
-            subset_train = [train_examples[i] for i in range(args.n_train) if mask[i]]
-            if not subset_train: continue
-
-            sub_res = train_model_with_history(
-                subset_train,
-                steps=args.subset_steps,
-                lr=args.lr,
-                hidden_dim=args.hidden_dim,
-                seed=args.seed + j + 100,
-                save_checkpoints=False,
-                use_adam=use_adam,
-                beta=args.beta,
-                ref_model=ref_model,
-            )
-            sub_model = sub_res["model"]
-
-            for i in range(args.n_test):
-                actual_rewards[i, j] = exact_expected_reward(sub_model, test_examples[i])
-
-        if cache_path is not None:
-            np.savez(cache_path, actual_rewards=actual_rewards, subset_masks=subset_masks.numpy())
-            print(f"  Saved LDS cache to {cache_path}")
-
-    # Predicted rewards depend on the IF method, so always recompute from test_ifs.
-    for j in range(args.m_subsets):
-        mask = subset_masks[j]
-        if not mask.any():
-            continue
-        mask_np = mask.numpy()
-        for i in range(args.n_test):
-            predicted_rewards[i, j] = test_ifs[i][mask_np].sum()
+    lds = run_lds(
+        test_ifs,
+        subset_trainer,
+        n_train=args.n_train,
+        n_test=args.n_test,
+        m_subsets=args.m_subsets,
+        seed=args.seed,
+        cache_path=cache_path,
+    )
+    actual_rewards = lds.actual_rewards
+    predicted_rewards = lds.predicted_rewards
+    subset_masks = lds.subset_masks
+    test_results = lds.per_test
+    avg_corr = lds.average_correlation
+    cache_hit = lds.cache_hit
 
     print(f"\nLDS Evaluation Results for {args.if_calculation} Influence:")
-    corrs = []
-    test_results = []
-    for i in range(args.n_test):
-        actual_std = np.std(actual_rewards[i])
-        pred_std = np.std(predicted_rewards[i])
-        
-        result_entry = {
-            "test_idx": i,
-            "actual_std": float(actual_std),
-            "pred_std": float(pred_std),
-        }
-        
-        if actual_std == 0 or pred_std == 0:
-            print(f"  Test Example {i}: Undefined variance (Actual Std={actual_std:.4f}, Pred Std={pred_std:.4f}).")
-            result_entry["correlation"] = None
+    for row in test_results:
+        i = row["test_idx"]
+        if row["correlation"] is None:
+            print(
+                f"  Test Example {i}: Undefined variance "
+                f"(Actual Std={row['actual_std']:.4f}, Pred Std={row['pred_std']:.4f})."
+            )
         else:
-            corr, p = spearmanr(actual_rewards[i], predicted_rewards[i])
-            corrs.append(corr)
-            result_entry["correlation"] = float(corr)
-            result_entry["p_value"] = float(p)
-            print(f"  Test Example {i}: Corr={corr:.4f}, p={p:.4e}")
-        
-        test_results.append(result_entry)
-
-    avg_corr = np.mean(corrs) if corrs else 0.0
+            print(f"  Test Example {i}: Corr={row['correlation']:.4f}, p={row['p_value']:.4e}")
+    corrs = [r["correlation"] for r in test_results if r["correlation"] is not None]
     if corrs:
         print(f"\nAverage Trajectory LDS Correlation: {avg_corr:.4f}")
 

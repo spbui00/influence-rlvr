@@ -10,7 +10,9 @@ from .attribution import (
     TrajectoryFisherInfluence,
     PBRFInfluence,
     RepSimInfluence,
+    CGInfluence,
 )
+from .attribution.cg import policy_fisher_fvp_from_grad_cache
 from .gradients import (
     compute_policy_gradient_bundle,
     compute_policy_gradient_bundle_batch,
@@ -54,6 +56,18 @@ from .trajectory import (
     collect_checkpoint_infos,
 )
 from .training import HistoricalBatchGRPOTrainer
+from .lds import (
+    LDSResult,
+    ExtremesRow,
+    SubsetTrainer,
+    compute_lds_cache_key,
+    sample_subset_masks,
+    predicted_rewards_from_ifs,
+    lds_correlations,
+    collect_actual_rewards,
+    run_lds,
+    run_extremes_test,
+)
 from .toy_grpo import (
     AutoregressiveLogisticRegression,
     ToyGRPOExample,
@@ -85,6 +99,8 @@ __all__ = [
     "TrajectoryFisherInfluence",
     "PBRFInfluence",
     "RepSimInfluence",
+    "CGInfluence",
+    "policy_fisher_fvp_from_grad_cache",
     "InfluenceMode",
     "ExperimentMode",
     "GenerationBackend",
@@ -136,4 +152,14 @@ __all__ = [
     "validate_toy_influence_with_preconditioned_step",
     "detect_device",
     "clear_cache",
+    "LDSResult",
+    "ExtremesRow",
+    "SubsetTrainer",
+    "compute_lds_cache_key",
+    "sample_subset_masks",
+    "predicted_rewards_from_ifs",
+    "lds_correlations",
+    "collect_actual_rewards",
+    "run_lds",
+    "run_extremes_test",
 ]
