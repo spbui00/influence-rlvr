@@ -177,7 +177,11 @@ from influence_rlvr.toy_grpo import (
     ToyHistoricalWeightMode,
     compute_toy_gradient_bundle
 )
-from influence_rlvr.attribution import CGInfluence, policy_fisher_fvp_from_grad_cache
+from influence_rlvr.attribution import (
+    CGInfluence,
+    TrueFisherInfluence,
+    policy_fisher_fvp_from_grad_cache,
+)
 from influence_rlvr.lds import (
     compute_lds_cache_key,
     run_extremes_test,
@@ -581,23 +585,25 @@ def compute_toy_preference_influence(
     return torch.tensor(scores)
 
 
-def compute_toy_cg_influence(
+def _build_toy_policy_fisher_inputs(
     model: nn.Module,
     train_examples: Sequence[ToyGRPOExample],
     test_example: ToyGRPOExample,
-    lambda_damp: float = 1.0,
-    cg_iters: int = 50,
-    cg_tol: float = 1e-6,
+    *,
     beta: float = 0.0,
     ref_model: nn.Module | None = None,
-) -> tuple[torch.Tensor, dict]:
+) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], list[dict]]:
     """
-    PBRF-style influence at the final checkpoint via CGInfluence (CG + FVP).
+    Shared single-checkpoint setup for any policy-Fisher influence method.
 
-    Builds per-(z, y) policy-score gradients for every training example, hands
-    them to `policy_fisher_fvp_from_grad_cache` to produce the FVP closure, and
-    routes the CG solve through `CGInfluence`. Scores each train example as
-    g_train^T h where g_train is the GRPO-train gradient at the final ckpt.
+    Returns:
+      g_test       — test-side gradient ∇ E[r·log π] (shape (D,))
+      grad_cache   — per-prompt (n_y, D) tensor of ∇log π(y|z) for every rolled-out y
+      prob_cache   — per-prompt (n_y,)  tensor of π(y|z) under the current policy
+      train_infos  — [{"grad": g_train_i}, ...] using GRPO_TRAIN at this checkpoint
+
+    Both `CGInfluence` (CG+FVP) and `TrueFisherInfluence` (direct Cholesky) consume
+    grad_cache/prob_cache → identical operator, same g_train → apples-to-apples.
     """
     model.eval()
     params = [p for p in model.parameters() if p.requires_grad]
@@ -629,16 +635,7 @@ def compute_toy_cg_influence(
         grad_cache.append(G_z)
         prob_cache.append(probs.to(dtype=torch.float32))
 
-    fvp_fn = policy_fisher_fvp_from_grad_cache(grad_cache, prob_cache)
-    cg = CGInfluence(
-        fvp_fn=fvp_fn,
-        lambda_damp=lambda_damp,
-        cg_iters=cg_iters,
-        cg_tol=cg_tol,
-    )
-
-    test_info = {"grad": g_test}
-    train_infos = []
+    train_infos: list[dict] = []
     for ex in train_examples:
         old_model = clone_toy_model(model)
         bundle = compute_toy_gradient_bundle(
@@ -653,9 +650,63 @@ def compute_toy_cg_influence(
         )
         train_infos.append({"grad": bundle["grad"].to(dtype=torch.float32).detach()})
 
+    return g_test, grad_cache, prob_cache, train_infos
+
+
+def compute_toy_cg_influence(
+    model: nn.Module,
+    train_examples: Sequence[ToyGRPOExample],
+    test_example: ToyGRPOExample,
+    lambda_damp: float = 1.0,
+    cg_iters: int = 50,
+    cg_tol: float = 1e-6,
+    beta: float = 0.0,
+    ref_model: nn.Module | None = None,
+) -> tuple[torch.Tensor, dict]:
+    """PBRF-style IF at one checkpoint: CG+FVP solve against the true policy Fisher."""
+    g_test, grad_cache, prob_cache, train_infos = _build_toy_policy_fisher_inputs(
+        model, train_examples, test_example, beta=beta, ref_model=ref_model,
+    )
+    fvp_fn = policy_fisher_fvp_from_grad_cache(grad_cache, prob_cache)
+    cg = CGInfluence(
+        fvp_fn=fvp_fn,
+        lambda_damp=lambda_damp,
+        cg_iters=cg_iters,
+        cg_tol=cg_tol,
+    )
+    test_info = {"grad": g_test}
     scores_np = cg.compute_all_scores(test_info, train_infos)
     cg_info = cg.cg_info_for(test_info) or {}
     return torch.from_numpy(scores_np), cg_info
+
+
+def compute_toy_true_fisher_influence(
+    model: nn.Module,
+    train_examples: Sequence[ToyGRPOExample],
+    test_example: ToyGRPOExample,
+    lambda_damp: float = 1.0,
+    beta: float = 0.0,
+    ref_model: nn.Module | None = None,
+) -> tuple[torch.Tensor, dict]:
+    """
+    Direct (Cholesky) inverse of the true policy Fisher at one checkpoint.
+
+    Same operator as `compute_toy_cg_influence` — use this to validate CG
+    (h_cg should match h_truefisher to ~1e-5 relative error) or to isolate
+    the operator-choice effect from the solver-choice effect in LDS ablations.
+    Feasible only at toy scale (explicit D×D Cholesky).
+    """
+    g_test, grad_cache, prob_cache, train_infos = _build_toy_policy_fisher_inputs(
+        model, train_examples, test_example, beta=beta, ref_model=ref_model,
+    )
+    tf = TrueFisherInfluence(
+        train_infos,
+        grad_cache=grad_cache,
+        prob_cache=prob_cache,
+        lambda_damp=lambda_damp,
+    )
+    scores_np = tf.compute_all_scores({"grad": g_test})
+    return torch.from_numpy(scores_np), {"solver": "cholesky", "D": int(g_test.numel())}
 
 
 def compute_toy_cg_influence_historical(
@@ -917,7 +968,7 @@ def main():
     )
     parser.add_argument(
         "--if-calculation",
-        choices=["historical", "historical-last", "preference-styled", "surrogate", "cg", "cg-last"],
+        choices=["historical", "historical-last", "preference-styled", "surrogate", "cg", "cg-last", "true-fisher-last"],
         default="historical",
         help=(
             "Method to use for influence calculation. "
@@ -930,7 +981,11 @@ def main():
             "every training checkpoint and sums the per-step IFs over the "
             "trajectory (mirrors `historical`); "
             "`cg-last` is the single-final-checkpoint variant of `cg` (mirrors "
-            "`historical-last`)."
+            "`historical-last`); "
+            "`true-fisher-last` solves the same operator as `cg-last` but with "
+            "direct Cholesky inversion of the explicit D×D Fisher — use as the "
+            "reference solver to validate CG, or to ablate operator vs solver "
+            "choices against `historical-last`."
         ),
     )
     args = parser.parse_args()
@@ -1064,7 +1119,9 @@ def main():
     print(f"  Method: {args.if_calculation}...")
     # historical-last reuses the historical method's gradient logic, but only
     # evaluates at the final checkpoint (same single-step trick as surrogate).
-    last_checkpoint_only = args.if_calculation in ("surrogate", "historical-last", "cg-last")
+    last_checkpoint_only = args.if_calculation in (
+        "surrogate", "historical-last", "cg-last", "true-fisher-last",
+    )
     method_for_if = "historical" if args.if_calculation == "historical-last" else args.if_calculation
 
     for i, test_ex in enumerate(test_examples):
@@ -1097,6 +1154,18 @@ def main():
                 f"final residual={cg_info.get('final_residual', float('nan')):.2e}; "
                 f"g_test·h={cg_info.get('g_test_dot_h', float('nan')):.4e} (>=0 if SPD)"
             )
+        elif args.if_calculation == "true-fisher-last":
+            print(f"    True policy Fisher (direct Cholesky) at final checkpoint, λ={args.lambda_damp}...")
+            tf_scores, tf_info = compute_toy_true_fisher_influence(
+                full_model,
+                train_examples=train_examples,
+                test_example=test_ex,
+                lambda_damp=args.lambda_damp,
+                beta=args.beta,
+                ref_model=ref_model,
+            )
+            scores = tf_scores.numpy()
+            print(f"    Direct Cholesky on D={tf_info.get('D', '?')} Fisher.")
         elif args.if_calculation == "cg":
             print(
                 f"    CG trajectory over {len(train_result['history'])} steps "

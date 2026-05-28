@@ -7,6 +7,7 @@ from influence_rlvr.attribution.cg import (
     CGInfluence,
     policy_fisher_fvp_from_grad_cache,
 )
+from influence_rlvr.attribution.fisher import TrueFisherInfluence
 
 
 def _build_F_and_caches(D=12, n_y=4, N=20, seed=0):
@@ -67,6 +68,45 @@ class CGInfluenceTests(unittest.TestCase):
         vec = cg.compute_all_scores(test_info, train_infos)
         loop = np.array([cg.compute_score(test_info, ti) for ti in train_infos], dtype=np.float32)
         np.testing.assert_allclose(vec, loop, rtol=1e-5, atol=1e-6)
+
+    def test_cg_matches_true_fisher_direct(self):
+        """CG (FVP+iterative) must produce the same h as TrueFisher (direct Cholesky).
+
+        Both build the same operator F_true = (1/n) Σ_i Σ_y π(y|z_i) g g^T + λI,
+        so they should agree to machine precision once CG converges tightly.
+        """
+        D = 12
+        grad_cache, prob_cache, _ = _build_F_and_caches(D=D)
+        lam = 0.1
+        g_test = torch.randn(D, generator=torch.Generator().manual_seed(7))
+
+        # Direct Cholesky on F_true
+        train_infos = [
+            {"grad": torch.randn(D, generator=torch.Generator().manual_seed(20 + i))}
+            for i in range(len(grad_cache))
+        ]
+        tf = TrueFisherInfluence(
+            train_infos,
+            grad_cache=grad_cache,
+            prob_cache=prob_cache,
+            lambda_damp=lam,
+        )
+        h_tf = tf._precondition(g_test)
+
+        # CG via FVP closure (same operator, iterative)
+        fvp = policy_fisher_fvp_from_grad_cache(grad_cache, prob_cache)
+        cg = CGInfluence(fvp_fn=fvp, lambda_damp=lam, cg_iters=200, cg_tol=1e-10)
+        h_cg, info = cg.solve(g_test)
+        self.assertTrue(info["converged"])
+
+        rel_err = ((h_cg - h_tf).norm() / h_tf.norm()).item()
+        self.assertLess(rel_err, 1e-5)
+
+        # Per-train-example scores must also agree.
+        test_info = {"grad": g_test}
+        cg_scores = cg.compute_all_scores(test_info, train_infos)
+        tf_scores = tf.compute_all_scores(test_info)
+        np.testing.assert_allclose(cg_scores, tf_scores, rtol=1e-4, atol=1e-5)
 
     def test_h_cache_keyed_by_content_not_identity(self):
         """Two dicts with identical g_test bytes should hit the same cache entry."""

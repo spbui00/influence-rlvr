@@ -28,7 +28,20 @@ def _geometry_weight_vector(infos):
     )
 
 
-class FisherWoodburyInfluence(BaseInfluenceMethod):
+class MeanScoreFisherWoodburyInfluence(BaseInfluenceMethod):
+    """
+    Outer-of-means Fisher with the Woodbury identity for the inverse.
+
+        F = Σ_i w_i · x_i x_i^T + λI,    where x_i = ∇log mean_y π(y|z_i)
+
+    `x_i` is one *averaged* score vector per training prompt (not one outer
+    product per (prompt, y) pair). This is rank-`n_train` plus damping, so
+    the Woodbury identity inverts it in O(n_train²·D) space rather than O(D²).
+
+    For the *true* policy Fisher F = Σ_i Σ_y π(y|z_i) g_{i,y} g_{i,y}^T, use
+    `TrueFisherInfluence` (direct Cholesky) or `CGInfluence` (CG+FVP).
+    """
+
     def __init__(self, train_infos: list, lambda_damp: float = 0.1, normalize: bool = False):
         with torch.no_grad():
             self.device = _influence_device()
@@ -172,8 +185,19 @@ class FisherWoodburyInfluence(BaseInfluenceMethod):
             return torch.dot(h_inv_g, g_train).item()
 
 
-class FisherInfluence(BaseInfluenceMethod):
-    """Full Fisher inverse"""
+class MeanScoreFisherInfluence(BaseInfluenceMethod):
+    """
+    Outer-of-means Fisher with direct (full) inversion.
+
+        F = Σ_i w_i · x_i x_i^T + λI,    where x_i = ∇log mean_y π(y|z_i)
+
+    Same operator as `MeanScoreFisherWoodburyInfluence`, just inverted by
+    `torch.linalg.inv` on the full D×D matrix. Use when D is small.
+
+    For the *true* policy Fisher F = Σ_i Σ_y π(y|z_i) g_{i,y} g_{i,y}^T, use
+    `TrueFisherInfluence` (direct Cholesky) or `CGInfluence` (CG+FVP).
+    """
+
     def __init__(self, train_infos: list, lambda_damp: float = 0.1, normalize: bool = False):
         with torch.no_grad():
             self.device = _influence_device()
@@ -259,6 +283,86 @@ class FisherInfluence(BaseInfluenceMethod):
             return torch.dot(h_inv_g, g_train).item()
 
 
+class TrueFisherInfluence(BaseInfluenceMethod):
+    """
+    Direct (Cholesky) inversion of the *true* policy Fisher.
+
+        F = (1/n) Σ_i Σ_y π(y|z_i) ∇log π(y|z_i) ∇log π(y|z_i)^T + λI
+
+    Consumes the same `grad_cache` / `prob_cache` that
+    `policy_fisher_fvp_from_grad_cache` (and thus `CGInfluence`) uses, so this
+    class and CG should produce the same `h` to machine precision. Use this
+    as the gold-standard reference when validating CG, or when D is small
+    enough that an explicit D×D Cholesky is cheaper than CG.
+
+    Required train_info keys:
+      train_info["grad"] — flat D-vector training-side gradient.
+
+    grad_cache[i]: (n_y, D) tensor of ∇log π(y|z_i) for every rolled-out y.
+    prob_cache[i]: (n_y,)  tensor of π(y|z_i) under the current policy.
+    """
+
+    def __init__(
+        self,
+        train_infos: list,
+        grad_cache: list,
+        prob_cache: list,
+        lambda_damp: float = 0.1,
+    ):
+        with torch.no_grad():
+            self.device = _influence_device()
+            self.lambda_damp = float(lambda_damp)
+            self._train_grad_list = [info["grad"] for info in train_infos]
+            n = len(grad_cache)
+            if n != len(prob_cache):
+                raise ValueError(
+                    f"grad_cache (len {n}) and prob_cache (len {len(prob_cache)}) must match."
+                )
+            if n == 0:
+                self._L = None
+                self._D = 0
+                return
+
+            D = int(grad_cache[0].shape[1])
+            F = torch.zeros(D, D, dtype=torch.float32, device=self.device)
+            for G_i, pi_i in zip(grad_cache, prob_cache):
+                G = G_i.to(device=self.device, dtype=torch.float32)
+                pi = pi_i.to(device=self.device, dtype=torch.float32)
+                # G^T diag(π) G — per-prompt expected outer product
+                F = F + G.T @ (pi.unsqueeze(1) * G)
+            F = F / max(n, 1)
+            F = F + self.lambda_damp * torch.eye(D, dtype=torch.float32, device=self.device)
+            self._L = torch.linalg.cholesky(F)
+            self._D = D
+
+    def _precondition(self, g_test: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            g = g_test.to(device=self.device, dtype=torch.float32)
+            if self._L is None:
+                return (1.0 / self.lambda_damp) * g
+            return torch.cholesky_solve(g.unsqueeze(-1), self._L).squeeze(-1)
+
+    def compute_score(self, test_info: dict, train_info: dict) -> float:
+        with torch.no_grad():
+            h = self._precondition(test_info["grad"])
+            g_train = train_info["grad"].to(device=self.device, dtype=torch.float32)
+            return float(torch.dot(h, g_train).item())
+
+    def compute_all_scores(self, test_info: dict) -> np.ndarray:
+        with torch.no_grad():
+            n = len(self._train_grad_list)
+            if n == 0:
+                return np.zeros(0, dtype=np.float32)
+            h = self._precondition(test_info["grad"])
+            G = torch.stack(
+                [
+                    self._train_grad_list[i].to(device=self.device, dtype=torch.float32)
+                    for i in range(n)
+                ]
+            )
+            return (G @ h).detach().cpu().numpy().astype(np.float32, copy=False)
+
+
 class TrajectoryFisherInfluence:
     def __init__(
         self,
@@ -273,7 +377,7 @@ class TrajectoryFisherInfluence:
             raise ValueError(f"Unsupported Fisher solver: {solver!r}. Use 'woodbury' or 'full'.")
 
     def _build_fisher(self, train_infos: list) -> BaseInfluenceMethod:
-        cls = FisherInfluence if self.solver == "full" else FisherWoodburyInfluence
+        cls = MeanScoreFisherInfluence if self.solver == "full" else MeanScoreFisherWoodburyInfluence
         return cls(
             train_infos,
             lambda_damp=self.lambda_damp,
@@ -323,3 +427,10 @@ class TrajectoryFisherInfluence:
                 })
 
         return (total_matrix, breakdown) if return_breakdown else total_matrix
+
+
+# Backward-compat aliases for the pre-rename names. The classes implement the
+# outer-of-means Fisher (Σ_i w_i · x_i x_i^T with x_i = ∇log mean_y π(y|z_i)),
+# not the true policy Fisher — use `TrueFisherInfluence` for that.
+FisherInfluence = MeanScoreFisherInfluence
+FisherWoodburyInfluence = MeanScoreFisherWoodburyInfluence
