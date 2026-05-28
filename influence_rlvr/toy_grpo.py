@@ -429,6 +429,76 @@ def compute_toy_gradient_bundle(
     }
 
 
+def build_toy_policy_fisher_inputs(
+    model: nn.Module,
+    train_examples: Sequence[ToyGRPOExample],
+    test_example: ToyGRPOExample,
+    *,
+    beta: float = 0.0,
+    ref_model: nn.Module | None = None,
+) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], list[dict]]:
+    """
+    Single-checkpoint setup shared by every policy-Fisher influence method on the toy.
+
+    Returns:
+      g_test       — test-side gradient ∇ E[r·log π]  (D,)
+      grad_cache   — per-prompt (n_y, D) tensors of ∇log π(y|z), one per train ex
+      prob_cache   — per-prompt (n_y,) tensors of π(y|z) under the current policy
+      train_infos  — [{"grad": g_train_i}, ...] from GRPO_TRAIN at this checkpoint
+
+    Consumed by `CGInfluence` (CG+FVP), `TrueFisherInfluence` (direct Cholesky),
+    and `MeanScoreFisherInfluence` — identical operator/test-side inputs across
+    methods, so any LDS gap between them is attributable to operator or solver,
+    not preprocessing.
+    """
+    model.eval()
+    params = [p for p in model.parameters() if p.requires_grad]
+
+    test_bundle = compute_toy_gradient_bundle(
+        model,
+        test_example,
+        G=4,
+        rollout_mode=ToyRolloutMode.EXHAUSTIVE,
+        objective_mode=GradientObjective.EXPECTED_REWARD_PG,
+    )
+    g_test = test_bundle["grad"].to(dtype=torch.float32).detach()
+    D = g_test.numel()
+
+    sequences = _ALL_TWO_TOKEN_SEQUENCES.to(model.device)
+    n_seq = int(sequences.shape[0])
+    grad_cache: list[torch.Tensor] = []
+    prob_cache: list[torch.Tensor] = []
+    for ex in train_examples:
+        z = ex.z_tensor(device=model.device)
+        log_probs = model.sequence_log_probs(z, sequences)
+        probs = log_probs.detach().exp()
+        G_z = torch.zeros(n_seq, D, dtype=torch.float32, device=g_test.device)
+        for y_idx in range(n_seq):
+            grads = torch.autograd.grad(
+                log_probs[y_idx], params, retain_graph=(y_idx < n_seq - 1)
+            )
+            G_z[y_idx] = torch.cat([g.detach().flatten() for g in grads]).to(dtype=torch.float32)
+        grad_cache.append(G_z)
+        prob_cache.append(probs.to(dtype=torch.float32))
+
+    train_infos: list[dict] = []
+    for ex in train_examples:
+        old_model = clone_toy_model(model)
+        bundle = compute_toy_gradient_bundle(
+            model,
+            ex,
+            G=4,
+            rollout_mode=ToyRolloutMode.EXHAUSTIVE,
+            beta=beta,
+            old_model=old_model,
+            ref_model=ref_model,
+            objective_mode=GradientObjective.GRPO_TRAIN,
+        )
+        train_infos.append({"grad": bundle["grad"].to(dtype=torch.float32).detach()})
+
+    return g_test, grad_cache, prob_cache, train_infos
+
+
 def train_toy_grpo(
     model: AutoregressiveLogisticRegression,
     dataset: Sequence[ToyGRPOExample],

@@ -10,7 +10,7 @@ from peft import load_peft_weights, set_peft_model_state_dict
 from analysis.loader import append_grad_cache_checkpoint
 
 from .attribution.datainf import DataInfInfluence
-from .attribution.fisher import FisherWoodburyInfluence
+from .attribution.fisher import MeanScoreFisherInfluence
 from .attribution.tracin import tracin_base_matrix_from_infos
 from .checkpoint_schedule import (
     build_checkpoint_schedule,
@@ -625,10 +625,11 @@ def collect_checkpoint_infos(
             else:
                 datainf_checkpoint_matrix = np.zeros((n_test, n_train), dtype=np.float32)
 
-            fisher = FisherWoodburyInfluence(
+            fisher = MeanScoreFisherInfluence(
                 train_infos,
                 lambda_damp=fisher_ld,
                 normalize=fisher_normalize,
+                solver="woodbury",
             )
             fisher_checkpoint_matrix = np.zeros((n_test, n_train), dtype=np.float32)
             for idx, test_info in enumerate(test_infos):

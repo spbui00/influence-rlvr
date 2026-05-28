@@ -165,17 +165,16 @@ import matplotlib.pyplot as plt
 from influence_rlvr.toy_grpo import (
     ToyGRPOExample,
     ToyRolloutMode,
+    build_toy_policy_fisher_inputs,
     clone_toy_model,
-    compute_toy_fisher_influence,
     compute_toy_historical_fisher_influence,
     exact_expected_reward,
-    train_toy_grpo,
     reward_for_sequences,
     _ALL_TWO_TOKEN_SEQUENCES,
     GradientObjective,
     _toy_objective_and_debug,
     ToyHistoricalWeightMode,
-    compute_toy_gradient_bundle
+    compute_toy_gradient_bundle,
 )
 from influence_rlvr.attribution import (
     CGInfluence,
@@ -505,154 +504,6 @@ def _train_subset_for_lds(
     )
 
 
-def compute_toy_preference_influence(
-    model: nn.Module,
-    ref_model: nn.Module,
-    train_examples: Sequence[ToyGRPOExample],
-    test_example: ToyGRPOExample,
-    lambda_damp: float = 1.0,
-) -> torch.Tensor:
-    model.eval()
-    ref_model.eval()
-    
-    # 1. Compute test gradient g_test
-    test_bundle = compute_toy_gradient_bundle(
-        model,
-        test_example,
-        G=4,
-        rollout_mode=ToyRolloutMode.EXHAUSTIVE,
-        objective_mode=GradientObjective.EXPECTED_REWARD_PG,
-    )
-    g_test = test_bundle["grad"].to(dtype=torch.float32)
-
-    # 2. Compute training gradients g_train and geometry features
-    train_grads = []
-    geometry_features = []
-    
-    responses = _ALL_TWO_TOKEN_SEQUENCES.to(model.device)
-    N = responses.shape[0]
-    
-    for ex in train_examples:
-        z = ex.z_tensor(device=model.device)
-        target = ex.target_tensor(device=model.device)
-        
-        # Ground truth rewards
-        with torch.no_grad():
-            r_phi = reward_for_sequences(responses, target)
-            mu_phi = r_phi.mean()
-            sigma_phi = r_phi.std(unbiased=False).clamp(min=1e-8)
-            r_phi_prime = (r_phi - mu_phi) / sigma_phi
-        
-        # Implicit rewards
-        lp = model.sequence_log_probs(z, responses)
-        with torch.no_grad():
-            lp_ref = ref_model.sequence_log_probs(z.to(ref_model.device), responses.to(ref_model.device)).to(model.device)
-            r_hat = lp.detach() - lp_ref
-            mu_hat = r_hat.mean()
-            sigma_hat = r_hat.std(unbiased=False).clamp(min=1e-8)
-            r_hat_prime = (r_hat - mu_hat) / sigma_hat
-        
-        # g_train = - (2/N) * sum( (r_phi' - r_hat_prime) * grad log pi )
-        weights = - (2.0 / N) * (r_phi_prime - r_hat_prime)
-        weighted_lp = (weights * lp).sum()
-        
-        grads = torch.autograd.grad(weighted_lp, model.parameters(), retain_graph=True)
-        g_train = torch.cat([g.flatten() for g in grads]).to(dtype=torch.float32)
-        train_grads.append(g_train)
-        
-        # Geometry feature: mean grad log pi for Fisher
-        mean_lp = lp.mean()
-        g_logp_list = torch.autograd.grad(mean_lp, model.parameters())
-        g_logp = torch.cat([g.flatten() for g in g_logp_list]).to(dtype=torch.float32)
-        geometry_features.append(g_logp)
-
-    # 3. Compute Fisher and solve
-    X = torch.stack(geometry_features)
-    dim = X.shape[1]
-    # TrajectoryFisherInfluence typically normalizes by n_train, let's do the same
-    F = (X.T @ X) / len(train_examples)
-    F = F + lambda_damp * torch.eye(dim, device=F.device)
-    
-    h_inv_g_test = torch.linalg.solve(F, g_test)
-    
-    # Influence = g_test^T F^-1 g_train
-    # (Removed the leading minus from the user's formula to align with reward-based LDS)
-    scores = []
-    for gt in train_grads:
-        score = torch.dot(h_inv_g_test, gt).item()
-        scores.append(score)
-        
-    return torch.tensor(scores)
-
-
-def _build_toy_policy_fisher_inputs(
-    model: nn.Module,
-    train_examples: Sequence[ToyGRPOExample],
-    test_example: ToyGRPOExample,
-    *,
-    beta: float = 0.0,
-    ref_model: nn.Module | None = None,
-) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], list[dict]]:
-    """
-    Shared single-checkpoint setup for any policy-Fisher influence method.
-
-    Returns:
-      g_test       — test-side gradient ∇ E[r·log π] (shape (D,))
-      grad_cache   — per-prompt (n_y, D) tensor of ∇log π(y|z) for every rolled-out y
-      prob_cache   — per-prompt (n_y,)  tensor of π(y|z) under the current policy
-      train_infos  — [{"grad": g_train_i}, ...] using GRPO_TRAIN at this checkpoint
-
-    Both `CGInfluence` (CG+FVP) and `TrueFisherInfluence` (direct Cholesky) consume
-    grad_cache/prob_cache → identical operator, same g_train → apples-to-apples.
-    """
-    model.eval()
-    params = [p for p in model.parameters() if p.requires_grad]
-
-    test_bundle = compute_toy_gradient_bundle(
-        model,
-        test_example,
-        G=4,
-        rollout_mode=ToyRolloutMode.EXHAUSTIVE,
-        objective_mode=GradientObjective.EXPECTED_REWARD_PG,
-    )
-    g_test = test_bundle["grad"].to(dtype=torch.float32).detach()
-    D = g_test.numel()
-
-    sequences = _ALL_TWO_TOKEN_SEQUENCES.to(model.device)
-    n_seq = int(sequences.shape[0])
-    grad_cache: list[torch.Tensor] = []
-    prob_cache: list[torch.Tensor] = []
-    for ex in train_examples:
-        z = ex.z_tensor(device=model.device)
-        log_probs = model.sequence_log_probs(z, sequences)
-        probs = log_probs.detach().exp()
-        G_z = torch.zeros(n_seq, D, dtype=torch.float32, device=g_test.device)
-        for y_idx in range(n_seq):
-            grads = torch.autograd.grad(
-                log_probs[y_idx], params, retain_graph=(y_idx < n_seq - 1)
-            )
-            G_z[y_idx] = torch.cat([g.detach().flatten() for g in grads]).to(dtype=torch.float32)
-        grad_cache.append(G_z)
-        prob_cache.append(probs.to(dtype=torch.float32))
-
-    train_infos: list[dict] = []
-    for ex in train_examples:
-        old_model = clone_toy_model(model)
-        bundle = compute_toy_gradient_bundle(
-            model,
-            ex,
-            G=4,
-            rollout_mode=ToyRolloutMode.EXHAUSTIVE,
-            beta=beta,
-            old_model=old_model,
-            ref_model=ref_model,
-            objective_mode=GradientObjective.GRPO_TRAIN,
-        )
-        train_infos.append({"grad": bundle["grad"].to(dtype=torch.float32).detach()})
-
-    return g_test, grad_cache, prob_cache, train_infos
-
-
 def compute_toy_cg_influence(
     model: nn.Module,
     train_examples: Sequence[ToyGRPOExample],
@@ -664,7 +515,7 @@ def compute_toy_cg_influence(
     ref_model: nn.Module | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """PBRF-style IF at one checkpoint: CG+FVP solve against the true policy Fisher."""
-    g_test, grad_cache, prob_cache, train_infos = _build_toy_policy_fisher_inputs(
+    g_test, grad_cache, prob_cache, train_infos = build_toy_policy_fisher_inputs(
         model, train_examples, test_example, beta=beta, ref_model=ref_model,
     )
     fvp_fn = policy_fisher_fvp_from_grad_cache(grad_cache, prob_cache)
@@ -696,7 +547,7 @@ def compute_toy_true_fisher_influence(
     the operator-choice effect from the solver-choice effect in LDS ablations.
     Feasible only at toy scale (explicit D×D Cholesky).
     """
-    g_test, grad_cache, prob_cache, train_infos = _build_toy_policy_fisher_inputs(
+    g_test, grad_cache, prob_cache, train_infos = build_toy_policy_fisher_inputs(
         model, train_examples, test_example, beta=beta, ref_model=ref_model,
     )
     tf = TrueFisherInfluence(

@@ -28,98 +28,125 @@ def _geometry_weight_vector(infos):
     )
 
 
-class MeanScoreFisherWoodburyInfluence(BaseInfluenceMethod):
+class MeanScoreFisherInfluence(BaseInfluenceMethod):
     """
-    Outer-of-means Fisher with the Woodbury identity for the inverse.
+    Outer-of-means Fisher with a selectable solver.
 
-        F = Σ_i w_i · x_i x_i^T + λI,    where x_i = ∇log mean_y π(y|z_i)
+        F = Σ_i w_i · x_i x_i^T + λI,    x_i = ∇log mean_y π(y|z_i)
 
-    `x_i` is one *averaged* score vector per training prompt (not one outer
-    product per (prompt, y) pair). This is rank-`n_train` plus damping, so
-    the Woodbury identity inverts it in O(n_train²·D) space rather than O(D²).
+    `x_i` is one *averaged* score vector per training prompt, so F is rank
+    ≤ n_train plus damping. Two solvers consume the same operator:
 
-    For the *true* policy Fisher F = Σ_i Σ_y π(y|z_i) g_{i,y} g_{i,y}^T, use
+      - `solver="woodbury"` (default): Woodbury identity, inverts an n×n
+        matrix instead of D×D. O(n² · D) space; use when D >> n_train
+        (typical LLM scale).
+      - `solver="full"`: materialize and `torch.linalg.inv` the explicit
+        D×D Fisher. Use when D is small enough that the explicit inverse
+        is cheaper than the Woodbury structure (toy / small-feature regime).
+
+    For the *true* policy Fisher F = Σ_i Σ_y π(y|z_i) g g^T, use
     `TrueFisherInfluence` (direct Cholesky) or `CGInfluence` (CG+FVP).
+
+    Required train_info keys:
+      train_info["grad"]              — flat D-vector training-side gradient.
+      train_info["geometry_feature"]  — flat D-vector ∇log mean_y π(y|z_i).
+      train_info["historical_weight"] — optional, defaults to uniform 1/n.
     """
 
-    def __init__(self, train_infos: list, lambda_damp: float = 0.1, normalize: bool = False):
+    _SOLVERS = ("woodbury", "full")
+
+    def __init__(
+        self,
+        train_infos: list,
+        lambda_damp: float = 0.1,
+        normalize: bool = False,
+        solver: str = "woodbury",
+    ):
+        if solver not in self._SOLVERS:
+            raise ValueError(
+                f"Unsupported solver: {solver!r}. Use one of {self._SOLVERS}."
+            )
         with torch.no_grad():
             self.device = _influence_device()
-            self.lambda_damp = lambda_damp
-            self.normalize = normalize
+            self.lambda_damp = float(lambda_damp)
+            self.normalize = bool(normalize)
+            self.solver = solver
             self._train_grad_list = [info["grad"] for info in train_infos]
             self._geometry_list = []
             for info in train_infos:
                 gf = info.get("geometry_feature")
                 if gf is None:
                     raise ValueError(
-                        "Fisher influence requires 'geometry_feature' on each train info."
+                        "MeanScoreFisherInfluence requires 'geometry_feature' on each train info."
                     )
                 self._geometry_list.append(gf)
             n = len(self._train_grad_list)
             if n != len(self._geometry_list):
                 raise ValueError("train_infos grad and geometry_feature counts differ.")
 
+            self._grad_norms = None
+            self._geometry_norms = None
             if n > 0 and normalize:
-                norms = torch.empty(n, dtype=torch.float32, device=self.device)
-                for i in range(n):
-                    gi = self._train_grad_list[i].to(
-                        device=self.device, dtype=torch.float32
-                    )
-                    norms[i] = gi.norm().clamp(min=1e-12)
-                    del gi
-                self._grad_norms = norms
-            else:
-                self._grad_norms = None
-
-            if n > 0 and normalize:
+                grad_norms = torch.empty(n, dtype=torch.float32, device=self.device)
                 geom_norms = torch.empty(n, dtype=torch.float32, device=self.device)
                 for i in range(n):
-                    xi = self._geometry_list[i].to(
-                        device=self.device, dtype=torch.float32
-                    )
+                    gi = self._train_grad_list[i].to(device=self.device, dtype=torch.float32)
+                    xi = self._geometry_list[i].to(device=self.device, dtype=torch.float32)
+                    grad_norms[i] = gi.norm().clamp(min=1e-12)
                     geom_norms[i] = xi.norm().clamp(min=1e-12)
-                    del xi
+                self._grad_norms = grad_norms
                 self._geometry_norms = geom_norms
-            else:
-                self._geometry_norms = None
 
             self.geometry_weights = _geometry_weight_vector(train_infos).to(self.device)
 
-            chunk_size = 10
+            # Solver-specific state: at most one of these is populated.
+            self._inverse_small: torch.Tensor | None = None   # (n × n), Woodbury
+            self._inverse_fisher: torch.Tensor | None = None  # (D × D), full
+
             if n == 0:
-                gram = torch.empty(0, 0, dtype=torch.float32, device="cpu")
-                self.inverse_small = torch.empty(0, 0, dtype=torch.float32)
+                return
+            if solver == "woodbury":
+                self._setup_woodbury(n)
             else:
-                gram = torch.empty(n, n, dtype=torch.float32, device="cpu")
-                for i in range(0, n, chunk_size):
-                    i_end = min(i + chunk_size, n)
-                    chunk_i = self._geometry_weighted_chunk(i, i_end)
-                    for j in range(0, n, chunk_size):
-                        j_end = min(j + chunk_size, n)
-                        chunk_j = self._geometry_weighted_chunk(j, j_end)
-                        block = chunk_i @ chunk_j.T
-                        gram[i:i_end, j:j_end] = block.cpu()
-                        del chunk_j
-                        del block
-                    del chunk_i
-                identity = torch.eye(n, dtype=torch.float32, device="cpu")
-                self.inverse_small = torch.linalg.inv(
-                    identity + gram / lambda_damp
-                )
-                del identity
+                self._setup_full(n)
 
     def _geometry_weighted_chunk(self, start: int, end: int) -> torch.Tensor:
-        chunk = torch.stack(
-            [
-                self._geometry_list[k].to(device=self.device, dtype=torch.float32)
-                for k in range(start, end)
-            ]
-        )
+        chunk = torch.stack([
+            self._geometry_list[k].to(device=self.device, dtype=torch.float32)
+            for k in range(start, end)
+        ])
         if self.normalize:
-            chunk = chunk / self._geometry_norms[start:end].unsqueeze(1)
+            chunk = chunk / self._geometry_norms[start:end].unsqueeze(1)  # type: ignore[index]
         chunk = chunk * self.geometry_weights[start:end].sqrt().unsqueeze(1)
         return chunk
+
+    def _setup_woodbury(self, n: int) -> None:
+        chunk_size = 10
+        gram = torch.empty(n, n, dtype=torch.float32, device="cpu")
+        for i in range(0, n, chunk_size):
+            i_end = min(i + chunk_size, n)
+            chunk_i = self._geometry_weighted_chunk(i, i_end)
+            for j in range(0, n, chunk_size):
+                j_end = min(j + chunk_size, n)
+                chunk_j = self._geometry_weighted_chunk(j, j_end)
+                gram[i:i_end, j:j_end] = (chunk_i @ chunk_j.T).cpu()
+                del chunk_j
+            del chunk_i
+        identity = torch.eye(n, dtype=torch.float32, device="cpu")
+        self._inverse_small = torch.linalg.inv(identity + gram / self.lambda_damp)
+
+    def _setup_full(self, n: int) -> None:
+        features = torch.stack([
+            self._geometry_list[i].to(device=self.device, dtype=torch.float32)
+            for i in range(n)
+        ])
+        if self.normalize:
+            features = features / self._geometry_norms.unsqueeze(1)  # type: ignore[union-attr]
+        features = features * self.geometry_weights.sqrt().unsqueeze(1)
+        dim = int(features.shape[1])
+        fisher = features.T @ features
+        fisher = fisher + self.lambda_damp * torch.eye(dim, dtype=torch.float32, device=self.device)
+        self._inverse_fisher = torch.linalg.inv(fisher)
 
     def _precondition(self, g_test: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
@@ -127,16 +154,21 @@ class MeanScoreFisherWoodburyInfluence(BaseInfluenceMethod):
             if self.normalize:
                 g = g / (g.norm() + 1e-12)
             n = len(self._geometry_list)
-            chunk_size = 10
             if n == 0:
                 return (1.0 / self.lambda_damp) * g
+            if self.solver == "full":
+                assert self._inverse_fisher is not None
+                return self._inverse_fisher @ g
+            # Woodbury: h = (1/λ) g − (1/λ²) X^T (I + XX^T/λ)^{-1} X g
+            assert self._inverse_small is not None
+            chunk_size = 10
             features_g = torch.empty(n, dtype=torch.float32, device=self.device)
             for i in range(0, n, chunk_size):
                 i_end = min(i + chunk_size, n)
                 chunk = self._geometry_weighted_chunk(i, i_end)
                 features_g[i:i_end] = chunk @ g
                 del chunk
-            temp = self.inverse_small.to(self.device) @ features_g
+            temp = self._inverse_small.to(self.device) @ features_g
             del features_g
             correction = torch.zeros_like(g)
             for i in range(0, n, chunk_size):
@@ -144,13 +176,9 @@ class MeanScoreFisherWoodburyInfluence(BaseInfluenceMethod):
                 chunk = self._geometry_weighted_chunk(i, i_end)
                 correction += chunk.T @ temp[i:i_end]
                 del chunk
-            del temp
-            return (1.0 / self.lambda_damp) * g - (
-                1.0 / self.lambda_damp**2
-            ) * correction
+            return (1.0 / self.lambda_damp) * g - (1.0 / self.lambda_damp**2) * correction
 
     def compute_all_scores(self, test_info: dict) -> np.ndarray:
-        """Return IF of all train examples for test example test_info"""
         with torch.no_grad():
             n = len(self._train_grad_list)
             if n == 0:
@@ -160,118 +188,14 @@ class MeanScoreFisherWoodburyInfluence(BaseInfluenceMethod):
             out = np.empty(n, dtype=np.float32)
             for i in range(0, n, chunk_size):
                 i_end = min(i + chunk_size, n)
-                chunk = torch.stack(
-                    [
-                        self._train_grad_list[k].to(
-                            device=self.device, dtype=torch.float32
-                        )
-                        for k in range(i, i_end)
-                    ]
-                )
+                chunk = torch.stack([
+                    self._train_grad_list[k].to(device=self.device, dtype=torch.float32)
+                    for k in range(i, i_end)
+                ])
                 if self.normalize:
-                    chunk = chunk / self._grad_norms[i:i_end].unsqueeze(1)
+                    chunk = chunk / self._grad_norms[i:i_end].unsqueeze(1)  # type: ignore[index]
                 out[i:i_end] = (chunk @ h_inv_g).detach().cpu().numpy()
                 del chunk
-            return out
-
-    def compute_score(self, test_info: dict, train_info: dict) -> float:
-        with torch.no_grad():
-            g_train = train_info["grad"].to(
-                device=self.device, dtype=torch.float32
-            )
-            if self.normalize:
-                g_train = g_train / (g_train.norm() + 1e-12)
-            h_inv_g = self._precondition(test_info["grad"])
-            return torch.dot(h_inv_g, g_train).item()
-
-
-class MeanScoreFisherInfluence(BaseInfluenceMethod):
-    """
-    Outer-of-means Fisher with direct (full) inversion.
-
-        F = Σ_i w_i · x_i x_i^T + λI,    where x_i = ∇log mean_y π(y|z_i)
-
-    Same operator as `MeanScoreFisherWoodburyInfluence`, just inverted by
-    `torch.linalg.inv` on the full D×D matrix. Use when D is small.
-
-    For the *true* policy Fisher F = Σ_i Σ_y π(y|z_i) g_{i,y} g_{i,y}^T, use
-    `TrueFisherInfluence` (direct Cholesky) or `CGInfluence` (CG+FVP).
-    """
-
-    def __init__(self, train_infos: list, lambda_damp: float = 0.1, normalize: bool = False):
-        with torch.no_grad():
-            self.device = _influence_device()
-            self.lambda_damp = lambda_damp
-            self.normalize = normalize
-            self._train_grad_list = [info["grad"] for info in train_infos]
-            self._geometry_list = []
-            for info in train_infos:
-                gf = info.get("geometry_feature")
-                if gf is None:
-                    raise ValueError(
-                        "Fisher influence requires 'geometry_feature' on each train info."
-                    )
-                self._geometry_list.append(gf)
-
-            n = len(self._train_grad_list)
-            if n != len(self._geometry_list):
-                raise ValueError("train_infos grad and geometry_feature counts differ.")
-
-            if n == 0:
-                self._grad_norms = None
-                self._geometry_norms = None
-                self.inverse_fisher = None
-                return
-
-            if normalize:
-                self._grad_norms = torch.empty(n, dtype=torch.float32, device=self.device)
-                self._geometry_norms = torch.empty(n, dtype=torch.float32, device=self.device)
-                for i in range(n):
-                    gi = self._train_grad_list[i].to(device=self.device, dtype=torch.float32)
-                    xi = self._geometry_list[i].to(device=self.device, dtype=torch.float32)
-                    self._grad_norms[i] = gi.norm().clamp(min=1e-12)
-                    self._geometry_norms[i] = xi.norm().clamp(min=1e-12)
-            else:
-                self._grad_norms = None
-                self._geometry_norms = None
-
-            geometry_weights = _geometry_weight_vector(train_infos).to(self.device)
-            features = torch.stack(
-                [
-                    self._geometry_list[i].to(device=self.device, dtype=torch.float32)
-                    for i in range(n)
-                ]
-            )
-            if normalize:
-                features = features / self._geometry_norms.unsqueeze(1)
-            features = features * geometry_weights.sqrt().unsqueeze(1)
-
-            dim = int(features.shape[1])
-            fisher = features.T @ features
-            fisher = fisher + lambda_damp * torch.eye(dim, dtype=torch.float32, device=self.device)
-            self.inverse_fisher = torch.linalg.inv(fisher)
-
-    def _precondition(self, g_test: torch.Tensor) -> torch.Tensor:
-        with torch.no_grad():
-            g = g_test.to(device=self.device, dtype=torch.float32)
-            if self.normalize:
-                g = g / (g.norm() + 1e-12)
-            if self.inverse_fisher is None:
-                return (1.0 / self.lambda_damp) * g
-            return self.inverse_fisher @ g
-
-    def compute_all_scores(self, test_info: dict) -> np.ndarray:
-        with torch.no_grad():
-            n = len(self._train_grad_list)
-            if n == 0:
-                return np.zeros(0, dtype=np.float32)
-            h_inv_g = self._precondition(test_info["grad"])
-            out = np.empty(n, dtype=np.float32)
-            for i in range(n):
-                g_train = self._train_grad_list[i].to(device=self.device, dtype=torch.float32)
-                if self.normalize:
-                    g_train = g_train / self._grad_norms[i]
-                out[i] = torch.dot(h_inv_g, g_train).detach().cpu().item()
             return out
 
     def compute_score(self, test_info: dict, train_info: dict) -> float:
@@ -377,11 +301,11 @@ class TrajectoryFisherInfluence:
             raise ValueError(f"Unsupported Fisher solver: {solver!r}. Use 'woodbury' or 'full'.")
 
     def _build_fisher(self, train_infos: list) -> BaseInfluenceMethod:
-        cls = MeanScoreFisherInfluence if self.solver == "full" else MeanScoreFisherWoodburyInfluence
-        return cls(
+        return MeanScoreFisherInfluence(
             train_infos,
             lambda_damp=self.lambda_damp,
             normalize=self.normalize,
+            solver=self.solver,
         )
 
     def compute_matrix(self, checkpoint_infos: list, return_breakdown: bool = False):
@@ -427,10 +351,3 @@ class TrajectoryFisherInfluence:
                 })
 
         return (total_matrix, breakdown) if return_breakdown else total_matrix
-
-
-# Backward-compat aliases for the pre-rename names. The classes implement the
-# outer-of-means Fisher (Σ_i w_i · x_i x_i^T with x_i = ∇log mean_y π(y|z_i)),
-# not the true policy Fisher — use `TrueFisherInfluence` for that.
-FisherInfluence = MeanScoreFisherInfluence
-FisherWoodburyInfluence = MeanScoreFisherWoodburyInfluence

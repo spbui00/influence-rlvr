@@ -6,15 +6,9 @@ from .attribution import (
     TrajectoryTracInInfluence,
     TrajectoryDataInfInfluence,
     MeanScoreFisherInfluence,
-    MeanScoreFisherWoodburyInfluence,
     TrueFisherInfluence,
     TrajectoryFisherInfluence,
-    PBRFInfluence,
-    RepSimInfluence,
     CGInfluence,
-    # Deprecated aliases:
-    FisherInfluence,
-    FisherWoodburyInfluence,
 )
 from .attribution.cg import policy_fisher_fvp_from_grad_cache
 from .gradients import (
@@ -79,6 +73,7 @@ from .toy_grpo import (
     ToyHistoricalWeightMode,
     ToyRolloutMode,
     ToySandboxDataset,
+    build_toy_policy_fisher_inputs,
     build_user_plan_sandbox,
     compute_toy_fisher_influence,
     compute_toy_gradient_bundle,
@@ -97,17 +92,11 @@ __all__ = [
     "TracInInfluence",
     "DataInfInfluence",
     "MeanScoreFisherInfluence",
-    "MeanScoreFisherWoodburyInfluence",
     "TrueFisherInfluence",
     "TrajectoryTracInInfluence",
     "TrajectoryDataInfInfluence",
     "TrajectoryFisherInfluence",
-    "PBRFInfluence",
-    "RepSimInfluence",
     "CGInfluence",
-    # Deprecated aliases:
-    "FisherInfluence",
-    "FisherWoodburyInfluence",
     "policy_fisher_fvp_from_grad_cache",
     "InfluenceMode",
     "ExperimentMode",

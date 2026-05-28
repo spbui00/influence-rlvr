@@ -4,8 +4,7 @@ import numpy as np
 import torch
 
 from influence_rlvr.attribution.fisher import (
-    FisherInfluence,
-    FisherWoodburyInfluence,
+    MeanScoreFisherInfluence,
     TrajectoryFisherInfluence,
 )
 
@@ -61,8 +60,8 @@ class FisherInfluenceTests(unittest.TestCase):
         ]
         test_info = {"grad": torch.tensor([1.0, 2.0], dtype=torch.float32)}
 
-        full = FisherInfluence(train_infos, lambda_damp=0.5, normalize=False)
-        woodbury = FisherWoodburyInfluence(train_infos, lambda_damp=0.5, normalize=False)
+        full = MeanScoreFisherInfluence(train_infos, lambda_damp=0.5, normalize=False, solver="full")
+        woodbury = MeanScoreFisherInfluence(train_infos, lambda_damp=0.5, normalize=False, solver="woodbury")
 
         np.testing.assert_allclose(
             full.compute_all_scores(test_info),
