@@ -17,6 +17,38 @@ from pathlib import Path
 from typing import Sequence
 
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import matplotlib.pyplot as plt
+
+from influence_rlvr.toy_grpo import (
+    ToyGRPOExample,
+    ToyRolloutMode,
+    build_toy_policy_fisher_inputs,
+    clone_toy_model,
+    compute_toy_historical_fisher_influence,
+    exact_expected_reward,
+    reward_for_sequences,
+    _ALL_TWO_TOKEN_SEQUENCES,
+    GradientObjective,
+    _toy_objective_and_debug,
+    ToyHistoricalWeightMode,
+    compute_toy_gradient_bundle,
+)
+from influence_rlvr.attribution import (
+    CGInfluence,
+    TrueFisherInfluence,
+    policy_fisher_fvp_from_grad_cache,
+)
+from influence_rlvr.lds import (
+    compute_lds_cache_key,
+    run_extremes_test,
+    run_lds,
+)
+
+
 def run_saturation_diagnostics(
     full_model,
     checkpoints,
@@ -156,36 +188,6 @@ def _lds_cache_key(args) -> str:
     }
     return compute_lds_cache_key(payload)
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-import matplotlib.pyplot as plt
-
-from influence_rlvr.toy_grpo import (
-    ToyGRPOExample,
-    ToyRolloutMode,
-    build_toy_policy_fisher_inputs,
-    clone_toy_model,
-    compute_toy_historical_fisher_influence,
-    exact_expected_reward,
-    reward_for_sequences,
-    _ALL_TWO_TOKEN_SEQUENCES,
-    GradientObjective,
-    _toy_objective_and_debug,
-    ToyHistoricalWeightMode,
-    compute_toy_gradient_bundle,
-)
-from influence_rlvr.attribution import (
-    CGInfluence,
-    TrueFisherInfluence,
-    policy_fisher_fvp_from_grad_cache,
-)
-from influence_rlvr.lds import (
-    compute_lds_cache_key,
-    run_extremes_test,
-    run_lds,
-)
 
 
 class ToyAutoregressiveMLP(nn.Module):
