@@ -23,7 +23,7 @@ export HF_HUB_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
 
 module --force purge
-module load StdEnv/2023 gcc/12.3 python/3.11 cuda/12.2 arrow
+module load StdEnv/2023 gcc/12.3 python/3.11 cuda/12.2 arrow/21.0.0
 source "$VENV_DIR/bin/activate"
 cd "$SLURM_SUBMIT_DIR"
 
