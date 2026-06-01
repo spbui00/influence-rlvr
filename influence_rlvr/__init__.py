@@ -11,6 +11,7 @@ from .attribution import (
     CGInfluence,
 )
 from .attribution.cg import policy_fisher_fvp_from_grad_cache
+from .fisher_fvp import FisherRow, build_policy_fisher_fvp
 from .gradients import (
     compute_policy_gradient_bundle,
     compute_policy_gradient_bundle_batch,
@@ -57,6 +58,7 @@ from .training import HistoricalBatchGRPOTrainer
 from .lds import (
     LDSResult,
     ExtremesRow,
+    PerExampleResult,
     SubsetTrainer,
     compute_lds_cache_key,
     sample_subset_masks,
@@ -65,6 +67,7 @@ from .lds import (
     collect_actual_rewards,
     run_lds,
     run_extremes_test,
+    run_per_example_test,
 )
 from .toy_grpo import (
     AutoregressiveLogisticRegression,
@@ -98,6 +101,8 @@ __all__ = [
     "TrajectoryFisherInfluence",
     "CGInfluence",
     "policy_fisher_fvp_from_grad_cache",
+    "FisherRow",
+    "build_policy_fisher_fvp",
     "InfluenceMode",
     "ExperimentMode",
     "GenerationBackend",

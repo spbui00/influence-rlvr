@@ -63,11 +63,45 @@ def sample_subset_masks(n_train: int, m_subsets: int, *, seed: int) -> torch.Ten
     return torch.randint(0, 2, (m_subsets, n_train), dtype=torch.bool)
 
 
+def _visit_weights(mask: np.ndarray, n_training_steps: int | None) -> np.ndarray:
+    """Per-example training visit counts under round-robin traversal of the masked subset.
+
+    The PBRF derivation predicts ΔReward ≈ Σ_k η · IF[example_at_step_k] over the
+    sequence of training steps. For round-robin training on a subset of size |S|
+    with K total steps:
+      - Each position p ∈ [0, |S|) is visited ⌊K/|S|⌋ or ⌊K/|S|⌋+1 times.
+      - The first (K mod |S|) positions get the extra visit.
+
+    If `n_training_steps` is None, every masked example gets weight 1 — i.e. the
+    naive `sum(IF over subset)` predictor (correct only when K = |S|).
+    """
+    if n_training_steps is None:
+        return mask.astype(np.float64)
+    n = int(mask.sum())
+    weights = np.zeros_like(mask, dtype=np.float64)
+    if n == 0:
+        return weights
+    base = n_training_steps // n
+    extra = n_training_steps % n
+    in_subset_idx = np.flatnonzero(mask)  # ascending global indices
+    for pos, idx in enumerate(in_subset_idx):
+        weights[idx] = base + (1 if pos < extra else 0)
+    return weights
+
+
 def predicted_rewards_from_ifs(
     test_ifs: Sequence[np.ndarray],
     subset_masks: torch.Tensor,
+    n_training_steps: int | None = None,
 ) -> np.ndarray:
-    """(n_test, m_subsets) matrix of `sum(IF[i] over subset j)`."""
+    """(n_test, m_subsets) matrix of visit-count-weighted `Σ_i visits[i] · IF[i]`.
+
+    When `n_training_steps` is None this is the plain `sum(IF over subset)`
+    predictor. Pass `n_training_steps` (= `--lds-cont-steps` or `--subset-steps`)
+    to weight each example by how many times round-robin training actually
+    visited it — which is what the PBRF formula predicts literally and matters
+    when n_training_steps differs from |subset|.
+    """
     n_test = len(test_ifs)
     m_subsets = int(subset_masks.shape[0])
     out = np.zeros((n_test, m_subsets), dtype=np.float64)
@@ -77,8 +111,9 @@ def predicted_rewards_from_ifs(
         mask = masks_np[j]
         if not mask.any():
             continue
+        weights = _visit_weights(mask, n_training_steps)
         for i in range(n_test):
-            out[i, j] = float(ifs_np[i][mask].sum())
+            out[i, j] = float((ifs_np[i] * weights).sum())
     return out
 
 
@@ -182,8 +217,17 @@ def run_lds(
     seed: int = 42,
     cache_path: Path | None = None,
     progress_every: int = 10,
+    n_training_steps: int | None = None,
 ) -> LDSResult:
-    """End-to-end LDS run. `seed` controls mask sampling and per-subset seeds."""
+    """End-to-end LDS run. `seed` controls mask sampling and per-subset seeds.
+
+    `n_training_steps` should match the total number of optimizer steps the
+    caller's `subset_trainer` takes per subset (e.g. `--lds-cont-steps` for
+    continuation mode, `--subset-steps` for from-scratch). The predicted-reward
+    sum is then weighted by the per-example round-robin visit count, which is
+    what the PBRF formula predicts literally. Leave it None to fall back to the
+    naive `sum(IF over subset)` predictor — correct only when steps == |subset|.
+    """
     subset_masks = sample_subset_masks(n_train, m_subsets, seed=seed + 1)
     actual, cache_hit = collect_actual_rewards(
         subset_masks,
@@ -193,7 +237,7 @@ def run_lds(
         progress_every=progress_every,
         cache_path=cache_path,
     )
-    predicted = predicted_rewards_from_ifs(test_ifs, subset_masks)
+    predicted = predicted_rewards_from_ifs(test_ifs, subset_masks, n_training_steps=n_training_steps)
     per_test, avg = lds_correlations(actual, predicted)
     return LDSResult(
         actual_rewards=actual,
@@ -202,6 +246,82 @@ def run_lds(
         per_test=per_test,
         average_correlation=avg,
         cache_hit=cache_hit,
+    )
+
+
+@dataclass
+class PerExampleResult:
+    """Per-test Spearman between IF scores and per-example actual reward changes."""
+    actual_rewards: np.ndarray            # (n_test, n_train)
+    per_test: list[dict]                  # [{test_idx, correlation, p_value, actual_std, if_std}, ...]
+    average_correlation: float
+
+
+def run_per_example_test(
+    test_ifs: Sequence[np.ndarray],
+    subset_trainer: SubsetTrainer,
+    *,
+    n_train: int,
+    n_test: int,
+    seed: int = 42,
+    progress_every: int = 50,
+) -> PerExampleResult:
+    """
+    Per-example Spearman: train on each singleton subset {z_i} alone and
+    correlate the resulting test reward with the IF score φ_i.
+
+    For each train example i, calls `subset_trainer([i], seed)` to train on the
+    singleton, measure per-test rewards, then computes Spearman per test point
+    between `{φ_i}_i` and `{R(θ_singleton_i, z_test)}_i`.
+
+    This is the cleanest test of "does the IF rank single examples correctly"
+    for greedy selection — answers the question directly, without LDS's
+    linear-additivity assumption over random subsets.
+
+    Cost: n_train singleton trainings (one per example). Cheaper than LDS when
+    n_train < m_subsets — same fraction-of-data per call but no compositional
+    confounds.
+
+    Caveat: with `n_training_steps=1` in the trainer, this exactly equals
+    η·φ_i by the PBRF derivation → Spearman ≈ 1 by construction. Use K ≫ 1
+    to make nonlinearity room to matter (and to align with the regime where
+    you actually care about the IF's predictions).
+    """
+    actual = np.zeros((n_test, n_train), dtype=np.float64)
+    t0 = time.time()
+    for i in range(n_train):
+        if progress_every and i > 0 and i % progress_every == 0:
+            print(f"  Per-example {i}/{n_train} (Elapsed: {time.time() - t0:.1f}s)...")
+        rewards = subset_trainer([i], seed=seed + 1000 + i)
+        actual[:, i] = np.asarray(rewards, dtype=np.float64)
+
+    per_test: list[dict] = []
+    corrs: list[float] = []
+    for j in range(n_test):
+        if_scores = np.asarray(test_ifs[j])
+        actual_j = actual[j]
+        actual_std = float(np.std(actual_j))
+        if_std = float(np.std(if_scores))
+        row: dict = {
+            "test_idx": j,
+            "actual_std": actual_std,
+            "if_std": if_std,
+        }
+        if actual_std == 0 or if_std == 0:
+            row["correlation"] = None
+            row["p_value"] = None
+        else:
+            r, p = spearmanr(if_scores, actual_j)
+            row["correlation"] = float(r)
+            row["p_value"] = float(p)
+            corrs.append(float(r))
+        per_test.append(row)
+
+    avg = float(np.mean(corrs)) if corrs else 0.0
+    return PerExampleResult(
+        actual_rewards=actual,
+        per_test=per_test,
+        average_correlation=avg,
     )
 
 
