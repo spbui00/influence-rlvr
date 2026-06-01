@@ -76,17 +76,42 @@ def load_train_pool(cfg: ExperimentConfig) -> Dataset:
     return ds
 
 
+def _webinstruct_test_domains(cfg: ExperimentConfig) -> tuple[str, ...]:
+    """Domains for the test partition: `webinstruct_test_domains` or all `domains`."""
+    return tuple(cfg.webinstruct_test_domains) or tuple(cfg.domains)
+
+
+def _webinstruct_test_partition(cfg: ExperimentConfig) -> tuple[Dataset, Dataset]:
+    """Deterministic, DISJOINT split of the test slice into (if_target, eval).
+
+    One fixed shuffle of the (domain-filtered) test split; the first
+    `n_if_target` rows are the influence target, the remainder are the
+    in-distribution eval set. So the eval can never overlap the IF target.
+    Both loaders call this, so they always agree on the partition.
+    """
+    cats = _categories_for_domains(_webinstruct_test_domains(cfg))
+    raw = load_dataset(cfg.train_dataset, split="test")
+    raw = raw.filter(lambda ex: ex.get("category") in cats)
+    raw = raw.filter(lambda ex: bool(str(ex.get("answer", "") or "").strip()))
+    raw = raw.shuffle(seed=cfg.seed)
+    n = len(raw)
+    n_if = cfg.n_if_target if cfg.n_if_target and cfg.n_if_target > 0 else n
+    if n_if >= n:                       # keep the eval partition non-empty
+        n_if = max(1, n // 2)
+        print(f"  [data] only {n} test rows for domains "
+              f"{_webinstruct_test_domains(cfg)}; splitting {n_if} IF target / "
+              f"{n - n_if} eval.")
+    return raw.select(range(n_if)), raw.select(range(n_if, n))
+
+
 def load_if_target_set(cfg: ExperimentConfig) -> Dataset:
-    """Held-out target set the influence is measured against (test split)."""
-    raw = _load_webinstruct_split(cfg, "test")
-    if cfg.n_if_target and cfg.n_if_target > 0 and len(raw) > cfg.n_if_target:
-        raw = raw.shuffle(seed=cfg.seed + 1).select(range(cfg.n_if_target))
-    ds = raw.map(
+    """Held-out target set the influence is measured against (disjoint from eval)."""
+    if_raw, _ = _webinstruct_test_partition(cfg)
+    return if_raw.map(
         _format_webinstruct_row,
         with_indices=True,
-        remove_columns=raw.column_names,
+        remove_columns=if_raw.column_names,
     )
-    return ds
 
 
 # ── Eval benchmarks ─────────────────────────────────────────────────────────
@@ -106,13 +131,15 @@ def _eval_row(question: str, solution: str, *, source: str,
 
 
 def load_webinstruct_test(cfg: ExperimentConfig, limit: int) -> list[dict]:
-    raw = _load_webinstruct_split(cfg, "test")
-    if limit and len(raw) > limit:
-        raw = raw.shuffle(seed=cfg.seed + 7).select(range(limit))
+    """In-distribution eval — the eval half of the test partition (disjoint from
+    the IF target). Respects `webinstruct_test_domains` (e.g. CS-only)."""
+    _, eval_raw = _webinstruct_test_partition(cfg)
+    if limit and len(eval_raw) > limit:
+        eval_raw = eval_raw.select(range(limit))
     return [
         _eval_row(ex["question"], ex.get("answer", ""), source="webinstruct_test",
                   answer_type=ex.get("answer_type", ""), category=ex.get("category", ""))
-        for ex in raw
+        for ex in eval_raw
     ]
 
 

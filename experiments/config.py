@@ -70,8 +70,15 @@ class ExperimentConfig:
     # <=0 means "use everything after filtering".
     n_train_pool: int = 6000
     # Held-out target set the influence is measured against (drawn from the
-    # dataset `test` split, filtered to the same domains).
+    # dataset `test` split). The test slice is partitioned into a disjoint IF
+    # target (first n_if_target) and an in-distribution eval set (the rest), so
+    # the eval never overlaps the influence target.
     n_if_target: int = 64
+    # Restrict the WebInstruct *test* partition (both IF target AND the
+    # in-distribution `webinstruct_test` eval) to these domains. Empty -> use
+    # `domains`. e.g. ("cs",) to steer pruning toward, and test on, Computer
+    # Science specifically while still training on all `domains`.
+    webinstruct_test_domains: tuple[str, ...] = ()
     max_prompt_length: int = 1024
 
     # ── GRPO ────────────────────────────────────────────────────────────────
@@ -143,8 +150,19 @@ class ExperimentConfig:
     eval_temperature: float = 0.0     # greedy by default
     eval_top_p: float = 1.0
 
+    # ── Live (in-training) held-out eval ────────────────────────────────────
+    # Periodically score the disjoint held-out eval set (the eval half of the
+    # WebInstruct test partition, CS-only if webinstruct_test_domains=("cs",))
+    # with the verifier and log eval/accuracy to W&B + a CSV, so baseline and
+    # if_prune yield comparable held-out-accuracy-vs-step curves. This is the
+    # fair comparison (training reward is over different data per regime).
+    live_eval: bool = True
+    live_eval_every: int = 0          # 0 -> use save_steps
+    live_eval_examples: int = 64      # held-out prompts scored each time (kept small)
+    live_eval_max_new_tokens: int = 1024
+
     def __post_init__(self) -> None:
-        for d in self.domains:
+        for d in (*self.domains, *self.webinstruct_test_domains):
             if d not in DOMAIN_TO_CATEGORIES:
                 raise ValueError(
                     f"Unknown domain {d!r}. Known: {sorted(DOMAIN_TO_CATEGORIES)}"
@@ -210,7 +228,7 @@ class ExperimentConfig:
             if k not in fields:
                 continue
             # Restore tuple-typed fields.
-            if k in {"lora_target_modules", "domains", "eval_benchmarks"} and isinstance(v, list):
+            if k in {"lora_target_modules", "domains", "eval_benchmarks", "webinstruct_test_domains"} and isinstance(v, list):
                 v = tuple(v)
             kwargs[k] = v
         return cls(**kwargs)
@@ -235,7 +253,7 @@ class ExperimentConfig:
                 parser.add_argument(name, dest=f.name, action="store_true", default=None)
                 parser.add_argument("--no-" + f.name.replace("_", "-"),
                                     dest=f.name, action="store_false")
-            elif f.name in {"lora_target_modules", "domains", "eval_benchmarks"}:
+            elif f.name in {"lora_target_modules", "domains", "eval_benchmarks", "webinstruct_test_domains"}:
                 parser.add_argument(name, type=str, default=None,
                                     help="Comma-separated list.")
             elif isinstance(default, int):
@@ -259,7 +277,7 @@ class ExperimentConfig:
             val = getattr(args, f.name, None)
             if val is None:
                 continue
-            if f.name in {"lora_target_modules", "domains", "eval_benchmarks"} and isinstance(val, str):
+            if f.name in {"lora_target_modules", "domains", "eval_benchmarks", "webinstruct_test_domains"} and isinstance(val, str):
                 val = tuple(p.strip() for p in val.split(",") if p.strip())
             overrides[f.name] = val
         merged = {**base.to_dict(), **overrides}
