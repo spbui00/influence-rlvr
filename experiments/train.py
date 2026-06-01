@@ -34,8 +34,9 @@ from influence_rlvr.generation import clear_vllm_engine_cache
 from influence_rlvr.rewards import format_guardrail_reward_func
 
 from .config import ExperimentConfig
-from .data import load_if_target_set, load_train_pool
+from .data import load_if_target_set, load_train_pool, load_webinstruct_test
 from .influence import compute_pool_influence
+from .live_eval import LiveEvalCallback
 from .verifier import make_verifier_reward_func
 
 
@@ -136,8 +137,24 @@ def make_grpo_config(cfg: ExperimentConfig, *, max_steps: int, shuffle: bool = T
     return GRPOConfig(**kw)
 
 
-def build_trainer(cfg, model, tokenizer, train_dataset, *, max_steps, shuffle=True):
-    return HistoricalBatchGRPOTrainer(
+def make_live_eval_callback(cfg, tokenizer, device):
+    """Held-out eval callback (or None). Uses the disjoint eval partition."""
+    if not cfg.live_eval:
+        return None
+    examples = load_webinstruct_test(cfg, cfg.live_eval_examples)
+    if not examples:
+        print("  [live-eval] no held-out eval examples; disabling live eval.")
+        return None
+    every = cfg.live_eval_every if cfg.live_eval_every > 0 else cfg.save_steps
+    return LiveEvalCallback(
+        cfg, examples, tokenizer, device,
+        csv_path=cfg.run_dir / "live_eval.csv", every=every,
+    )
+
+
+def build_trainer(cfg, model, tokenizer, train_dataset, *, max_steps, shuffle=True,
+                  callbacks=None):
+    trainer = HistoricalBatchGRPOTrainer(
         model=model,
         reward_funcs=build_reward_funcs(cfg),
         args=make_grpo_config(cfg, max_steps=max_steps, shuffle=shuffle),
@@ -145,6 +162,9 @@ def build_trainer(cfg, model, tokenizer, train_dataset, *, max_steps, shuffle=Tr
         processing_class=tokenizer,
         history_output_dir=str(cfg.grpo_output_dir),
     )
+    for cb in (callbacks or []):
+        trainer.add_callback(cb)
+    return trainer
 
 
 def _repeat_to_length(order: np.ndarray, n_picks: int) -> list[int]:
@@ -172,7 +192,9 @@ def run_baseline(cfg, model, tokenizer, train_pool, device):
     print("\n" + "=" * 80)
     print(f"BASELINE GRPO — {cfg.max_steps} steps on {len(train_pool)} prompts")
     print("=" * 80)
-    trainer = build_trainer(cfg, model, tokenizer, train_pool, max_steps=cfg.max_steps)
+    live_eval = make_live_eval_callback(cfg, tokenizer, device)
+    trainer = build_trainer(cfg, model, tokenizer, train_pool, max_steps=cfg.max_steps,
+                            callbacks=[live_eval] if live_eval else None)
     t0 = time.time()
     trainer.train()
     print(f"Baseline training finished in {time.time() - t0:.1f}s")
@@ -216,6 +238,7 @@ def run_if_prune(cfg, model, tokenizer, train_pool, device):
     print(f"  IF target set: {len(target_set)} held-out prompts")
     print("=" * 80)
 
+    live_eval = make_live_eval_callback(cfg, tokenizer, device)
     prev_ckpt: str | None = None
     for w in range(len(boundaries) - 1):
         start, end = boundaries[w], boundaries[w + 1]
@@ -255,7 +278,8 @@ def run_if_prune(cfg, model, tokenizer, train_pool, device):
                 model.gradient_checkpointing_enable()
             model.config.use_cache = False
 
-        trainer = build_trainer(cfg, model, tokenizer, dataset, max_steps=end, shuffle=shuffle)
+        trainer = build_trainer(cfg, model, tokenizer, dataset, max_steps=end,
+                                shuffle=shuffle, callbacks=[live_eval] if live_eval else None)
         t0 = time.time()
         if prev_ckpt is None:
             trainer.train()

@@ -43,6 +43,41 @@ of 6000 at 8 prompts/step ≈ 750 steps/window). The job prints this at startup.
 Controls/ablations via `--selection`: `if-guided` (most influential first),
 `anti-if` (least first — should *hurt* if IF has signal), `random` (size-matched).
 
+### Held-out target & eval (no leakage)
+
+The WebInstruct `test` slice is split **once, deterministically, into two disjoint
+halves**: the first `n_if_target` rows are the **IF target** (what pruning steers
+toward), the rest are the in-distribution **`webinstruct_test` eval**. They never
+overlap, so the eval isn't measuring the examples the data-selection was tuned on.
+The training pool comes from the `train` split, disjoint from both. External
+benchmarks (`gsm8k`, `math500`, …) are separate datasets — the cleanest signal.
+
+**Targeting a single domain (e.g. Computer Science):** `--webinstruct-test-domains cs`
+restricts *both* the IF target and the `webinstruct_test` eval to CS, while training
+still spans all `--domains`. So you prune the (math+cs+finance) pool by influence on
+held-out **CS** and test on held-out **CS**:
+
+```bash
+sbatch --export=ALL,REGIME=if_prune,RUN_NAME=qwen3_4b_prune_cs,\
+EXTRA_ARGS="--webinstruct-test-domains cs --eval-benchmarks webinstruct_test" \
+  experiments/cluster/train.slurm
+```
+
+(When `webinstruct_test` spans all three domains, `evaluate.py` already reports a
+per-category accuracy breakdown, so you also get CS/Math/Finance numbers separately.)
+
+### Held-out accuracy *during* training (the comparison curve)
+
+TRL only logs the **training reward** (verifier pass-rate on the prompts trained
+that step) — and since `baseline` and `if_prune` train on *different* prompts each
+step, that curve isn't comparable across regimes. So a `LiveEvalCallback` also runs
+every `live_eval_every` steps (default = `save_steps`): it generates on the disjoint
+held-out eval set (CS-only if you set `--webinstruct-test-domains cs`), scores with
+the verifier, and logs `eval/accuracy` (+ `eval/acc_<category>`) to **W&B** and
+`outputs/<run>/live_eval.csv`. Plot `eval/accuracy` vs step for both runs — *that's*
+the fair baseline-vs-if_prune comparison. Disable with `--no-live-eval`; tune
+`--live-eval-examples` / `--live-eval-max-new-tokens` for cost.
+
 > **Cost:** every recompute re-scores the entire pool (one rollout + gradient per
 > pool example). With K triggers that's K × `n_train_pool` scoring rollouts — the
 > dominant cost. Keep `n_train_pool` modest, or raise `if_recompute_every`, when
@@ -71,7 +106,7 @@ uv run python -m experiments.train \
   --g-train 2 --per-device-batch 2 --grad-accum 1 \
   --cg-fisher-examples 4 --cg-fisher-g 2 --cg-iters 5 \
   --max-completion-length 256 --no-use-vllm \
-  --verifier-max-new-tokens 128
+  --verifier-max-new-tokens 128 --live-eval-examples 2
 ```
 
 (Generation/verifier are slow on CPU — this just exercises the full code path.)

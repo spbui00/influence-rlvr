@@ -58,7 +58,8 @@ def load_policy(cfg: ExperimentConfig, checkpoint_dir: Path, device):
 
 @torch.inference_mode()
 def generate_answers(model, tokenizer, questions: list[str], cfg: ExperimentConfig,
-                     device, batch_size: int = 8) -> list[str]:
+                     device, batch_size: int = 8, max_new_tokens: int | None = None) -> list[str]:
+    max_new_tokens = max_new_tokens or cfg.eval_max_new_tokens
     responses: list[str] = []
     for start in range(0, len(questions), batch_size):
         batch = questions[start:start + batch_size]
@@ -70,7 +71,7 @@ def generate_answers(model, tokenizer, questions: list[str], cfg: ExperimentConf
         enc = tokenizer(prompts, return_tensors="pt", padding=True,
                         truncation=True, max_length=cfg.max_prompt_length).to(device)
         gen_kwargs = dict(
-            max_new_tokens=cfg.eval_max_new_tokens,
+            max_new_tokens=max_new_tokens,
             pad_token_id=tokenizer.pad_token_id,
         )
         if cfg.eval_temperature and cfg.eval_temperature > 0:
@@ -84,33 +85,45 @@ def generate_answers(model, tokenizer, questions: list[str], cfg: ExperimentConf
     return responses
 
 
-def evaluate_benchmark(name: str, cfg: ExperimentConfig, model, tokenizer, device) -> dict:
-    examples = load_eval_benchmark(name, cfg, cfg.eval_max_examples)
+def score_examples(examples: list[dict], model, tokenizer, cfg: ExperimentConfig,
+                   device, *, max_new_tokens: int | None = None) -> dict:
+    """Generate + verifier-score a list of {question, solution, category} rows.
+
+    Shared by the post-hoc benchmark eval and the in-training LiveEvalCallback.
+    """
     questions = [e["question"] for e in examples]
     golds = [e["solution"] for e in examples]
-    print(f"  [{name}] generating {len(examples)} completions...")
-    responses = generate_answers(model, tokenizer, questions, cfg, device)
+    responses = generate_answers(model, tokenizer, questions, cfg, device,
+                                 max_new_tokens=max_new_tokens)
     students = [_student_answer(r) for r in responses]
-
-    verifier = get_verifier_from_config(cfg)
-    rewards = verifier.verify_batch(questions, golds, students)
+    rewards = get_verifier_from_config(cfg).verify_batch(questions, golds, students)
 
     by_cat: dict[str, list[float]] = defaultdict(list)
     for ex, r in zip(examples, rewards):
         by_cat[ex.get("category", "")].append(r)
+    return {
+        "n": len(rewards),
+        "accuracy": (sum(rewards) / len(rewards)) if rewards else 0.0,
+        "per_category": {c: sum(v) / len(v) for c, v in by_cat.items() if v},
+        "students": students,
+        "rewards": rewards,
+    }
 
-    acc = sum(rewards) / len(rewards) if rewards else 0.0
-    per_category = {c: sum(v) / len(v) for c, v in by_cat.items() if v}
-    print(f"  [{name}] accuracy = {acc:.4f} (n={len(rewards)})")
+
+def evaluate_benchmark(name: str, cfg: ExperimentConfig, model, tokenizer, device) -> dict:
+    examples = load_eval_benchmark(name, cfg, cfg.eval_max_examples)
+    print(f"  [{name}] generating {len(examples)} completions...")
+    res = score_examples(examples, model, tokenizer, cfg, device)
+    print(f"  [{name}] accuracy = {res['accuracy']:.4f} (n={res['n']})")
     return {
         "benchmark": name,
-        "n": len(rewards),
-        "accuracy": acc,
-        "per_category": per_category,
+        "n": res["n"],
+        "accuracy": res["accuracy"],
+        "per_category": res["per_category"],
         "per_example": [
             {"category": ex.get("category", ""), "gold": ex["solution"],
              "student": s, "reward": r}
-            for ex, s, r in zip(examples, students, rewards)
+            for ex, s, r in zip(examples, res["students"], res["rewards"])
         ],
     }
 
