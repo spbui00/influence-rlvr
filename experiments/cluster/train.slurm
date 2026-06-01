@@ -30,7 +30,7 @@ export TOKENIZERS_PARALLELISM=false
 export WANDB_MODE="${WANDB_MODE:-offline}"   # sync later from a login node: `wandb sync`
 
 module --force purge
-module load StdEnv/2023 gcc/12.3 python/3.11 cuda/12.2 arrow/17.0.0
+module load StdEnv/2023 gcc/12.3 python/3.11 cuda/12.2 arrow
 source "$VENV_DIR/bin/activate"
 cd "$SLURM_SUBMIT_DIR"
 
