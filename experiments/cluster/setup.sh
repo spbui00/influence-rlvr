@@ -39,11 +39,24 @@ pip install --no-index --upgrade pip
 pip install --no-index torch torchvision torchaudio || \
     echo "torch not in wheelhouse; will resolve from PyPI below."
 
-# Editable install of this repo + its deps. vLLM is optional and large; install
-# it only if the wheelhouse/PyPI resolves it for this cluster's CUDA.
-pip install -e "$PROJECT_DIR"
-pip install "trl>=0.17" "peft>=0.14" "transformers>=4.56,<5" "datasets>=3.0" \
-            "accelerate>=1.0" "math-verify" wandb || true
+# IMPORTANT (Alliance): PyArrow is NOT installed by pip — it ships with the
+# `arrow` module loaded above (a dummy wheel blocks pip from building it). So
+# install `datasets` from the cluster wheelhouse (--no-index) so it binds to the
+# module's PyArrow; installing datasets>=3.0 from PyPI would demand pyarrow>=21
+# and fail against that dummy wheel.
+pip install --no-index datasets numpy scipy || {
+    echo "datasets not in wheelhouse; falling back to a PyArrow-module-compatible pin."
+    pip install "datasets<3" numpy scipy
+}
+
+# Our package code WITHOUT re-resolving the heavy deps (avoids re-pulling
+# pyarrow via datasets). Then the remaining deps — none pull pyarrow now that
+# datasets is satisfied.
+pip install -e "$PROJECT_DIR" --no-deps
+pip install "transformers>=4.56,<5" "accelerate>=1.0" "trl>=0.17" "peft>=0.14" \
+            "math-verify" wandb
+
+python -c "import torch, transformers, trl, peft, datasets, pyarrow; print('deps import OK')"
 
 echo
 echo "Trying optional vLLM (skip on failure; you can run --no-use-vllm with HF generate):"
