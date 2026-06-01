@@ -28,6 +28,12 @@ export HF_HOME="${HF_HOME:-$HOME/scratch/hf_cache}"
 export HF_HUB_OFFLINE=1                 # compute nodes have no internet
 export TOKENIZERS_PARALLELISM=false
 export WANDB_MODE="${WANDB_MODE:-offline}"   # sync later from a login node: `wandb sync`
+# Keep temp + wandb off the small/shared /tmp (it fills up; wandb makes a temp
+# dir at import). $SLURM_TMPDIR is node-local SSD, auto-cleaned per job.
+export TMPDIR="${SLURM_TMPDIR:-$HOME/scratch/tmp}"; mkdir -p "$TMPDIR"
+export WANDB_DIR="${WANDB_DIR:-$HOME/scratch/wandb}"
+export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-$HOME/scratch/wandb/cache}"
+mkdir -p "$WANDB_DIR" "$WANDB_CACHE_DIR"
 
 module --force purge
 module load StdEnv/2023 gcc/12.3 python/3.11 cuda/12.2 arrow/21.0.0
