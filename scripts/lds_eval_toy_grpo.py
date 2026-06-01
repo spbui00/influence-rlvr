@@ -1,11 +1,3 @@
-# /// script
-# dependencies = [
-#   "torch",
-#   "numpy",
-#   "scipy",
-# ]
-# ///
-
 from __future__ import annotations
 
 import argparse
@@ -15,7 +7,6 @@ import json
 import csv
 from pathlib import Path
 from typing import Sequence
-
 
 import torch
 import torch.nn as nn
@@ -46,6 +37,7 @@ from influence_rlvr.lds import (
     compute_lds_cache_key,
     run_extremes_test,
     run_lds,
+    run_per_example_test,
 )
 
 
@@ -185,6 +177,15 @@ def _lds_cache_key(args) -> str:
         "lds_mode": getattr(args, "lds_mode", "from-scratch"),
         "lds_cont_steps": getattr(args, "lds_cont_steps", None) if is_cont else None,
         "lds_cont_lr": getattr(args, "lds_cont_lr", None) if is_cont else None,
+        "natural_gradient_cont": getattr(args, "natural_gradient_cont", False) if is_cont else False,
+        "natural_gradient_cont_lambda": (
+            getattr(args, "natural_gradient_cont_lambda", None)
+            if (is_cont and getattr(args, "natural_gradient_cont", False)) else None
+        ),
+        "natural_gradient_cont_fisher_batch": (
+            getattr(args, "natural_gradient_cont_fisher_batch", None)
+            if (is_cont and getattr(args, "natural_gradient_cont", False)) else None
+        ),
     }
     return compute_lds_cache_key(payload)
 
@@ -384,6 +385,39 @@ def generate_clustered_dataset(
     return train_examples, test_examples, test_cluster_ids, signal_per_cluster, cluster_targets
 
 
+def _build_fvp_cache(
+    model: nn.Module, examples: Sequence[ToyGRPOExample]
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Compute (grad_cache, prob_cache) for natural-gradient FVP — the policy
+    Fisher F(θ) = (1/|B|) Σ_{z∈B} Σ_y π(y|z) ∇log π ∇log π^T evaluated on the
+    Fisher batch `examples`.
+
+    Pass [single_example] for the standard SGD-style minibatch natural gradient.
+    Pass the full training set for the PBRF-consistent F that the IF formula
+    actually uses — this is the operator that makes per-example Spearman = 1
+    under K_cont=1.
+    """
+    params = [p for p in model.parameters() if p.requires_grad]
+    sequences = _ALL_TWO_TOKEN_SEQUENCES.to(model.device)
+    n_seq = int(sequences.shape[0])
+    D = sum(p.numel() for p in params)
+    grad_cache: list[torch.Tensor] = []
+    prob_cache: list[torch.Tensor] = []
+    for example in examples:
+        z = example.z_tensor(device=model.device)
+        log_probs = model.sequence_log_probs(z, sequences)
+        probs = log_probs.detach().exp()
+        G_z = torch.zeros(n_seq, D, dtype=torch.float32, device=model.device)
+        for y_idx in range(n_seq):
+            grads = torch.autograd.grad(
+                log_probs[y_idx], params, retain_graph=(y_idx < n_seq - 1)
+            )
+            G_z[y_idx] = torch.cat([g.detach().flatten() for g in grads]).to(dtype=torch.float32)
+        grad_cache.append(G_z)
+        prob_cache.append(probs.to(dtype=torch.float32))
+    return grad_cache, prob_cache
+
+
 def train_model_with_history(
     dataset: Sequence[ToyGRPOExample],
     steps: int = 1000,
@@ -395,7 +429,24 @@ def train_model_with_history(
     beta: float = 0.0,
     ref_model: nn.Module | None = None,
     start_model: nn.Module | None = None,
+    natural_gradient_lambda: float | None = None,
+    natural_gradient_cg_iters: int = 50,
+    natural_gradient_cg_tol: float = 1e-6,
+    natural_gradient_fisher_examples: Sequence[ToyGRPOExample] | None = None,
 ) -> dict:
+    """Train GRPO with Adam/SGD or, when `natural_gradient_lambda` is provided,
+    with natural-gradient steps θ_new = θ − lr · (F + λI)^{-1} · ∇L.
+
+    `natural_gradient_fisher_examples`:
+      - None (default): use the *singleton* {current example} as the Fisher batch
+        — standard minibatch natural gradient. Cheaper but doesn't match the IF's
+        full-train Fisher operator.
+      - <list>: use this list as the Fisher batch at every step. Pass the full
+        training set to get the PBRF-consistent F^{-1} that the IF formula uses
+        — under this choice the per-example Spearman should be ≈ 1 at K_cont=1
+        because ΔR = lr · φ_i exactly to first order.
+    """
+    use_natural_gradient = natural_gradient_lambda is not None
     torch.manual_seed(seed)
     model = ToyAutoregressiveMLP(hidden_dim=hidden_dim)
     if start_model is not None:
@@ -413,10 +464,13 @@ def train_model_with_history(
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    if use_adam:
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    else:
-        optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = None
+    if not use_natural_gradient:
+        if use_adam:
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        else:
+            optimizer = torch.optim.SGD(model.parameters(), lr=lr)
 
     checkpoints = {}
     if save_checkpoints:
@@ -424,9 +478,11 @@ def train_model_with_history(
 
     history = []
     for step in range(1, steps + 1):
-        example = dataset[(step - 1) % len(dataset)]
+        example = dataset[(step - 1) % len(dataset)]  # round-robin over the dataset
         old_model = clone_toy_model(model)
-        optimizer.zero_grad()
+
+        if optimizer is not None:
+            optimizer.zero_grad()
 
         objective, _, debug = _toy_objective_and_debug(
             model,
@@ -441,18 +497,45 @@ def train_model_with_history(
             advantage_eps=1e-4,
             objective_mode=GradientObjective.GRPO_TRAIN
         )
-        objective.backward()
-        optimizer.step()
-        
+
+        if use_natural_gradient:
+            # Natural gradient step: h = (F + λI)^{-1} · ∇L, then θ -= lr · h.
+            grads = torch.autograd.grad(objective, params)
+            g_flat = torch.cat([g.detach().flatten() for g in grads]).to(dtype=torch.float32)
+            fisher_examples = (
+                list(natural_gradient_fisher_examples)
+                if natural_gradient_fisher_examples is not None
+                else [example]
+            )
+            grad_cache, prob_cache = _build_fvp_cache(model, fisher_examples)
+            fvp_fn = policy_fisher_fvp_from_grad_cache(grad_cache, prob_cache)
+            cg = CGInfluence(
+                fvp_fn=fvp_fn,
+                lambda_damp=float(natural_gradient_lambda),
+                cg_iters=natural_gradient_cg_iters,
+                cg_tol=natural_gradient_cg_tol,
+            )
+            h_flat, _ = cg.solve(g_flat)
+            with torch.no_grad():
+                offset = 0
+                for p in params:
+                    n = p.numel()
+                    p.sub_(h_flat[offset:offset + n].view(p.shape), alpha=lr)
+                    offset += n
+        else:
+            objective.backward()
+            assert optimizer is not None
+            optimizer.step()
+
         history.append({
             "step": step,
             "example_name": example.name,
             "loss": float(objective.item())
         })
-        
+
         if save_checkpoints:
             checkpoints[step] = copy.deepcopy(model.state_dict())
-            
+
     return {
         "model": model,
         "history": history,
@@ -468,6 +551,7 @@ def _train_subset_for_lds(
     subset_train: Sequence[ToyGRPOExample],
     seed: int,
     use_adam: bool,
+    full_train_examples: Sequence[ToyGRPOExample] | None = None,
 ) -> dict:
     """
     Train one subset model under the configured --lds-mode.
@@ -481,6 +565,22 @@ def _train_subset_for_lds(
     """
     if args.lds_mode == "continuation":
         cont_lr = args.lds_cont_lr if args.lds_cont_lr is not None else (args.lr / 10.0)
+        use_ng = getattr(args, "natural_gradient_cont", False)
+        nat_grad_lambda = (
+            (args.natural_gradient_cont_lambda
+             if args.natural_gradient_cont_lambda is not None else args.lambda_damp)
+            if use_ng else None
+        )
+        # Pick the Fisher batch for natural-gradient training. `full-train` matches
+        # the IF formula's Fisher operator and is what makes per-example Spearman = 1
+        # at K_cont=1; `singleton` is standard minibatch NG (cheaper but mismatched).
+        fisher_batch_examples: Sequence[ToyGRPOExample] | None = None
+        if use_ng and getattr(args, "natural_gradient_cont_fisher_batch", "singleton") == "full-train":
+            if full_train_examples is None:
+                raise ValueError(
+                    "natural_gradient_cont_fisher_batch=full-train requires full_train_examples."
+                )
+            fisher_batch_examples = list(full_train_examples)
         return train_model_with_history(
             subset_train,
             steps=args.lds_cont_steps,
@@ -492,6 +592,10 @@ def _train_subset_for_lds(
             beta=args.beta,
             ref_model=ref_model,
             start_model=full_model,
+            natural_gradient_lambda=nat_grad_lambda,
+            natural_gradient_cg_iters=args.cg_iters,
+            natural_gradient_cg_tol=args.cg_tol,
+            natural_gradient_fisher_examples=fisher_batch_examples,
         )
     return train_model_with_history(
         subset_train,
@@ -706,10 +810,52 @@ def main():
         default=0.5,
         help="α (subset fraction) used for the --extremes-test top/bottom/random subsets.",
     )
+    parser.add_argument(
+        "--per-example-test",
+        action="store_true",
+        help=(
+            "Run a per-example Spearman test: for each training example i, train on the "
+            "singleton subset {z_i} alone (same --lds-mode protocol) and correlate IF "
+            "score φ_i with resulting test reward. Tests *ranking* directly without LDS's "
+            "linear-additivity-over-subsets assumption. Cost: n_train singleton trainings."
+        ),
+    )
+    parser.add_argument(
+        "--natural-gradient-cont",
+        action="store_true",
+        help=(
+            "Use natural-gradient steps θ - lr · (F + λI)^{-1} · ∇L during continuation "
+            "training (replaces Adam/SGD). Eliminates the Adam-vs-F^{-1} optimizer "
+            "mismatch — under this mode the PBRF derivation predicts per-example "
+            "Spearman ≈ 1 at K_cont=1, since ΔR_i = lr · φ_i exactly to first order."
+        ),
+    )
+    parser.add_argument(
+        "--natural-gradient-cont-lambda",
+        type=float,
+        default=None,
+        help=(
+            "λ damping for the natural-gradient F^{-1} solve. Defaults to --lambda-damp. "
+            "Should typically match the λ used when computing the IF for the "
+            "cleanest PBRF-consistency test."
+        ),
+    )
+    parser.add_argument(
+        "--natural-gradient-cont-fisher-batch",
+        choices=["singleton", "full-train"],
+        default="singleton",
+        help=(
+            "Which Fisher batch the natural-gradient step uses at each continuation "
+            "step. `singleton`: just the current example (cheap, standard minibatch NG). "
+            "`full-train`: the entire training set (matches the IF formula's F operator "
+            "exactly — Spearman should ≈ 1 at K_cont=1, but rebuilds the full grad/prob "
+            "cache every step so it's O(n_train) times slower per step)."
+        ),
+    )
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--hidden-dim", type=int, default=16)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--lambda-damp", type=float, default=1.0)
+    parser.add_argument("--lambda-damp", type=float, default=0.1)
     parser.add_argument(
         "--cg-iters",
         type=int,
@@ -1002,9 +1148,11 @@ def main():
                 ref_model=ref_model,
             )
             scores = cg_scores.numpy()
+            status = "converged" if cg_info.get("converged") else "MAX-ITERS (did not converge)"
             print(
-                f"    CG converged in {cg_info.get('n_iters', '?')} iters; "
-                f"final residual={cg_info.get('final_residual', float('nan')):.2e}; "
+                f"    CG {status} after {cg_info.get('n_iters', '?')} iters; "
+                f"final residual={cg_info.get('final_residual', float('nan')):.2e} "
+                f"(tol={args.cg_tol:.0e}); "
                 f"g_test·h={cg_info.get('g_test_dot_h', float('nan')):.4e} (>=0 if SPD)"
             )
         elif args.if_calculation == "true-fisher-last":
@@ -1077,6 +1225,7 @@ def main():
             subset_train=subset_train,
             seed=seed,
             use_adam=use_adam,
+            full_train_examples=train_examples,
         )
         return np.array(
             [exact_expected_reward(sub_res["model"], te) for te in test_examples],
@@ -1109,6 +1258,42 @@ def main():
             }, f, indent=2)
         print(f"  Extremes test saved to {run_dir / 'extremes_test.json'}")
 
+    if args.per_example_test:
+        cont_str = f", K_cont={args.lds_cont_steps}" if args.lds_mode == "continuation" else ""
+        print(
+            f"\nPer-example test (singleton trainings × {args.n_train} examples, "
+            f"mode={args.lds_mode}{cont_str}):"
+        )
+        pe = run_per_example_test(
+            test_ifs,
+            subset_trainer,
+            n_train=args.n_train,
+            n_test=args.n_test,
+            seed=args.seed,
+        )
+        for row in pe.per_test:
+            i = row["test_idx"]
+            if row["correlation"] is None:
+                print(
+                    f"  Test {i}: Spearman undefined "
+                    f"(actual_std={row['actual_std']:.4e}, if_std={row['if_std']:.4e})"
+                )
+            else:
+                print(
+                    f"  Test {i}: Spearman(IF, ΔR_singleton)={row['correlation']:.4f}, "
+                    f"p={row['p_value']:.2e}"
+                )
+        print(f"  Average per-example Spearman: {pe.average_correlation:.4f}")
+        with (run_dir / "per_example_test.json").open("w") as f:
+            json.dump({
+                "average_correlation": pe.average_correlation,
+                "per_test": pe.per_test,
+                "lds_mode": args.lds_mode,
+                "lds_cont_steps": args.lds_cont_steps if args.lds_mode == "continuation" else None,
+                "subset_steps": args.subset_steps if args.lds_mode == "from-scratch" else None,
+            }, f, indent=2)
+        print(f"  Per-example test saved to {run_dir / 'per_example_test.json'}")
+
     cont_str = (
         f" (continuation: K_cont={args.lds_cont_steps}, "
         f"lr={args.lds_cont_lr if args.lds_cont_lr is not None else args.lr / 10.0:.2e})"
@@ -1123,6 +1308,13 @@ def main():
         cache_path = cache_dir / f"lds_{_lds_cache_key(args)}.npz"
 
     start_time = time.time()
+    # Match the predictor's visit-weighting to the subset_trainer's actual step count
+    # — continuation does K_cont steps round-robin on the subset; from-scratch does
+    # subset_steps. This makes the LDS predictor literally consistent with the PBRF
+    # formula instead of assuming every masked example was visited exactly once.
+    n_training_steps = (
+        args.lds_cont_steps if args.lds_mode == "continuation" else args.subset_steps
+    )
     lds = run_lds(
         test_ifs,
         subset_trainer,
@@ -1131,6 +1323,7 @@ def main():
         m_subsets=args.m_subsets,
         seed=args.seed,
         cache_path=cache_path,
+        n_training_steps=n_training_steps,
     )
     actual_rewards = lds.actual_rewards
     predicted_rewards = lds.predicted_rewards
