@@ -11,6 +11,11 @@ Jobs then run with HF_HUB_OFFLINE=1 and read straight from the cache.
 from __future__ import annotations
 
 import os
+import sys
+
+# Allow running as a plain script (`python experiments/cluster/prefetch.py`):
+# put the repo root on the path so `experiments` is importable.
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 from huggingface_hub import snapshot_download
 
