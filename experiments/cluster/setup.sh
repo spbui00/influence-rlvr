@@ -1,12 +1,11 @@
 #!/bin/bash
-# One-time environment setup on a Digital Research Alliance of Canada cluster
-# (Killarney / Narval / Nibi). RUN THIS ON A LOGIN NODE — compute nodes have no
-# internet, so the venv build and all Hugging Face downloads must happen here.
+# ONE-TIME environment build on a Digital Research Alliance cluster (Killarney /
+# Narval / Nibi). Run once to create the venv. For every session afterwards you
+# `source experiments/cluster/env.sh` instead (modules + activate) — env.sh does
+# NOT replace this; this builds the venv, env.sh opens it.
 #
-#   bash experiments/cluster/setup.sh
-#
-# After it finishes, run experiments/cluster/prefetch.py (also on the login node)
-# to cache the model + datasets, then submit jobs with sbatch.
+#   bash experiments/cluster/setup.sh           # build (login node or a node with internet)
+#   python experiments/cluster/prefetch.py      # then cache models + datasets
 set -euo pipefail
 
 # ── Where the persistent virtualenv and HF cache live ──────────────────────
@@ -34,36 +33,32 @@ fi
 source "$VENV_DIR/bin/activate"
 pip install --no-index --upgrade pip
 
-# Prefer the cluster wheelhouse (--no-index) for the heavy, ABI-sensitive
-# packages; fall back to PyPI for the rest (login nodes have internet).
-pip install --no-index torch torchvision torchaudio || \
-    echo "torch not in wheelhouse; will resolve from PyPI below."
+# Heavy ABI-sensitive wheels from the cluster wheelhouse (--no-index). Pulling
+# `datasets` here binds it to the module's PyArrow — a PyPI datasets would demand
+# pyarrow>=21 and hit Alliance's dummy "pyarrow_noinstall" wheel. (torchvision/
+# torchaudio are intentionally NOT installed — unused, and their cluster pins
+# mismatch torch.)
+pip install --no-index torch datasets numpy scipy pandas
 
-# IMPORTANT (Alliance): PyArrow is NOT installed by pip — it ships with the
-# `arrow` module loaded above (a dummy wheel blocks pip from building it). So
-# install `datasets` from the cluster wheelhouse (--no-index) so it binds to the
-# module's PyArrow; installing datasets>=3.0 from PyPI would demand pyarrow>=21
-# and fail against that dummy wheel.
-pip install --no-index datasets numpy scipy || {
-    echo "datasets not in wheelhouse; falling back to a PyArrow-module-compatible pin."
-    pip install "datasets<3" numpy scipy
-}
-
-# Our package code WITHOUT re-resolving the heavy deps (avoids re-pulling
-# pyarrow via datasets). Then the remaining deps — none pull pyarrow now that
-# datasets is satisfied.
+# Our package code only, WITHOUT re-resolving heavy deps — `pip install -e .`
+# (with deps) would re-resolve datasets→pyarrow and rebuild the dummy wheel.
 pip install -e "$PROJECT_DIR" --no-deps
-pip install "transformers>=4.56,<5" "accelerate>=1.0" "trl>=0.17" "peft>=0.14" \
-            "math-verify" wandb
 
-python -c "import torch, transformers, trl, peft, datasets, pyarrow; print('deps import OK')"
+# Remaining runtime deps. transformers/trl/peft/accelerate come from the
+# wheelhouse and pull most transitive deps; the trailing names backfill torch's
+# runtime deps that --no-deps skipped (these caused import errors otherwise).
+pip install transformers accelerate trl peft math-verify wandb \
+            typing_extensions sympy mpmath networkx jinja2 filelock fsspec
+
+python -c "import torch, transformers, trl, peft, datasets, pyarrow, numpy, scipy, pandas; \
+print('deps import OK —', 'torch', torch.__version__, '| trl', trl.__version__)"
 
 echo
-echo "Trying optional vLLM (skip on failure; you can run --no-use-vllm with HF generate):"
-pip install "vllm==0.11.2" || echo "vLLM install skipped — set --no-use-vllm in jobs."
+echo "Optional vLLM (big; for generation speed at scale — runs use --no-use-vllm without it):"
+pip install vllm || echo "vLLM install skipped — set --no-use-vllm in jobs (HF generation)."
 
 mkdir -p "$HF_HOME"
 echo
 echo "Done. Next:"
-echo "  source $VENV_DIR/bin/activate"
-echo "  HF_HOME=$HF_HOME python experiments/cluster/prefetch.py"
+echo "  python experiments/cluster/prefetch.py       # cache models + datasets"
+echo "  # then every session:  source experiments/cluster/env.sh"
