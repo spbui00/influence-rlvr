@@ -26,7 +26,6 @@ export TMPDIR="${SLURM_TMPDIR:-$HOME/scratch/tmp}"; mkdir -p "$TMPDIR"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export WANDB_DIR="${WANDB_DIR:-$HOME/scratch/wandb}"; mkdir -p "$WANDB_DIR"
 
-module reset
 module load StdEnv/2023 gcc/12.3 python/3.11 cuda/12.2 arrow/21.0.0 opencv/4.13.0
 source "$VENV_DIR/bin/activate"
 cd "$SLURM_SUBMIT_DIR"

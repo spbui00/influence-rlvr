@@ -20,7 +20,6 @@ echo "HF_HOME:  $HF_HOME"
 
 # ── Modules. Versions differ slightly per cluster — `module spider python` to
 #    check. StdEnv/2023 + a recent python + cuda + arrow (for pyarrow/datasets). ─
-module reset
 module load StdEnv/2023 gcc/12.3 python/3.11 cuda/12.2 arrow/21.0.0 opencv/4.13.0 || {
     echo "Module load failed — run 'module spider python cuda arrow' and edit this script."
     exit 1
