@@ -24,7 +24,8 @@ from experiments.config import ExperimentConfig
 cfg = ExperimentConfig()
 
 MODELS = [cfg.model_id, cfg.verifier_model_id]
-DATASETS = [cfg.train_dataset, "openai/gsm8k", "HuggingFaceH4/MATH-500"]
+DATASETS = [cfg.train_dataset, "openai/gsm8k", "HuggingFaceH4/MATH-500",
+            "TIGER-Lab/TheoremQA"]
 
 
 def main() -> None:

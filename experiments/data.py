@@ -215,10 +215,40 @@ def load_math500(cfg: ExperimentConfig, limit: int) -> list[dict]:
     ]
 
 
-# Heavier benchmarks the user listed. These need their own harnesses; wire them
-# in once the core loop is validated. Documented here so the registry is honest.
+def _row_get(ex: dict, *keys, default=""):
+    for k in keys:
+        if k in ex and ex[k] is not None:
+            return ex[k]
+    return default
+
+
+def load_theoremqa_cs(cfg: ExperimentConfig, limit: int) -> list[dict]:
+    """TheoremQA filtered to the CS/EECS field, text-only (drop image questions).
+
+    External CS eval (verifier-scored). The `field` value for CS is matched
+    defensively ('comput'/'eecs'); confirm the count with the snippet in chat.
+    """
+    raw = load_dataset("TIGER-Lab/TheoremQA", split="test")
+
+    def is_cs(ex):
+        f = str(_row_get(ex, "field", "Field", "subfield")).lower()
+        return ("comput" in f) or ("eecs" in f)
+
+    raw = raw.filter(is_cs)
+    # text-only: skip questions that carry an image
+    raw = raw.filter(lambda ex: not _row_get(ex, "Picture", "picture", default=None))
+    rows = []
+    for ex in raw:
+        q = _row_get(ex, "Question", "question")
+        a = _row_get(ex, "Answer", "answer")
+        rows.append(_eval_row(str(q), str(a), source="theoremqa_cs",
+                              answer_type=str(_row_get(ex, "Answer_type", "answer_type")),
+                              category="Computer Science"))
+    return rows[:limit] if (limit and len(rows) > limit) else rows
+
+
+# Heavier benchmarks the proposal listed but not yet wired (need own harnesses).
 _UNIMPLEMENTED = {
-    "theoremqa": "TIGER-Lab/TheoremQA — free-form; verifier-scorable, add loader.",
     "olympiadbench": "Hothan/OlympiadBench — multimodal subsets need filtering.",
     "aime25": "AIME 2025 — tiny (30 q); add a static loader.",
     "finqa": "ibm-research/finqa or dreamerdeo/finqa — needs table context in prompt.",
@@ -230,6 +260,7 @@ EVAL_LOADERS = {
     "webinstruct_test": load_webinstruct_test,
     "gsm8k": load_gsm8k,
     "math500": load_math500,
+    "theoremqa_cs": load_theoremqa_cs,
 }
 
 
