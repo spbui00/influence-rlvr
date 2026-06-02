@@ -103,10 +103,16 @@ class ExperimentConfig:
 
     # ── Generation backend ──────────────────────────────────────────────────
     use_vllm: bool = True
+    # "colocate" — vLLM engine in the training process (1 GPU; can't span the
+    #   if_prune windows → if_prune falls back to HF). "server" — vLLM runs as a
+    #   separate `trl vllm-serve` process (own GPU); training connects over HTTP,
+    #   so if_prune CAN use vLLM (no in-process engine). Use server with l40s:2.
     vllm_mode: str = "colocate"       # "colocate" | "server"
-    vllm_gpu_memory_utilization: float = 0.4
+    vllm_gpu_memory_utilization: float = 0.4   # colocate only
     vllm_max_model_len: int | None = 4096
-    vllm_enable_sleep_mode: bool = True
+    vllm_enable_sleep_mode: bool = True        # colocate only
+    vllm_server_host: str = "127.0.0.1"        # server mode
+    vllm_server_port: int = 8000               # server mode
 
     # ── Verifier (reward model) ─────────────────────────────────────────────
     verifier_model_id: str = "TIGER-Lab/general-verifier"

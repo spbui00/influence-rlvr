@@ -132,10 +132,15 @@ def make_grpo_config(cfg: ExperimentConfig, *, max_steps: int, shuffle: bool = T
         kw["generation_batch_size"] = cfg.generation_batch_size
     if cfg.use_vllm:
         kw["vllm_mode"] = cfg.vllm_mode
-        kw["vllm_gpu_memory_utilization"] = cfg.vllm_gpu_memory_utilization
-        kw["vllm_enable_sleep_mode"] = cfg.vllm_enable_sleep_mode
-        if cfg.vllm_max_model_len is not None:
-            kw["vllm_max_model_length"] = cfg.vllm_max_model_len
+        if cfg.vllm_mode == "server":
+            # Engine lives in a separate `trl vllm-serve` process; just point at it.
+            kw["vllm_server_host"] = cfg.vllm_server_host
+            kw["vllm_server_port"] = cfg.vllm_server_port
+        else:  # colocate
+            kw["vllm_gpu_memory_utilization"] = cfg.vllm_gpu_memory_utilization
+            kw["vllm_enable_sleep_mode"] = cfg.vllm_enable_sleep_mode
+            if cfg.vllm_max_model_len is not None:
+                kw["vllm_max_model_length"] = cfg.vllm_max_model_len
     # GRPOConfig fields differ across TRL versions (e.g. max_prompt_length,
     # importance_sampling_level, vllm_mode were added/renamed). Keep only fields
     # this installed TRL actually accepts; warn about the rest.
@@ -241,15 +246,15 @@ def _window_boundaries(cfg) -> list[int]:
 
 
 def run_if_prune(cfg, model, tokenizer, train_pool, device):
-    # if_prune builds one GRPOTrainer per window, but vLLM's CuMem allocator
-    # allows only ONE engine per process — a 2nd window's vLLM init asserts. And
-    # vLLM only speeds the (minority) training generation here; CG scoring is
-    # HF/gradient-bound regardless. So force HF training for if_prune. Use a
-    # separate-process-per-window orchestration if you ever need vLLM here.
-    if cfg.use_vllm:
+    # if_prune builds one GRPOTrainer per window. With vLLM *colocate* the engine
+    # lives in this process and its CuMem allocator is one-per-process, so a 2nd
+    # window's init asserts → fall back to HF. With vLLM *server* the engine is a
+    # separate process (trl vllm-serve), so every window just reconnects over HTTP
+    # and vLLM works fine across windows.
+    if cfg.use_vllm and cfg.vllm_mode == "colocate":
         print("[if_prune] vLLM colocate can't re-init across windows in one "
-              "process; using HF generation for if_prune training "
-              "(baseline runs can still use vLLM).")
+              "process; using HF generation for if_prune training. "
+              "Use --vllm-mode server (separate engine process) for vLLM here.")
         cfg.use_vllm = False
     boundaries = _window_boundaries(cfg)
     triggers = boundaries[1:-1]
