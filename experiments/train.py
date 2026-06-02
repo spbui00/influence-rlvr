@@ -124,7 +124,9 @@ def make_grpo_config(cfg: ExperimentConfig, *, max_steps: int, shuffle: bool = T
         "scale_rewards": "group",
         "loss_type": "grpo",
         "max_completion_length": cfg.max_completion_length,
-        "max_prompt_length": cfg.max_prompt_length,
+        # NOTE: max_prompt_length is not a GRPOConfig field in current TRL; prompt
+        # truncation (if needed for very long WebInstruct questions) is handled at
+        # tokenization in evaluate.py / can be added in data.py.
     }
     if cfg.generation_batch_size is not None:
         kw["generation_batch_size"] = cfg.generation_batch_size
