@@ -146,7 +146,10 @@ class ExperimentConfig:
     # cg_fisher_examples · cg_fisher_g · D · 4 bytes. Lower these on A100-40G.
     cg_fisher_examples: int = 16
     cg_fisher_g: int = 4
-    cg_fisher_max_tokens: int = 512
+    # Caps BOTH the Fisher prompt and response length. The FVP's math-attention
+    # double-backward is O(seq²) in memory, so keep this modest on a 48 GB L40S
+    # (total seq ≈ 2× this). 512 OOMs on long prompts; 256 is safe.
+    cg_fisher_max_tokens: int = 256
 
     # ── Eval ────────────────────────────────────────────────────────────────
     eval_benchmarks: tuple[str, ...] = (

@@ -68,6 +68,11 @@ def _build_true_fisher_fvp(cfg, model, tokenizer, train_pool, device, backend, v
             model, tokenizer, train_pool[i]["prompt"], G=cfg.cg_fisher_g, cfg=cfg,
             device=device, backend=backend, vllm_cfg=vllm_cfg, seed=cfg.seed + i,
         )
+        # Cap BOTH prompt and response: the math-attention double-backward in the
+        # FVP is quadratic in sequence length, so long WebInstruct prompts OOM.
+        # Keep the prompt tail (instruction + generation marker) + truncated resp.
+        prompt_ids = prompt_ids[:, -max_tok:]
+        prompt_am = prompt_am[:, -max_tok:]
         resp_ids = rollout.token_ids[:, :max_tok]
         resp_mask = rollout.response_mask[:, :max_tok]
         for u in range(resp_ids.shape[0]):
