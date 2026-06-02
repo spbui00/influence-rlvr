@@ -48,7 +48,7 @@ def _example_grad(model, tokenizer, sample, reward_funcs, *, objective_mode, cfg
     res = compute_policy_gradient_bundle(
         model, tokenizer, sample["prompt"], reward_funcs,
         G=cfg.if_g_train, device=device,
-        enable_vllm=cfg.use_vllm, generation_backend=backend,
+        enable_vllm=False, generation_backend=backend,
         max_new_tokens=cfg.if_max_new_tokens, temperature=0.7, top_p=0.9,
         seed=seed, epsilon=cfg.grpo_epsilon, beta=cfg.grpo_beta,
         objective_mode=objective_mode, vllm_config=vllm_cfg, model_id=cfg.model_id,
@@ -126,7 +126,10 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, fvp, *,
             tag, checkpoint_step, save_dir):
     cg = CGInfluence(fvp_fn=fvp, lambda_damp=cfg.lambda_damp,
                      cg_iters=cfg.cg_iters, cg_tol=cfg.cg_tol)
-    backend = GenerationBackend.VLLM if cfg.use_vllm else GenerationBackend.HF
+    # Influence ALWAYS uses HF generation, never vLLM: CG needs gradients
+    # (backward), which vLLM can't do, and spinning a 2nd vLLM engine collides
+    # with TRL's colocate engine on the same GPU. Training still uses vLLM.
+    backend = GenerationBackend.HF
     vllm_cfg = _vllm_config(cfg)
     builder = _make_verifier_reward_builder(cfg)
 
@@ -190,7 +193,10 @@ def compute_cg_pool_influence(
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    backend = GenerationBackend.VLLM if cfg.use_vllm else GenerationBackend.HF
+    # Influence ALWAYS uses HF generation, never vLLM: CG needs gradients
+    # (backward), which vLLM can't do, and spinning a 2nd vLLM engine collides
+    # with TRL's colocate engine on the same GPU. Training still uses vLLM.
+    backend = GenerationBackend.HF
     vllm_cfg = _vllm_config(cfg)
 
     if cfg.if_method == "cg-empirical":
