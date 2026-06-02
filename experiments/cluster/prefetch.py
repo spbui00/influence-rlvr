@@ -25,7 +25,7 @@ cfg = ExperimentConfig()
 
 MODELS = [cfg.model_id, cfg.verifier_model_id]
 DATASETS = [cfg.train_dataset, "openai/gsm8k", "HuggingFaceH4/MATH-500",
-            "TIGER-Lab/TheoremQA"]
+            "cais/mmlu"]
 
 
 def main() -> None:

@@ -88,6 +88,11 @@ class ExperimentConfig:
     # of them guide the influence. REQUIRES eval on an external dataset — do NOT
     # keep "webinstruct_test" in eval_benchmarks with this on (it would leak).
     if_target_full_test: bool = False
+    # Where the IF target comes from: "webinstruct" (held-out WebInstruct test
+    # partition) or "mmlu_cs" (held-out half of MMLU-CS — SAME distribution as the
+    # mmlu_cs eval, so the influence steers toward what we measure). Training pool
+    # is always WebInstruct (the cross-domain candidate set).
+    if_target_source: str = "webinstruct"
     max_prompt_length: int = 1024
 
     # ── GRPO ────────────────────────────────────────────────────────────────
@@ -209,6 +214,10 @@ class ExperimentConfig:
                     f"if_recompute_every ({self.if_recompute_every}) must be a "
                     f"multiple of save_steps ({self.save_steps})."
                 )
+        if self.if_target_source not in ("webinstruct", "mmlu_cs"):
+            raise ValueError(
+                f"if_target_source must be webinstruct|mmlu_cs, got {self.if_target_source!r}"
+            )
         if self.if_method not in ("cg", "cg-empirical", "fisher"):
             raise ValueError(
                 f"if_method must be cg|cg-empirical|fisher, got {self.if_method!r}"

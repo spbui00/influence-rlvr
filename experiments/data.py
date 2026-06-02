@@ -15,6 +15,7 @@ Row schema produced for GRPO (consumed by TRL + the verifier reward):
 """
 from __future__ import annotations
 
+import random
 from typing import Iterable
 
 from datasets import Dataset, concatenate_datasets, load_dataset
@@ -134,11 +135,19 @@ def _webinstruct_test_partition(cfg: ExperimentConfig) -> tuple[Dataset, Dataset
 def load_if_target_set(cfg: ExperimentConfig) -> Dataset:
     """Held-out target set the influence is measured against.
 
-    Default: the IF half of the disjoint test partition (disjoint from the
-    webinstruct_test eval). With `if_target_full_test`: the ENTIRE filtered test
-    slice (no carve-out) — for tiny single-domain slices (e.g. all ~5 CS rows);
-    eval must then be an external dataset.
+    Default: the IF half of the disjoint WebInstruct test partition. With
+    `if_target_source="mmlu_cs"`: the target half of the disjoint MMLU-CS
+    partition (same distribution as the mmlu_cs eval — no proxy mismatch).
+    With `if_target_full_test`: the ENTIRE filtered WebInstruct test slice.
     """
+    if cfg.if_target_source == "mmlu_cs":
+        target_rows, _ = _mmlu_cs_partition(cfg)
+        raw = Dataset.from_list(target_rows)
+        print(f"  [data] IF target: {len(raw)} MMLU-CS prompts "
+              f"(disjoint from the mmlu_cs eval half)")
+        return raw.map(_format_webinstruct_row, with_indices=True,
+                       remove_columns=raw.column_names)
+
     if cfg.if_target_full_test:
         cats = _categories_for_domains(_webinstruct_test_domains(cfg))
         raw = load_dataset(cfg.train_dataset, split="test")
@@ -215,36 +224,65 @@ def load_math500(cfg: ExperimentConfig, limit: int) -> list[dict]:
     ]
 
 
-def _row_get(ex: dict, *keys, default=""):
-    for k in keys:
-        if k in ex and ex[k] is not None:
-            return ex[k]
-    return default
+# ── MMLU-CS (external, clean, labeled CS) — used for BOTH the IF target and eval ─
+# (disjoint splits). cais/mmlu has clean per-subject configs.
+MMLU_CS_CONFIGS = (
+    "college_computer_science",
+    "high_school_computer_science",
+    "computer_security",
+    "machine_learning",
+)
 
 
-def load_theoremqa_cs(cfg: ExperimentConfig, limit: int) -> list[dict]:
-    """TheoremQA filtered to the CS/EECS field, text-only (drop image questions).
+def _mmlu_cs_rows(cfg: ExperimentConfig) -> list[dict]:
+    """Combined MMLU-CS `test` questions as WebInstruct-style rows.
 
-    External CS eval (verifier-scored). The `field` value for CS is matched
-    defensively ('comput'/'eecs'); confirm the count with the snippet in chat.
+    Each multiple-choice item becomes a prompt with lettered options + an
+    instruction to answer with the letter; the gold is that letter.
     """
-    raw = load_dataset("TIGER-Lab/TheoremQA", split="test")
+    rows: list[dict] = []
+    for sub in MMLU_CS_CONFIGS:
+        ds = load_dataset("cais/mmlu", sub, split="test")
+        for ex in ds:
+            choices = list(ex["choices"])
+            idx = int(ex["answer"])
+            letters = "ABCDEFGH"[: len(choices)]
+            opts = "\n".join(f"{l}. {c}" for l, c in zip(letters, choices))
+            q = (f"{ex['question']}\n\nOptions:\n{opts}\n\n"
+                 "Answer with the letter of the single correct option.")
+            rows.append({
+                "question": q,
+                "answer": letters[idx],
+                "answer_type": "Multiple Choice",
+                "category": "Computer Science",
+                "subject": sub,
+            })
+    return rows
 
-    def is_cs(ex):
-        f = str(_row_get(ex, "field", "Field", "subfield")).lower()
-        return ("comput" in f) or ("eecs" in f)
 
-    raw = raw.filter(is_cs)
-    # text-only: skip questions that carry an image
-    raw = raw.filter(lambda ex: not _row_get(ex, "Picture", "picture", default=None))
-    rows = []
-    for ex in raw:
-        q = _row_get(ex, "Question", "question")
-        a = _row_get(ex, "Answer", "answer")
-        rows.append(_eval_row(str(q), str(a), source="theoremqa_cs",
-                              answer_type=str(_row_get(ex, "Answer_type", "answer_type")),
-                              category="Computer Science"))
-    return rows[:limit] if (limit and len(rows) > limit) else rows
+def _mmlu_cs_partition(cfg: ExperimentConfig) -> tuple[list[dict], list[dict]]:
+    """Deterministic disjoint (IF target, eval) split of MMLU-CS test."""
+    rows = _mmlu_cs_rows(cfg)
+    rng = random.Random(cfg.seed)
+    rng.shuffle(rows)
+    n = len(rows)
+    n_if = cfg.n_if_target if cfg.n_if_target and cfg.n_if_target > 0 else n
+    if n_if >= n:
+        n_if = max(1, n // 2)
+        print(f"  [data] only {n} MMLU-CS rows; splitting {n_if} IF / {n - n_if} eval.")
+    return rows[:n_if], rows[n_if:]
+
+
+def load_mmlu_cs(cfg: ExperimentConfig, limit: int) -> list[dict]:
+    """CS eval = the eval half of the MMLU-CS partition (disjoint from IF target)."""
+    _, eval_rows = _mmlu_cs_partition(cfg)
+    if limit and len(eval_rows) > limit:
+        eval_rows = eval_rows[:limit]
+    return [
+        _eval_row(r["question"], r["answer"], source="mmlu_cs",
+                  answer_type=r["answer_type"], category=r["category"])
+        for r in eval_rows
+    ]
 
 
 # Heavier benchmarks the proposal listed but not yet wired (need own harnesses).
@@ -254,13 +292,14 @@ _UNIMPLEMENTED = {
     "finqa": "ibm-research/finqa or dreamerdeo/finqa — needs table context in prompt.",
     "livecodebench": "livecodebench/* — needs the LCB execution harness, not verifier.",
     "swebench": "princeton-nlp/SWE-bench — agentic; out of scope for verifier scoring.",
+    "theoremqa": "TIGER-Lab/TheoremQA HF release has no subject/field column → can't filter to CS.",
 }
 
 EVAL_LOADERS = {
     "webinstruct_test": load_webinstruct_test,
     "gsm8k": load_gsm8k,
     "math500": load_math500,
-    "theoremqa_cs": load_theoremqa_cs,
+    "mmlu_cs": load_mmlu_cs,
 }
 
 
