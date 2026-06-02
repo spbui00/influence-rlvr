@@ -261,16 +261,28 @@ def _mmlu_cs_rows(cfg: ExperimentConfig) -> list[dict]:
 
 
 def _mmlu_cs_partition(cfg: ExperimentConfig) -> tuple[list[dict], list[dict]]:
-    """Deterministic disjoint (IF target, eval) split of MMLU-CS test."""
-    rows = _mmlu_cs_rows(cfg)
+    """Deterministic disjoint (IF target, eval) split of MMLU-CS test, STRATIFIED:
+    the IF target takes an equal share (n_if_target / #subjects) from each CS
+    subject so it spans all of them. The eval is the remainder (all subjects)."""
+    from collections import defaultdict
+    by_sub: dict[str, list[dict]] = defaultdict(list)
+    for r in _mmlu_cs_rows(cfg):
+        by_sub[r["subject"]].append(r)
     rng = random.Random(cfg.seed)
-    rng.shuffle(rows)
-    n = len(rows)
-    n_if = cfg.n_if_target if cfg.n_if_target and cfg.n_if_target > 0 else n
-    if n_if >= n:
-        n_if = max(1, n // 2)
-        print(f"  [data] only {n} MMLU-CS rows; splitting {n_if} IF / {n - n_if} eval.")
-    return rows[:n_if], rows[n_if:]
+    n_sub = max(1, len(by_sub))
+    per = (cfg.n_if_target // n_sub) if (cfg.n_if_target and cfg.n_if_target > 0) else 0
+    target, eval_rows = [], []
+    for sub in sorted(by_sub):
+        rows = by_sub[sub]
+        rng.shuffle(rows)
+        k = min(per, max(0, len(rows) - 1)) if per > 0 else 0  # leave ≥1 per subject for eval
+        target.extend(rows[:k])
+        eval_rows.extend(rows[k:])
+    rng.shuffle(target)
+    rng.shuffle(eval_rows)
+    from collections import Counter as _C
+    print(f"  [data] MMLU-CS IF target by subject: {dict(_C(r['subject'] for r in target))}")
+    return target, eval_rows
 
 
 def load_mmlu_cs(cfg: ExperimentConfig, limit: int) -> list[dict]:
