@@ -132,8 +132,30 @@ def _webinstruct_test_partition(cfg: ExperimentConfig) -> tuple[Dataset, Dataset
 
 
 def load_if_target_set(cfg: ExperimentConfig) -> Dataset:
-    """Held-out target set the influence is measured against (disjoint from eval)."""
-    if_raw, _ = _webinstruct_test_partition(cfg)
+    """Held-out target set the influence is measured against.
+
+    Default: the IF half of the disjoint test partition (disjoint from the
+    webinstruct_test eval). With `if_target_full_test`: the ENTIRE filtered test
+    slice (no carve-out) — for tiny single-domain slices (e.g. all ~5 CS rows);
+    eval must then be an external dataset.
+    """
+    if cfg.if_target_full_test:
+        cats = _categories_for_domains(_webinstruct_test_domains(cfg))
+        raw = load_dataset(cfg.train_dataset, split="test")
+        raw = raw.filter(lambda ex: ex.get("category") in cats)
+        raw = raw.filter(lambda ex: bool(str(ex.get("answer", "") or "").strip()))
+        raw = raw.shuffle(seed=cfg.seed)
+        if cfg.n_if_target and cfg.n_if_target > 0 and len(raw) > cfg.n_if_target:
+            raw = raw.select(range(cfg.n_if_target))
+        if "webinstruct_test" in cfg.eval_benchmarks:
+            print("  [data] WARNING: if_target_full_test=True AND webinstruct_test "
+                  "in eval_benchmarks → eval LEAKS into the IF target. Use an "
+                  "external eval dataset instead.")
+        if_raw = raw
+    else:
+        if_raw, _ = _webinstruct_test_partition(cfg)
+    print(f"  [data] IF target: {len(if_raw)} prompts "
+          f"(domains={_webinstruct_test_domains(cfg)}, full_test={cfg.if_target_full_test})")
     return if_raw.map(
         _format_webinstruct_row,
         with_indices=True,

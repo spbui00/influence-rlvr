@@ -83,6 +83,11 @@ class ExperimentConfig:
     # `domains`. e.g. ("cs",) to steer pruning toward, and test on, Computer
     # Science specifically while still training on all `domains`.
     webinstruct_test_domains: tuple[str, ...] = ()
+    # Use the ENTIRE domain-filtered test slice as the IF target (no eval
+    # carve-out). For tiny single-domain slices (e.g. CS has ~5 test rows) so all
+    # of them guide the influence. REQUIRES eval on an external dataset — do NOT
+    # keep "webinstruct_test" in eval_benchmarks with this on (it would leak).
+    if_target_full_test: bool = False
     max_prompt_length: int = 1024
 
     # ── GRPO ────────────────────────────────────────────────────────────────
