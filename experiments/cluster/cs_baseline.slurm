@@ -12,7 +12,7 @@
 #SBATCH --gpus-per-node=l40s:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=4:00:00
+#SBATCH --time=6:00:00
 #SBATCH --output=slurm-%x-%j.out
 
 set -euo pipefail
@@ -39,7 +39,7 @@ cd "$SLURM_SUBMIT_DIR"
 echo "================ TRAIN (baseline, full pool) ================"
 srun python -m experiments.train --regime baseline --run-name "$RUN_NAME" --seed "$SEED" \
     --eval-benchmarks mmlu_cs,gsm8k,math500 --live-eval-benchmark mmlu_cs \
-    --n-train-pool 48 --n-if-target 32 \
+    --n-train-pool 96 --n-if-target 32 \
     --max-steps 30 --save-steps 10 \
     --g-train 4 --per-device-batch 8 --grad-accum 1 --max-completion-length 1024 \
     --verifier-max-new-tokens 512 --live-eval-examples 16 \

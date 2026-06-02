@@ -11,7 +11,7 @@
 #SBATCH --gpus-per-node=l40s:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=4:00:00
+#SBATCH --time=6:00:00
 #SBATCH --output=slurm-%x-%j.out
 
 set -euo pipefail
@@ -36,7 +36,7 @@ echo "================ TRAIN (if_prune, CS) ================"
 srun python -m experiments.train --regime if_prune --run-name "$RUN_NAME" --seed "$SEED" \
     --if-target-source mmlu_cs \
     --eval-benchmarks mmlu_cs,gsm8k,math500 --live-eval-benchmark mmlu_cs \
-    --n-train-pool 48 --n-if-target 32 \
+    --n-train-pool 96 --n-if-target 32 \
     --max-steps 30 --prune-step 10 --if-recompute-every 0 --save-steps 10 \
     --g-train 4 --per-device-batch 8 --grad-accum 1 --max-completion-length 1024 \
     --if-g-train 4 --if-max-new-tokens 512 \
