@@ -27,9 +27,9 @@ import numpy as np
 import torch
 from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
-from trl import GRPOConfig
+from trl import GRPOConfig, GRPOTrainer
 
-from influence_rlvr import HistoricalBatchGRPOTrainer, clear_cache, detect_device
+from influence_rlvr import clear_cache, detect_device
 from influence_rlvr.generation import clear_vllm_engine_cache
 from influence_rlvr.rewards import format_guardrail_reward_func
 
@@ -134,7 +134,24 @@ def make_grpo_config(cfg: ExperimentConfig, *, max_steps: int, shuffle: bool = T
         kw["vllm_enable_sleep_mode"] = cfg.vllm_enable_sleep_mode
         if cfg.vllm_max_model_len is not None:
             kw["vllm_max_model_length"] = cfg.vllm_max_model_len
+    # GRPOConfig fields differ across TRL versions (e.g. max_prompt_length,
+    # importance_sampling_level, vllm_mode were added/renamed). Keep only fields
+    # this installed TRL actually accepts; warn about the rest.
+    import dataclasses
+    valid = {f.name for f in dataclasses.fields(GRPOConfig)}
+    dropped = sorted(k for k in kw if k not in valid)
+    if dropped:
+        print(f"[grpo-config] this TRL ({_trl_version()}) ignores: {dropped}")
+    kw = {k: v for k, v in kw.items() if k in valid}
     return GRPOConfig(**kw)
+
+
+def _trl_version() -> str:
+    try:
+        import trl
+        return getattr(trl, "__version__", "?")
+    except Exception:
+        return "?"
 
 
 def make_live_eval_callback(cfg, tokenizer, device):
@@ -154,13 +171,15 @@ def make_live_eval_callback(cfg, tokenizer, device):
 
 def build_trainer(cfg, model, tokenizer, train_dataset, *, max_steps, shuffle=True,
                   callbacks=None):
-    trainer = HistoricalBatchGRPOTrainer(
+    # Stock GRPOTrainer (not influence_rlvr.HistoricalBatchGRPOTrainer): the
+    # custom subclass overrides TRL private methods that changed in TRL 1.x, and
+    # the CG/DENSE influence here never reads its batch-history logging.
+    trainer = GRPOTrainer(
         model=model,
         reward_funcs=build_reward_funcs(cfg),
         args=make_grpo_config(cfg, max_steps=max_steps, shuffle=shuffle),
         train_dataset=train_dataset,
         processing_class=tokenizer,
-        history_output_dir=str(cfg.grpo_output_dir),
     )
     for cb in (callbacks or []):
         trainer.add_callback(cb)
