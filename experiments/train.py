@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -305,9 +306,21 @@ def run_if_prune(cfg, model, tokenizer, train_pool, device):
             np.save(if_dir / f"ranked_order_step{start}.npy", order)
             np.save(if_dir / f"schedule_step{start}.npy", np.array(schedule))
             dataset = train_pool.select(schedule)   # ranked order, length n_picks
-            n_unique = len(set(schedule))
+            uniq = sorted(set(schedule))
+            n_unique = len(uniq)
+            # Which DOMAINS did the influence pick? (the cross-domain observable:
+            # e.g. did a CS target pull in Math/Finance examples?)
+            if "category" in train_pool.column_names:
+                cats = [train_pool[i]["category"] for i in uniq]
+                sel = dict(Counter(cats))
+                with (if_dir / f"selected_categories_step{start}.json").open("w") as f:
+                    json.dump(sel, f, indent=2)
+                cat_str = f" | selected-by-IF categories: {sel}"
+            else:
+                cat_str = ""
             print(f"[window {w}] popping top {n_picks} of {pool} ranked prompts "
-                  f"({n_unique} unique, {n_unique / pool:.0%} of pool); train {start}->{end}")
+                  f"({n_unique} unique, {n_unique / pool:.0%} of pool); train {start}->{end}"
+                  f"{cat_str}")
             shuffle = False
             # Influence (CG) disables grad checkpointing; restore for training.
             if hasattr(model, "gradient_checkpointing_enable"):

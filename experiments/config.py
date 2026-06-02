@@ -69,6 +69,10 @@ class ExperimentConfig:
     # Cap the training pool (per the IF-pruning study we don't need all 229k).
     # <=0 means "use everything after filtering".
     n_train_pool: int = 6000
+    # Draw an equal share from each domain (n_train_pool/#domains) instead of a
+    # random (Math-heavy) sample. Keep on so a single-domain IF target (e.g. CS)
+    # can pull in helpful examples from the other domains.
+    balance_domains: bool = True
     # Held-out target set the influence is measured against (drawn from the
     # dataset `test` split). The test slice is partitioned into a disjoint IF
     # target (first n_if_target) and an in-distribution eval set (the rest), so

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Iterable
 
-from datasets import Dataset, load_dataset
+from datasets import Dataset, concatenate_datasets, load_dataset
 
 from .config import DOMAIN_TO_CATEGORIES, ExperimentConfig
 
@@ -62,18 +62,45 @@ def _load_webinstruct_split(cfg: ExperimentConfig, split: str) -> Dataset:
     return raw
 
 
+def _load_train_domain(cfg: ExperimentConfig, domain: str) -> Dataset:
+    """Train split filtered to ONE domain's categories (+ nonempty answer)."""
+    cats = set(DOMAIN_TO_CATEGORIES[domain])
+    raw = load_dataset(cfg.train_dataset, split="train")
+    raw = raw.filter(lambda ex: ex.get("category") in cats)
+    raw = raw.filter(lambda ex: bool(str(ex.get("answer", "") or "").strip()))
+    return raw
+
+
 def load_train_pool(cfg: ExperimentConfig) -> Dataset:
-    """Filtered + capped training pool with a stable `train_index`."""
-    raw = _load_webinstruct_split(cfg, "train")
-    if cfg.n_train_pool and cfg.n_train_pool > 0 and len(raw) > cfg.n_train_pool:
-        raw = raw.shuffle(seed=cfg.seed).select(range(cfg.n_train_pool))
-    # Re-index after the (optional) subsample so train_index is contiguous.
-    ds = raw.map(
+    """Training pool with a stable `train_index`.
+
+    With `balance_domains` (default), draw an EQUAL share (n_train_pool/#domains)
+    from each domain so the pool is balanced — important when the IF target is one
+    domain (e.g. CS) and we want to see whether influence selects helpful examples
+    from the OTHER domains. Otherwise: a single random sample (Math-heavy, the
+    natural WebInstruct mix).
+    """
+    if cfg.balance_domains and cfg.n_train_pool and cfg.n_train_pool > 0:
+        per = cfg.n_train_pool // len(cfg.domains)
+        parts = []
+        for d in cfg.domains:
+            raw_d = _load_train_domain(cfg, d).shuffle(seed=cfg.seed)
+            k = min(per, len(raw_d))
+            if k < per:
+                print(f"  [data] domain {d!r}: only {len(raw_d)} rows, using {k} (< {per})")
+            parts.append(raw_d.select(range(k)))
+        raw = concatenate_datasets(parts).shuffle(seed=cfg.seed + 5)
+        print(f"  [data] balanced pool: {[(d, min(per, len(_load_train_domain(cfg, d)))) for d in cfg.domains]}")
+    else:
+        raw = _load_webinstruct_split(cfg, "train")
+        if cfg.n_train_pool and cfg.n_train_pool > 0 and len(raw) > cfg.n_train_pool:
+            raw = raw.shuffle(seed=cfg.seed).select(range(cfg.n_train_pool))
+    # Re-index after sampling so train_index is contiguous.
+    return raw.map(
         _format_webinstruct_row,
         with_indices=True,
         remove_columns=raw.column_names,
     )
-    return ds
 
 
 def _webinstruct_test_domains(cfg: ExperimentConfig) -> tuple[str, ...]:
