@@ -241,6 +241,16 @@ def _window_boundaries(cfg) -> list[int]:
 
 
 def run_if_prune(cfg, model, tokenizer, train_pool, device):
+    # if_prune builds one GRPOTrainer per window, but vLLM's CuMem allocator
+    # allows only ONE engine per process — a 2nd window's vLLM init asserts. And
+    # vLLM only speeds the (minority) training generation here; CG scoring is
+    # HF/gradient-bound regardless. So force HF training for if_prune. Use a
+    # separate-process-per-window orchestration if you ever need vLLM here.
+    if cfg.use_vllm:
+        print("[if_prune] vLLM colocate can't re-init across windows in one "
+              "process; using HF generation for if_prune training "
+              "(baseline runs can still use vLLM).")
+        cfg.use_vllm = False
     boundaries = _window_boundaries(cfg)
     triggers = boundaries[1:-1]
     target_set = load_if_target_set(cfg)
