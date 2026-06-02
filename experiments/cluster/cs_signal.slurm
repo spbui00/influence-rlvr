@@ -39,7 +39,7 @@ srun python -m experiments.train --regime if_prune --run-name "$RUN_NAME" --seed
     --n-train-pool 96 --n-if-target 16 \
     --max-steps 30 --prune-step 10 --if-recompute-every 0 --save-steps 10 \
     --g-train 4 --per-device-batch 8 --grad-accum 1 --max-completion-length 1024 \
-    --if-g-train 4 --if-max-new-tokens 512 \
+    --if-g-train 2 --if-max-new-tokens 1024 \
     --cg-fisher-examples 4 --cg-fisher-g 2 --cg-iters 10 --cg-fisher-max-tokens 128 \
     --verifier-max-new-tokens 512 --live-eval-examples 16 \
     --eval-max-examples 64 --eval-max-new-tokens 1024
