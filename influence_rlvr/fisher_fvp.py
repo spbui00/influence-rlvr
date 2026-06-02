@@ -26,10 +26,25 @@ does not compose with activation checkpointing.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable, Sequence
 
 import torch
+
+
+@contextmanager
+def _math_attention():
+    """Force the math SDPA backend: flash/mem-efficient attention has no
+    backward-of-backward, which the double-backward FVP needs. Math attention is
+    plain differentiable ops, so second-order grads work. No-op on older torch."""
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+    except Exception:
+        yield
+        return
+    with sdpa_kernel(SDPBackend.MATH):
+        yield
 
 
 @dataclass
@@ -45,7 +60,8 @@ def _response_logits(model, row: FisherRow) -> tuple[torch.Tensor, torch.Tensor]
     """Logits at the response positions (graph attached to θ), and their mask."""
     input_ids = torch.cat([row.prompt_ids, row.response_ids], dim=1)
     attention_mask = torch.cat([row.prompt_mask, row.response_mask], dim=1)
-    out = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+    with _math_attention():   # double-backward needs math (not flash) attention
+        out = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
     logits = out.logits if hasattr(out, "logits") else out[0]
     lp = int(row.prompt_ids.shape[1])
     lr = int(row.response_ids.shape[1])
