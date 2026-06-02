@@ -27,6 +27,7 @@ VENV_DIR="${VENV_DIR:-$HOME/envs/influence-rlvr}"
 export HF_HOME="${HF_HOME:-$HOME/scratch/hf_cache}"
 export HF_HUB_OFFLINE=1                 # compute nodes have no internet
 export TOKENIZERS_PARALLELISM=false
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export WANDB_MODE="${WANDB_MODE:-offline}"   # sync later from a login node: `wandb sync`
 # Keep temp + wandb off the small/shared /tmp (it fills up; wandb makes a temp
 # dir at import). $SLURM_TMPDIR is node-local SSD, auto-cleaned per job.

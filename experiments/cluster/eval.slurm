@@ -21,6 +21,7 @@ VENV_DIR="${VENV_DIR:-$HOME/envs/influence-rlvr}"
 export HF_HOME="${HF_HOME:-$HOME/scratch/hf_cache}"
 export HF_HUB_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TMPDIR="${SLURM_TMPDIR:-$HOME/scratch/tmp}"; mkdir -p "$TMPDIR"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export WANDB_DIR="${WANDB_DIR:-$HOME/scratch/wandb}"; mkdir -p "$WANDB_DIR"

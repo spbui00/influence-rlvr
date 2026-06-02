@@ -128,8 +128,11 @@ class ExperimentConfig:
     lambda_damp: float = 0.1
     cg_iters: int = 50
     cg_tol: float = 1e-6
-    if_g_train: int = 8               # rollouts per example when scoring grads
-    if_max_new_tokens: int = 1024
+    # rollouts/tokens per example when scoring grads. Each g_test/g_train backward
+    # holds logits of shape (if_g_train × tokens × vocab≈152k) — keep modest on a
+    # 48 GB L40S that also hosts the policy + verifier (8 OOMs there).
+    if_g_train: int = 4
+    if_max_new_tokens: int = 512
     # Fisher batch for CG: the Fisher is estimated over `cg_fisher_examples`
     # prompts × `cg_fisher_g` completions. For "cg" each completion is truncated
     # to `cg_fisher_max_tokens` positions (the Fisher needn't see full length).

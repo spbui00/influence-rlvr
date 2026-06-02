@@ -185,6 +185,11 @@ def compute_cg_pool_influence(
 ) -> np.ndarray:
     """Per-train aggregated CG influence (mean over the target set)."""
     model.eval()
+    # Release training-time memory before the (memory-heavy) scoring pass.
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     backend = GenerationBackend.VLLM if cfg.use_vllm else GenerationBackend.HF
     vllm_cfg = _vllm_config(cfg)
 
