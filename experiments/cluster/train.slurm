@@ -37,7 +37,7 @@ export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-$HOME/scratch/wandb/cache}"
 mkdir -p "$WANDB_DIR" "$WANDB_CACHE_DIR"
 
 module --force purge
-module load StdEnv/2023 gcc/12.3 python/3.11 cuda/12.2 arrow/21.0.0
+module load StdEnv/2023 gcc/12.3 python/3.11 cuda/12.2 arrow/21.0.0 opencv/4.13.0
 source "$VENV_DIR/bin/activate"
 cd "$SLURM_SUBMIT_DIR"
 

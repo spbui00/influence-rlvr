@@ -9,7 +9,7 @@
 # Override paths via env vars before sourcing if needed (VENV_DIR, HF_HOME, ...).
 
 module --force purge
-module load StdEnv/2023 gcc/12.3 python/3.11 cuda/12.2 arrow/21.0.0
+module load StdEnv/2023 gcc/12.3 python/3.11 cuda/12.2 arrow/21.0.0 opencv/4.13.0
 
 source "${VENV_DIR:-$HOME/envs/influence-rlvr}/bin/activate"
 
