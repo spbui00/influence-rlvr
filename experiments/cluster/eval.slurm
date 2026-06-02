@@ -4,8 +4,8 @@
 #   sbatch --export=ALL,RUN_NAME=qwen3_4b_base,STEP=latest experiments/cluster/eval.slurm
 #
 #SBATCH --job-name=ifrlvr-eval
-#SBATCH --account=rrg-zhijing
-#SBATCH --gpus-per-node=h100:1
+#SBATCH --account=aip-rgrosse
+#SBATCH --gpus-per-node=l40s:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=04:00:00

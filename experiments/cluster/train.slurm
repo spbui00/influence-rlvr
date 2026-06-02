@@ -4,13 +4,13 @@
 #   sbatch --export=ALL,REGIME=baseline,RUN_NAME=qwen3_4b_base  experiments/cluster/train.slurm
 #   sbatch --export=ALL,REGIME=if_prune,RUN_NAME=qwen3_4b_prune experiments/cluster/train.slurm
 #
-# Defaults below target Killarney (H100). For Narval (A100-40G) drop
-# --gpus-per-node to 1, lower vllm-gpu-memory-utilization, and use the matching
-# --account. Tune --time once you've measured a few steps.
+# Defaults below target Killarney: L40S (48 GB), account aip-rgrosse. On Narval
+# use --account=rrg-zhijing and --gpus-per-node=a100:N. Tune --time after a few
+# measured steps.
 #
 #SBATCH --job-name=ifrlvr
-#SBATCH --account=rrg-zhijing          # <-- your RRG group (rapi hqw-052-ab). `def-zhijing` for the default allocation.
-#SBATCH --gpus-per-node=h100:2         # 2 GPUs: policy+vLLM on GPU0, verifier on GPU1. Use h100:1 to colocate.
+#SBATCH --account=aip-rgrosse          # Killarney AIP project (CCRI uvf-292-02). Narval: rrg-zhijing.
+#SBATCH --gpus-per-node=l40s:1         # 1× L40S (48 GB); verifier colocates. Use l40s:2 to put the verifier on GPU 1.
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=96G
 #SBATCH --time=12:00:00
