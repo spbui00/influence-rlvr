@@ -35,7 +35,7 @@ from influence_rlvr.generation import clear_vllm_engine_cache
 from influence_rlvr.rewards import format_guardrail_reward_func
 
 from .config import ExperimentConfig
-from .data import load_if_target_set, load_train_pool, load_webinstruct_test
+from .data import load_eval_benchmark, load_if_target_set, load_train_pool
 from .influence import compute_pool_influence
 from .live_eval import LiveEvalCallback
 from .verifier import make_verifier_reward_func
@@ -166,7 +166,7 @@ def make_live_eval_callback(cfg, tokenizer, device):
     """Held-out eval callback (or None). Uses the disjoint eval partition."""
     if not cfg.live_eval:
         return None
-    examples = load_webinstruct_test(cfg, cfg.live_eval_examples)
+    examples = load_eval_benchmark(cfg.live_eval_benchmark, cfg, cfg.live_eval_examples)
     if not examples:
         print("  [live-eval] no held-out eval examples; disabling live eval.")
         return None

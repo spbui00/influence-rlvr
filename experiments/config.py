@@ -181,6 +181,10 @@ class ExperimentConfig:
     live_eval_every: int = 0          # 0 -> use save_steps
     live_eval_examples: int = 64      # held-out prompts scored each time (kept small)
     live_eval_max_new_tokens: int = 1024
+    # Which benchmark the in-training curve uses (any key in data.EVAL_LOADERS).
+    # Default webinstruct_test; set to an EXTERNAL set (e.g. theoremqa_cs) when
+    # if_target_full_test consumes the whole webinstruct test slice for the IF target.
+    live_eval_benchmark: str = "webinstruct_test"
 
     def __post_init__(self) -> None:
         for d in (*self.domains, *self.webinstruct_test_domains):
