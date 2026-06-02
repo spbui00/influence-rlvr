@@ -36,11 +36,11 @@ echo "================ TRAIN (if_prune, CS) ================"
 srun python -m experiments.train --regime if_prune --run-name "$RUN_NAME" --seed "$SEED" \
     --if-target-source mmlu_cs \
     --eval-benchmarks mmlu_cs,gsm8k,math500 --live-eval-benchmark mmlu_cs \
-    --n-train-pool 96 --n-if-target 32 \
+    --n-train-pool 96 --n-if-target 16 \
     --max-steps 30 --prune-step 10 --if-recompute-every 0 --save-steps 10 \
     --g-train 4 --per-device-batch 8 --grad-accum 1 --max-completion-length 1024 \
-    --if-g-train 4 --if-max-new-tokens 512 \
-    --cg-fisher-examples 8 --cg-fisher-g 4 --cg-iters 20 --cg-fisher-max-tokens 128 \
+    --if-g-train 2 --if-max-new-tokens 256 \
+    --cg-fisher-examples 4 --cg-fisher-g 2 --cg-iters 10 --cg-fisher-max-tokens 128 \
     --verifier-max-new-tokens 512 --live-eval-examples 16 \
     --eval-max-examples 64 --eval-max-new-tokens 1024
 
