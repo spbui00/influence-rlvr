@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import time
 from pathlib import Path
 
@@ -155,10 +156,8 @@ def _build_empirical_fvp(cfg, model, tokenizer, train_pool, device, backend, vll
 
 
 # ── Shared CG solve + streamed scoring ──────────────────────────────────────
-def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, fvp, *,
+def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
             tag, checkpoint_step, save_dir):
-    cg = CGInfluence(fvp_fn=fvp, lambda_damp=cfg.lambda_damp,
-                     cg_iters=cfg.cg_iters, cg_tol=cfg.cg_tol)
     # Influence ALWAYS uses HF generation, never vLLM: CG needs gradients
     # (backward), which vLLM can't do, and spinning a 2nd vLLM engine collides
     # with TRL's colocate engine on the same GPU. Training still uses vLLM.
@@ -170,6 +169,13 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, fvp, *,
     # half), so larger B fills the GPU. B=1 reproduces the old one-at-a-time loop
     # bit-for-bit (same per-example seeds). Backward stays per-prompt inside.
     B = max(1, cfg.if_score_batch)
+
+    # The Fisher FVP (and its double-backward machinery) is needed ONLY to solve
+    # for H — scoring is just H @ g_train and never touches it again. Build it here
+    # so it can be released before the memory-heavy scoring pass.
+    fvp = make_fvp()
+    cg = CGInfluence(fvp_fn=fvp, lambda_damp=cfg.lambda_damp,
+                     cg_iters=cfg.cg_iters, cg_tol=cfg.cg_tol)
 
     n_target = len(target_set)
     print(f"  CG: solving (F+λI)h = g_test for {n_target} targets (batch={B})...")
@@ -189,6 +195,18 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, fvp, *,
         print(f"    target {done}/{n_target}: CG {info['status']} in "
               f"{info['n_iters']} iters (resid={info['final_residual']})")
     H = torch.stack(h_rows, dim=0)
+
+    # Release the FVP + flush the CG double-backward graphs before the (memory-heavy,
+    # full-vocab-logit) scoring backward. Also re-enable gradient checkpointing: the
+    # FVP needed it OFF for double-backward, but scoring only needs first-order grads,
+    # so checkpointing here cuts activation memory and buys a bigger usable batch.
+    del cg, fvp
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+    model.config.use_cache = False
 
     n_train = len(train_pool)
     print(f"  CG: scoring {n_train} train prompts (batch={B})...")
@@ -233,7 +251,6 @@ def compute_cg_pool_influence(
     """Per-train aggregated CG influence (mean over the target set)."""
     model.eval()
     # Release training-time memory before the (memory-heavy) scoring pass.
-    import gc
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -243,14 +260,18 @@ def compute_cg_pool_influence(
     backend = GenerationBackend.HF
     vllm_cfg = _vllm_config(cfg)
 
+    # Pass a *builder* (not a built FVP) so _run_cg owns the FVP's lifetime and can
+    # free it right after the H-solve, before the scoring backward.
     if cfg.if_method == "cg-empirical":
-        fvp = _build_empirical_fvp(cfg, model, tokenizer, train_pool, device, backend, vllm_cfg)
+        def make_fvp():
+            return _build_empirical_fvp(cfg, model, tokenizer, train_pool, device, backend, vllm_cfg)
         tag = "cg_empirical"
     else:  # "cg" — true analytic per-token Fisher
-        fvp = _build_true_fisher_fvp(cfg, model, tokenizer, train_pool, device, backend, vllm_cfg)
+        def make_fvp():
+            return _build_true_fisher_fvp(cfg, model, tokenizer, train_pool, device, backend, vllm_cfg)
         tag = "cg"
 
     return _run_cg(
-        cfg, model, tokenizer, train_pool, target_set, device, fvp,
+        cfg, model, tokenizer, train_pool, target_set, device, make_fvp,
         tag=tag, checkpoint_step=checkpoint_step, save_dir=save_dir,
     )

@@ -70,13 +70,15 @@ def main(argv: list[str] | None = None) -> None:
           f"if_g_train={cfg.if_g_train} tokens={cfg.if_max_new_tokens} "
           f"method={cfg.if_method} | batch sizes {batch_sizes}")
 
-    # Build the Fisher FVP once; only the scoring loop (B) varies between runs.
+    # _run_cg rebuilds + frees the Fisher FVP itself (so it can release it before
+    # scoring); pass a builder. Each B run is thus fully independent in memory.
     backend = GenerationBackend.HF
     vllm_cfg = _vllm_config(cfg)
-    if cfg.if_method == "cg-empirical":
-        fvp = _build_empirical_fvp(cfg, model, tokenizer, train_pool, device, backend, vllm_cfg)
-    else:
-        fvp = _build_true_fisher_fvp(cfg, model, tokenizer, train_pool, device, backend, vllm_cfg)
+
+    def make_fvp():
+        if cfg.if_method == "cg-empirical":
+            return _build_empirical_fvp(cfg, model, tokenizer, train_pool, device, backend, vllm_cfg)
+        return _build_true_fisher_fvp(cfg, model, tokenizer, train_pool, device, backend, vllm_cfg)
 
     results: dict[int, tuple[np.ndarray, float]] = {}
     for B in batch_sizes:
@@ -84,7 +86,7 @@ def main(argv: list[str] | None = None) -> None:
         if torch.cuda.is_available():
             torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
         t0 = time.time()
-        scores = _run_cg(cfg, model, tokenizer, train_pool, target_set, device, fvp,
+        scores = _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp,
                          tag="bench", checkpoint_step=0, save_dir=None)
         dt = time.time() - t0
         peak = (torch.cuda.max_memory_allocated() / 1e9) if torch.cuda.is_available() else 0.0
