@@ -71,6 +71,7 @@ def main(argv: list[str] | None = None) -> None:
     rank, world, local_rank = init_distributed()
     if torch.cuda.is_available():
         device = torch.device(f"cuda:{local_rank}")
+        cfg.verifier_device = f"cuda:{local_rank}"  # pin each rank's verifier to its own GPU
     else:
         device = torch.device("cpu")
     model, tokenizer = build_model(cfg, device)
