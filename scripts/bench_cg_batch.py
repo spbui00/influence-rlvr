@@ -58,6 +58,13 @@ def main(argv: list[str] | None = None) -> None:
         i = argv.index("--batch-sizes")
         batch_sizes = [int(x) for x in argv[i + 1].split(",")]
         del argv[i : i + 2]
+    # Re-run the reference B at a *different seed* to measure the sampling-noise
+    # floor: B>1 scoring re-samples rollouts, so its disagreement with B=1 should
+    # be no worse than B=1-vs-B=1'-at-another-seed. Without this floor a low
+    # spearman is ambiguous (noisy signal vs. real batching bug).
+    noise_floor = "--noise-floor" in argv
+    if noise_floor:
+        argv.remove("--noise-floor")
 
     cfg = ExperimentConfig.from_cli(argv)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -68,7 +75,7 @@ def main(argv: list[str] | None = None) -> None:
     target_set = load_if_target_set(cfg)
     print(f"pool={len(train_pool)} targets={len(target_set)} "
           f"if_g_train={cfg.if_g_train} tokens={cfg.if_max_new_tokens} "
-          f"method={cfg.if_method} | batch sizes {batch_sizes}")
+          f"micro={cfg.if_logps_micro_batch} method={cfg.if_method} | batch sizes {batch_sizes}")
 
     # _run_cg rebuilds + frees the Fisher FVP itself (so it can release it before
     # scoring); pass a builder. Each B run is thus fully independent in memory.
@@ -80,9 +87,9 @@ def main(argv: list[str] | None = None) -> None:
             return _build_empirical_fvp(cfg, model, tokenizer, train_pool, device, backend, vllm_cfg)
         return _build_true_fisher_fvp(cfg, model, tokenizer, train_pool, device, backend, vllm_cfg)
 
-    results: dict[int, tuple[np.ndarray, float]] = {}
-    for B in batch_sizes:
+    def score_at(B: int, seed: int) -> tuple[np.ndarray, float, float]:
         cfg.if_score_batch = B
+        cfg.seed = seed
         if torch.cuda.is_available():
             torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
         t0 = time.time()
@@ -90,14 +97,29 @@ def main(argv: list[str] | None = None) -> None:
                          tag="bench", checkpoint_step=0, save_dir=None)
         dt = time.time() - t0
         peak = (torch.cuda.max_memory_allocated() / 1e9) if torch.cuda.is_available() else 0.0
+        return scores, dt, peak
+
+    base_seed = cfg.seed
+    results: dict[int, tuple[np.ndarray, float]] = {}
+    for B in batch_sizes:
+        scores, dt, peak = score_at(B, base_seed)
         results[B] = (scores, dt)
         print(f"\n[B={B}] {dt:.1f}s total | {dt / len(train_pool):.2f}s/example "
               f"| peak {peak:.1f} GB")
 
-    ref = results[batch_sizes[0]][0]
-    t_ref = results[batch_sizes[0]][1]
+    ref_B = batch_sizes[0]
+    ref = results[ref_B][0]
+    t_ref = results[ref_B][1]
     k = max(1, len(train_pool) // 4)
-    print("\n==== summary (vs B=%d reference) ====" % batch_sizes[0])
+
+    floor_rho = None
+    if noise_floor:
+        ref2, _, _ = score_at(ref_B, base_seed + 1000)
+        floor_rho = _spearman(ref, ref2)
+        print(f"\n[noise floor] B={ref_B} @seed {base_seed} vs @seed {base_seed + 1000}: "
+              f"spearman={floor_rho:.3f}, top-k={_topk_overlap(ref, ref2, k):.0%}")
+
+    print("\n==== summary (vs B=%d reference) ====" % ref_B)
     print(f"{'B':>4} {'s/ex':>8} {'speedup':>8} {'spearman':>9} {'top-k':>7}")
     for B in batch_sizes:
         scores, dt = results[B]
@@ -105,6 +127,9 @@ def main(argv: list[str] | None = None) -> None:
         ov = _topk_overlap(ref, scores, k)
         print(f"{B:>4} {dt / len(train_pool):>8.2f} {t_ref / dt:>7.2f}x "
               f"{rho:>9.3f} {ov:>6.0%}")
+    if floor_rho is not None:
+        print(f"\nInterpretation: if the B>1 spearman ≈ the noise floor ({floor_rho:.3f}), "
+              f"the disagreement is just rollout sampling, not a batching bug.")
 
 
 if __name__ == "__main__":
