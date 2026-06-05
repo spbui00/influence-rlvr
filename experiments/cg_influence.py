@@ -54,6 +54,7 @@ def _example_grad(model, tokenizer, sample, reward_funcs, *, objective_mode, cfg
         max_new_tokens=cfg.if_max_new_tokens, temperature=0.7, top_p=0.9,
         seed=seed, epsilon=cfg.grpo_epsilon, beta=cfg.grpo_beta,
         objective_mode=objective_mode, vllm_config=vllm_cfg, model_id=cfg.model_id,
+        logps_micro_batch_size=cfg.if_logps_micro_batch,
     )
     return res["grad"].detach().to(dtype=torch.float32)
 
@@ -81,6 +82,7 @@ def _example_grads_batch(model, tokenizer, samples, builder, *, objective_mode, 
         max_new_tokens=cfg.if_max_new_tokens, temperature=0.7, top_p=0.9,
         seed=seed, epsilon=cfg.grpo_epsilon, beta=cfg.grpo_beta,
         objective_mode=objective_mode, vllm_config=vllm_cfg, model_id=cfg.model_id,
+        logps_micro_batch_size=cfg.if_logps_micro_batch,
     )
     return [g.detach().to(dtype=torch.float32) for g in res["grad"]]
 

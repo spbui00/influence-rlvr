@@ -556,6 +556,7 @@ def compute_policy_gradient_bundle_batch(
     vllm_config=None,
     adapter_path=None,
     model_id=None,
+    logps_micro_batch_size=4,
 ):
     objective_mode = GradientObjective.parse(objective_mode)
     geometry_feature_mode = GeometryFeatureMode.parse(geometry_feature_mode)
@@ -645,6 +646,7 @@ def compute_policy_gradient_bundle_batch(
             single_prompt_mask,
             single_token_ids,
             single_response_mask,
+            micro_batch_size=logps_micro_batch_size,
         )
 
         if old_peft_model is None:
@@ -769,6 +771,7 @@ def compute_policy_gradient_bundle(
     vllm_config=None,
     adapter_path=None,
     model_id=None,
+    logps_micro_batch_size=4,
 ):
     objective_mode = GradientObjective.parse(objective_mode)
     geometry_feature_mode = GeometryFeatureMode.parse(geometry_feature_mode)
@@ -820,6 +823,7 @@ def compute_policy_gradient_bundle(
         prompt_attention_mask,
         response_ids,
         response_mask,
+        micro_batch_size=logps_micro_batch_size,
     )
     if old_peft_model is None:
         old_per_token_logps = per_token_logps.detach()

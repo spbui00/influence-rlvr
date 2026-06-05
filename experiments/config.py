@@ -159,6 +159,12 @@ class ExperimentConfig:
     # memory scales with generation (B × if_g_train × if_max_new_tokens), not B×D.
     # 1 == the old one-at-a-time loop. Raise until generation saturates the GPU.
     if_score_batch: int = 1
+    # Logits microbatch for the per-token-logp forward during scoring. The lm_head
+    # materializes (micro_batch × seq × vocab≈152k) logits — the dominant memory
+    # spike in the scoring backward. 1 = one sequence's logits at a time (minimum
+    # memory; needed on a 48 GB L40S at if_g_train≥4). Does NOT change the result,
+    # only how many rollouts' logits are resident at once.
+    if_logps_micro_batch: int = 1
     # Fisher batch for CG: the Fisher is estimated over `cg_fisher_examples`
     # prompts × `cg_fisher_g` completions. For "cg" each completion is truncated
     # to `cg_fisher_max_tokens` positions (the Fisher needn't see full length).
