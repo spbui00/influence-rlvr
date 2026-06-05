@@ -14,6 +14,7 @@ from influence_rlvr.gradients import (
     _compute_per_token_logps,
     _grad_vector_from_scalar,
     compute_policy_gradient_bundle,
+    compute_policy_gradient_bundle_batch,
 )
 from influence_rlvr.modes import GenerationBackend, GradientObjective, VLLMConfig
 from influence_rlvr.utils import tokenize_prompt
@@ -54,6 +55,33 @@ def _example_grad(model, tokenizer, sample, reward_funcs, *, objective_mode, cfg
         objective_mode=objective_mode, vllm_config=vllm_cfg, model_id=cfg.model_id,
     )
     return res["grad"].detach().to(dtype=torch.float32)
+
+
+def _example_grads_batch(model, tokenizer, samples, builder, *, objective_mode, cfg,
+                         device, backend, vllm_cfg, seed):
+    """Per-example gradients for a minibatch of `samples`, vectorized over generation.
+
+    Uses the batched bundle so all len(samples)×if_g_train rollouts are generated in
+    one forward (the slow half), then the per-prompt backward runs inside. Returns a
+    list of float32 grad vectors, one per sample, in input order.
+    """
+    if len(samples) == 1:  # keep the single-prompt path identical at B=1
+        return [_example_grad(
+            model, tokenizer, samples[0], builder(samples[0], cfg.if_g_train),
+            objective_mode=objective_mode, cfg=cfg, device=device, backend=backend,
+            vllm_cfg=vllm_cfg, seed=seed,
+        )]
+    prompts = [s["prompt"] for s in samples]
+    reward_funcs_batch = [builder(s, cfg.if_g_train) for s in samples]
+    res = compute_policy_gradient_bundle_batch(
+        model, tokenizer, prompts, reward_funcs_batch,
+        G=cfg.if_g_train, device=device,
+        enable_vllm=False, generation_backend=backend,
+        max_new_tokens=cfg.if_max_new_tokens, temperature=0.7, top_p=0.9,
+        seed=seed, epsilon=cfg.grpo_epsilon, beta=cfg.grpo_beta,
+        objective_mode=objective_mode, vllm_config=vllm_cfg, model_id=cfg.model_id,
+    )
+    return [g.detach().to(dtype=torch.float32) for g in res["grad"]]
 
 
 # ── Option 2: matrix-free true-Fisher FVP ───────────────────────────────────
@@ -138,37 +166,48 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, fvp, *,
     vllm_cfg = _vllm_config(cfg)
     builder = _make_verifier_reward_builder(cfg)
 
+    # Scoring minibatch: B prompts share one batched generation forward (the slow
+    # half), so larger B fills the GPU. B=1 reproduces the old one-at-a-time loop
+    # bit-for-bit (same per-example seeds). Backward stays per-prompt inside.
+    B = max(1, cfg.if_score_batch)
+
     n_target = len(target_set)
-    print(f"  CG: solving (F+λI)h = g_test for {n_target} targets...")
+    print(f"  CG: solving (F+λI)h = g_test for {n_target} targets (batch={B})...")
     h_rows = []
-    for j in range(n_target):
-        sample = target_set[j]
-        g_test = _example_grad(
-            model, tokenizer, sample, builder(sample, cfg.if_g_train),
+    info: dict = {"status": "?", "n_iters": 0, "final_residual": float("nan")}
+    for j0 in range(0, n_target, B):
+        chunk = [target_set[j] for j in range(j0, min(j0 + B, n_target))]
+        grads = _example_grads_batch(
+            model, tokenizer, chunk, builder,
             objective_mode=GradientObjective.EXPECTED_REWARD_PG, cfg=cfg,
-            device=device, backend=backend, vllm_cfg=vllm_cfg, seed=cfg.seed + 10_000 + j,
+            device=device, backend=backend, vllm_cfg=vllm_cfg, seed=cfg.seed + 10_000 + j0,
         )
-        h, info = cg.solve(g_test.to(device))
-        h_rows.append(h)
-        if (j + 1) % 10 == 0 or j == n_target - 1:
-            print(f"    target {j + 1}/{n_target}: CG {info['status']} in "
-                  f"{info['n_iters']} iters (resid={info['final_residual']})")
+        for g_test in grads:
+            h, info = cg.solve(g_test.to(device))
+            h_rows.append(h)
+        done = min(j0 + B, n_target)
+        print(f"    target {done}/{n_target}: CG {info['status']} in "
+              f"{info['n_iters']} iters (resid={info['final_residual']})")
     H = torch.stack(h_rows, dim=0)
 
     n_train = len(train_pool)
-    print(f"  CG: scoring {n_train} train prompts (streamed)...")
+    print(f"  CG: scoring {n_train} train prompts (batch={B})...")
     matrix = np.zeros((n_target, n_train), dtype=np.float64)
     t0 = time.time()
-    for i in range(n_train):
-        sample = train_pool[i]
-        g_train = _example_grad(
-            model, tokenizer, sample, builder(sample, cfg.if_g_train),
+    next_log = 50
+    for i0 in range(0, n_train, B):
+        chunk = [train_pool[i] for i in range(i0, min(i0 + B, n_train))]
+        grads = _example_grads_batch(
+            model, tokenizer, chunk, builder,
             objective_mode=GradientObjective.GRPO_TRAIN, cfg=cfg,
-            device=device, backend=backend, vllm_cfg=vllm_cfg, seed=cfg.seed + 20_000 + i,
+            device=device, backend=backend, vllm_cfg=vllm_cfg, seed=cfg.seed + 20_000 + i0,
         )
-        matrix[:, i] = (H @ g_train.to(H.device)).detach().cpu().numpy()
-        if (i + 1) % 50 == 0 or i == n_train - 1:
-            print(f"    scored {i + 1}/{n_train} ({time.time() - t0:.1f}s)")
+        for k, g_train in enumerate(grads):
+            matrix[:, i0 + k] = (H @ g_train.to(H.device)).detach().cpu().numpy()
+        done = min(i0 + B, n_train)
+        if done >= next_log or done == n_train:
+            print(f"    scored {done}/{n_train} ({time.time() - t0:.1f}s)")
+            next_log = ((done // 50) + 1) * 50
     scores = matrix.mean(axis=0)
 
     if save_dir is not None:

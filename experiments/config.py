@@ -151,8 +151,14 @@ class ExperimentConfig:
     # rollouts/tokens per example when scoring grads. Each g_test/g_train backward
     # holds logits of shape (if_g_train × tokens × vocab≈152k) — keep modest on a
     # 48 GB L40S that also hosts the policy + verifier (8 OOMs there).
-    if_g_train: int = 4
+    if_g_train: int = 4 # how many rollouts per prompt for influence on the train pool
     if_max_new_tokens: int = 512
+    # CG scoring minibatch: how many pool/target prompts to score per call. The
+    # batched bundle generates all B×if_g_train rollouts in ONE forward (fills the
+    # GPU) instead of one prompt at a time. Backward is still per-prompt inside, so
+    # memory scales with generation (B × if_g_train × if_max_new_tokens), not B×D.
+    # 1 == the old one-at-a-time loop. Raise until generation saturates the GPU.
+    if_score_batch: int = 1
     # Fisher batch for CG: the Fisher is estimated over `cg_fisher_examples`
     # prompts × `cg_fisher_g` completions. For "cg" each completion is truncated
     # to `cg_fisher_max_tokens` positions (the Fisher needn't see full length).
