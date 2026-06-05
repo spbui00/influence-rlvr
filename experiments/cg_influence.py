@@ -21,6 +21,7 @@ from influence_rlvr.modes import GenerationBackend, GradientObjective, VLLMConfi
 from influence_rlvr.utils import tokenize_prompt
 
 from .config import ExperimentConfig
+from .dist_utils import all_reduce_sum_, dist_info
 from .influence import _make_verifier_reward_builder
 
 
@@ -172,6 +173,14 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
     # bit-for-bit (same per-example seeds). Backward stays per-prompt inside.
     B = max(1, cfg.if_score_batch)
 
+    # Multi-GPU: shard both the H-solve (over targets) and the scoring (over pool)
+    # round-robin across ranks; each rank writes its slice into a zero-filled buffer
+    # and one all-reduce assembles the full result on every rank. world==1 → no-ops,
+    # and seeds are keyed to the GLOBAL index so results are world-size-invariant.
+    rank, world, _ = dist_info()
+    main = rank == 0
+    D = int(sum(p.numel() for p in model.parameters() if p.requires_grad))
+
     # The Fisher FVP (and its double-backward machinery) is needed ONLY to solve
     # for H — scoring is just H @ g_train and never touches it again. Build it here
     # so it can be released before the memory-heavy scoring pass.
@@ -180,23 +189,28 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
                      cg_iters=cfg.cg_iters, cg_tol=cfg.cg_tol)
 
     n_target = len(target_set)
-    print(f"  CG: solving (F+λI)h = g_test for {n_target} targets (batch={B})...")
-    h_rows = []
+    if main:
+        print(f"  CG: solving (F+λI)h = g_test for {n_target} targets "
+              f"(batch={B}, world={world})...")
+    H = torch.zeros(n_target, D, device=device, dtype=torch.float32)
     info: dict = {"status": "?", "n_iters": 0, "final_residual": float("nan")}
-    for j0 in range(0, n_target, B):
-        chunk = [target_set[j] for j in range(j0, min(j0 + B, n_target))]
+    my_targets = list(range(rank, n_target, world))
+    for c in range(0, len(my_targets), B):
+        tids = my_targets[c : c + B]
+        chunk = [target_set[j] for j in tids]
         grads = _example_grads_batch(
             model, tokenizer, chunk, builder,
             objective_mode=GradientObjective.EXPECTED_REWARD_PG, cfg=cfg,
-            device=device, backend=backend, vllm_cfg=vllm_cfg, seed=cfg.seed + 10_000 + j0,
+            device=device, backend=backend, vllm_cfg=vllm_cfg, seed=cfg.seed + 10_000 + tids[0],
         )
-        for g_test in grads:
+        for j, g_test in zip(tids, grads):
             h, info = cg.solve(g_test.to(device))
-            h_rows.append(h)
-        done = min(j0 + B, n_target)
-        print(f"    target {done}/{n_target}: CG {info['status']} in "
-              f"{info['n_iters']} iters (resid={info['final_residual']})")
-    H = torch.stack(h_rows, dim=0)
+            H[j] = h.to(H.dtype)
+        if main:
+            print(f"    target {min(c + B, len(my_targets))}/{len(my_targets)} (rank0): "
+                  f"CG {info['status']} in {info['n_iters']} iters "
+                  f"(resid={info['final_residual']})")
+    all_reduce_sum_(H)  # each rank filled disjoint rows → SUM assembles full H
 
     # Release the FVP + flush the CG double-backward graphs before the (memory-heavy,
     # full-vocab-logit) scoring backward. Also re-enable gradient checkpointing: the
@@ -211,26 +225,35 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
     model.config.use_cache = False
 
     n_train = len(train_pool)
-    print(f"  CG: scoring {n_train} train prompts (batch={B})...")
+    my_pool = list(range(rank, n_train, world))
+    if main:
+        print(f"  CG: scoring {n_train} train prompts "
+              f"({len(my_pool)}/rank × {world} ranks, batch={B})...")
     matrix = np.zeros((n_target, n_train), dtype=np.float64)
     t0 = time.time()
     next_log = 50
-    for i0 in range(0, n_train, B):
-        chunk = [train_pool[i] for i in range(i0, min(i0 + B, n_train))]
+    for c in range(0, len(my_pool), B):
+        pids = my_pool[c : c + B]
+        chunk = [train_pool[i] for i in pids]
         grads = _example_grads_batch(
             model, tokenizer, chunk, builder,
             objective_mode=GradientObjective.GRPO_TRAIN, cfg=cfg,
-            device=device, backend=backend, vllm_cfg=vllm_cfg, seed=cfg.seed + 20_000 + i0,
+            device=device, backend=backend, vllm_cfg=vllm_cfg, seed=cfg.seed + 20_000 + pids[0],
         )
-        for k, g_train in enumerate(grads):
-            matrix[:, i0 + k] = (H @ g_train.to(H.device)).detach().cpu().numpy()
-        done = min(i0 + B, n_train)
-        if done >= next_log or done == n_train:
-            print(f"    scored {done}/{n_train} ({time.time() - t0:.1f}s)")
+        for i, g_train in zip(pids, grads):
+            matrix[:, i] = (H @ g_train.to(H.device)).detach().cpu().numpy()
+        done = min(c + B, len(my_pool))
+        if main and (done >= next_log or done == len(my_pool)):
+            print(f"    rank0 scored {done}/{len(my_pool)} ({time.time() - t0:.1f}s)")
             next_log = ((done // 50) + 1) * 50
+
+    if world > 1:  # each rank filled disjoint columns → SUM assembles the full matrix
+        mt = torch.from_numpy(matrix).to(device)
+        all_reduce_sum_(mt)
+        matrix = mt.cpu().numpy()
     scores = matrix.mean(axis=0)
 
-    if save_dir is not None:
+    if save_dir is not None and main:  # only rank 0 writes (all ranks hold the same scores)
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
         np.save(save_dir / f"{tag}_if_matrix_step{checkpoint_step}.npy", matrix)
