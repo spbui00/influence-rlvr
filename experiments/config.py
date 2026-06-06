@@ -148,6 +148,11 @@ class ExperimentConfig:
     lambda_damp: float = 0.1
     cg_iters: int = 50
     cg_tol: float = 1e-6
+    # Spectral-normalize the Fisher (rescale by its top eigenvalue → spectrum in
+    # [0,1]) so lambda_damp is a scale-free knob in (0,1) and transfers across
+    # checkpoints/pool sizes. Also conditions (F+λI), helping CG converge at small λ.
+    cg_normalize_fisher: bool = True
+    cg_power_iters: int = 15
     # rollouts/tokens per example when scoring grads. Each g_test/g_train backward
     # holds logits of shape (if_g_train × tokens × vocab≈152k) — keep modest on a
     # 48 GB L40S that also hosts the policy + verifier (8 OOMs there).

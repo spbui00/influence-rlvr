@@ -117,7 +117,12 @@ def _build_true_fisher_fvp(cfg, model, tokenizer, train_pool, device, backend, v
     # Double-backward needs activation checkpointing OFF.
     if hasattr(model, "gradient_checkpointing_disable"):
         model.gradient_checkpointing_disable()
-    return build_policy_fisher_fvp(model, rows, normalize=len(rows))
+    return build_policy_fisher_fvp(
+        model, rows, normalize=len(rows),
+        spectral_normalize=cfg.cg_normalize_fisher,
+        n_power_iters=cfg.cg_power_iters,
+        power_seed=cfg.seed,
+    )
 
 
 # ── Option 1: cached sampled-Fisher FVP ─────────────────────────────────────

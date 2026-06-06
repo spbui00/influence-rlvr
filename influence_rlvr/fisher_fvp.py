@@ -75,6 +75,9 @@ def build_policy_fisher_fvp(
     fisher_rows: Sequence[FisherRow],
     *,
     normalize: int | None = None,
+    spectral_normalize: bool = False,
+    n_power_iters: int = 15,
+    power_seed: int = 0,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """Return `fvp(v) -> F·v` for the analytic per-token policy Fisher.
 
@@ -82,6 +85,13 @@ def build_policy_fisher_fvp(
     (LoRA) params, in `model.parameters()` order — matching the convention of
     `gradients._grad_vector_from_scalar`, so they are directly comparable to the
     `g_test`/`g_train` produced elsewhere.
+
+    With `spectral_normalize=True`, F is rescaled by its largest eigenvalue
+    (estimated by `n_power_iters` power iterations) so its spectrum lies in [0, 1].
+    This makes the CG damping λ a *scale-free* knob: (F/λ_max + λI) with λ∈(0,1)
+    damps relative to the top curvature direction, instead of depending on the raw
+    (batch/token-count-dependent) Fisher magnitude. The same λ then transfers
+    across checkpoints/pool sizes.
     """
     params = [p for p in model.parameters() if p.requires_grad]
     numels = [p.numel() for p in params]
@@ -139,4 +149,30 @@ def build_policy_fisher_fvp(
             return torch.zeros(sum(numels), dtype=torch.float32, device=params[0].device)
         return total / n_norm
 
-    return fvp
+    if not spectral_normalize:
+        return fvp
+
+    # Estimate the top eigenvalue of F by power iteration, then rescale so the
+    # spectrum lies in [0, 1]. Each iteration is one (expensive) FVP, but a handful
+    # is cheap next to a full CG solve and only happens once at build time.
+    D = int(sum(numels))
+    device = params[0].device
+    gen = torch.Generator(device=device).manual_seed(power_seed)
+    v = torch.randn(D, generator=gen, device=device, dtype=torch.float32)
+    v = v / v.norm().clamp(min=1e-20)
+    lam_max = torch.tensor(1.0, device=device)
+    for _ in range(max(1, n_power_iters)):
+        Fv = fvp(v)
+        nrm = Fv.norm()
+        if nrm < 1e-20:
+            break
+        v = Fv / nrm
+    Fv = fvp(v)
+    lam_max = torch.dot(v, Fv).clamp(min=1e-20)  # Rayleigh quotient (||v||=1)
+    scale = float(lam_max.item())
+    print(f"  Fisher spectral-normalize: λ_max≈{scale:.4g} (eigenvalues rescaled to [0,1])")
+
+    def fvp_normalized(vec: torch.Tensor) -> torch.Tensor:
+        return fvp(vec) / scale
+
+    return fvp_normalized
