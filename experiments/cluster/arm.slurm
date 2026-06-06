@@ -27,12 +27,13 @@ SEED="${SEED:-42}"
 ARM_ARGS="${ARM_ARGS:?set ARM_ARGS}"
 
 # Shared experiment config — identical across all arms so the ONLY difference is
-# the arm (regime/selection/if-method). One-shot prune at step 40 (recompute 0),
-# CS target+eval, the validated influence settings (if_g_train 8, 1024 tok,
-# normalized Fisher, lambda 0.5, micro-batch 1, score-batch 4).
+# the arm (regime/selection/if-method). DYNAMIC pruning: warm up to step 40, then
+# re-score the pool and re-rank every 20 steps (triggers at 40/60/80) so the
+# selection adapts to the evolving policy. CS target+eval, validated influence
+# settings (if_g_train 8, 1024 tok, normalized Fisher, lambda 0.5, micro 1, B 4).
 COMMON="--if-target-source mmlu_cs --eval-benchmarks mmlu_cs,gsm8k,math500 \
     --live-eval-benchmark mmlu_cs --n-train-pool 96 --n-if-target 16 \
-    --max-steps 100 --prune-step 40 --if-recompute-every 0 --save-steps 20 \
+    --max-steps 100 --prune-step 40 --if-recompute-every 20 --save-steps 20 \
     --g-train 4 --per-device-batch 8 --grad-accum 1 --max-completion-length 1024 \
     --if-g-train 8 --if-max-new-tokens 1024 --cg-fisher-examples 8 --cg-fisher-g 2 \
     --cg-fisher-max-tokens 128 --cg-iters 50 --lambda-damp 0.5 \
