@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lds_eval_toy_grpo import (  # noqa: E402
     ToyAutoregressiveMLP,
     compute_toy_cg_influence,
+    compute_toy_dot_influence,
     generate_clustered_dataset,
     generate_dataset,
 )
@@ -104,6 +105,7 @@ def compute_train_scores(
     train_examples: Sequence[ToyGRPOExample],
     test_examples: Sequence[ToyGRPOExample],
     *,
+    if_method: str = "cg",
     lambda_damp: float,
     cg_iters: int,
     cg_tol: float,
@@ -111,27 +113,38 @@ def compute_train_scores(
     ref_model: nn.Module,
 ) -> np.ndarray:
     """
-    Per-train aggregated IF score: mean of CG-IF across all test examples.
+    Per-train aggregated IF score: mean of per-test influence across all test
+    examples. `if_method` selects the influence operator:
+      - "cg"  : second-order, (F+λI)^{-1} g_test via CG+FVP (the policy Fisher).
+      - "dot" : first-order dot product g_train·g_test (TracIn-style, no Fisher).
 
-    Note: calls `compute_toy_cg_influence` once per test point. The grad/prob
-    caches are rebuilt inside each call — O(n_test) redundant cache builds at
-    each recompute. Cheap on toy; optimize at LLM scale by reusing the cache.
+    Note: rebuilds the grad/prob caches once per test point — O(n_test) redundant
+    builds per recompute. Cheap on toy; optimize at LLM scale by reusing the cache.
     """
     n_test = len(test_examples)
     n_train = len(train_examples)
     matrix = np.zeros((n_test, n_train), dtype=np.float64)
     for j, te in enumerate(test_examples):
-        scores, _ = compute_toy_cg_influence(
-            model,
-            train_examples=train_examples,
-            test_example=te,
-            lambda_damp=lambda_damp,
-            cg_iters=cg_iters,
-            cg_tol=cg_tol,
-            beta=beta,
-            ref_model=ref_model,
-        )
-        matrix[j] = scores.numpy()
+        if if_method == "dot":
+            scores, _ = compute_toy_dot_influence(
+                model,
+                train_examples=train_examples,
+                test_example=te,
+                beta=beta,
+                ref_model=ref_model,
+            )
+        else:
+            scores, _ = compute_toy_cg_influence(
+                model,
+                train_examples=train_examples,
+                test_example=te,
+                lambda_damp=lambda_damp,
+                cg_iters=cg_iters,
+                cg_tol=cg_tol,
+                beta=beta,
+                ref_model=ref_model,
+            )
+        matrix[j] = scores.detach().cpu().numpy()
     return matrix.mean(axis=0)
 
 
@@ -217,8 +230,11 @@ def run_regime(
     test_examples: list[ToyGRPOExample],
     ref_model: nn.Module,
     run_dir: Path,
+    if_method: str = "cg",
+    label: str | None = None,
 ) -> dict:
-    print(f"\n=== Regime: {regime} ===")
+    label = label or regime
+    print(f"\n=== Regime: {label} ===")
     model = init_model(ref_model, args.hidden_dim, args.seed)
     optimizer = make_optimizer(model, args.lr, use_adam=not args.no_adam)
 
@@ -247,6 +263,7 @@ def run_regime(
                 model,
                 train_examples,
                 test_examples,
+                if_method=if_method,
                 lambda_damp=args.lambda_damp,
                 cg_iters=args.cg_iters,
                 cg_tol=args.cg_tol,
@@ -309,11 +326,13 @@ def run_regime(
     final_rewards = [float(exact_expected_reward(model, te)) for te in test_examples]
     summary = {
         "regime": regime,
+        "label": label,
+        "if_method": if_method if needs_if else None,
         "final_per_test_reward": final_rewards,
         "final_mean_reward": float(np.mean(final_rewards)),
     }
 
-    regime_dir = run_dir / regime
+    regime_dir = run_dir / label.replace("[", "_").replace("]", "")
     regime_dir.mkdir(parents=True, exist_ok=True)
     with (regime_dir / "summary.json").open("w") as f:
         json.dump(summary, f, indent=2)
@@ -401,6 +420,9 @@ def main():
     # Selection / recompute
     parser.add_argument("--regimes", type=str, default=",".join(REGIMES),
                         help=f"Comma-separated regimes to run. Choices: {REGIMES}")
+    parser.add_argument("--if-methods", type=str, default="cg",
+                        help="Comma-separated influence methods for IF regimes (cg, dot). "
+                             "Pass 'cg,dot' to overlay both on the comparison plot.")
     parser.add_argument("--selection-policy", choices=list(SELECTION_POLICIES), default="top-k")
     parser.add_argument("--softmax-temperature", type=float, default=1.0)
     parser.add_argument("--if-recompute-mode", choices=["fixed", "log"], default="fixed")
@@ -423,6 +445,11 @@ def main():
         if r not in REGIMES:
             raise SystemExit(f"Unknown regime: {r!r}. Choices: {REGIMES}")
 
+    if_methods = [m.strip() for m in args.if_methods.split(",") if m.strip()]
+    for m in if_methods:
+        if m not in ("cg", "dot"):
+            raise SystemExit(f"Unknown if-method: {m!r}. Choices: ('cg', 'dot')")
+
     train_examples, test_examples = build_datasets(args)
     print(f"Dataset: {args.dataset}, train={len(train_examples)}, test={len(test_examples)}")
 
@@ -438,34 +465,48 @@ def main():
 
     ref_model = build_ref_model(args.hidden_dim, args.seed)
 
-    results: dict[str, dict] = {}
+    # Build the run list: IF-dependent regimes run once per influence method
+    # (so cg vs dot overlay on the plot); method-free baselines run once.
+    multi = len(if_methods) > 1
+    jobs: list[tuple[str, str, str]] = []  # (regime, if_method, label)
     for regime in regimes:
-        results[regime] = run_regime(
+        if regime in ("if-guided", "anti-if"):
+            for m in if_methods:
+                label = f"{regime}[{m}]" if multi else regime
+                jobs.append((regime, m, label))
+        else:
+            jobs.append((regime, if_methods[0], regime))  # method irrelevant
+
+    results: dict[str, dict] = {}
+    for regime, if_method, label in jobs:
+        results[label] = run_regime(
             regime,
             args=args,
             train_examples=train_examples,
             test_examples=test_examples,
             ref_model=ref_model,
             run_dir=run_dir,
+            if_method=if_method,
+            label=label,
         )
 
     with (run_dir / "summary.json").open("w") as f:
-        json.dump({r: results[r]["summary"] for r in regimes}, f, indent=2)
+        json.dump({k: v["summary"] for k, v in results.items()}, f, indent=2)
 
-    # Comparison plot.
+    # Comparison plot (every regime×method curve overlaid).
     plt.figure(figsize=(10, 6))
-    for regime in regimes:
-        rows = results[regime]["reward_log"]
+    for label, res in results.items():
+        rows = res["reward_log"]
         if not rows:
             continue
         steps = [r["step"] for r in rows]
         rewards = [r["mean_test_reward"] for r in rows]
-        plt.plot(steps, rewards, label=regime, marker="o", markersize=3)
+        plt.plot(steps, rewards, label=label, marker="o", markersize=3)
     plt.xlabel("Step")
     plt.ylabel("Mean test reward")
     plt.title(
         f"IF-pruning ({args.dataset}, B={args.batch_size}, sel={args.selection_policy}, "
-        f"recompute={args.if_recompute_mode}/{args.if_recompute_every})"
+        f"recompute={args.if_recompute_mode}/{args.if_recompute_every}, methods={','.join(if_methods)})"
     )
     plt.legend()
     plt.grid(True, alpha=0.3)
@@ -475,9 +516,9 @@ def main():
     print(f"\nPlot: {run_dir / 'comparison.png'}")
 
     print("\n=== Final mean test reward by regime ===")
-    for regime in regimes:
-        s = results[regime]["summary"]
-        print(f"  {regime:>14s}: {s['final_mean_reward']:.4f}  per-test={s['final_per_test_reward']}")
+    for label, res in results.items():
+        s = res["summary"]
+        print(f"  {label:>18s}: {s['final_mean_reward']:.4f}  per-test={s['final_per_test_reward']}")
 
 
 if __name__ == "__main__":

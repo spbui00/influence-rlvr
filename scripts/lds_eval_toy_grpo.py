@@ -637,6 +637,31 @@ def compute_toy_cg_influence(
     return torch.from_numpy(scores_np), cg_info
 
 
+def compute_toy_dot_influence(
+    model: nn.Module,
+    train_examples: Sequence[ToyGRPOExample],
+    test_example: ToyGRPOExample,
+    beta: float = 0.0,
+    ref_model: nn.Module | None = None,
+) -> tuple[torch.Tensor, dict]:
+    """First-order (dot-product / TracIn-style) influence: IF = g_train · g_test.
+
+    Same per-example gradients as `compute_toy_cg_influence`, but with NO Fisher
+    inverse — it's the λ→∞ limit of CG (h = g_test). Use to test whether the
+    second-order curvature correction actually buys anything over plain gradient
+    alignment.
+    """
+    g_test, _grad_cache, _prob_cache, train_infos = build_toy_policy_fisher_inputs(
+        model, train_examples, test_example, beta=beta, ref_model=ref_model,
+    )
+    gt = g_test.detach().to(dtype=torch.float32)
+    scores = torch.stack([
+        torch.dot(ti["grad"].detach().to(dtype=torch.float32, device=gt.device), gt)
+        for ti in train_infos
+    ])
+    return scores.cpu(), {"method": "dot", "n_train": len(train_infos)}
+
+
 def compute_toy_true_fisher_influence(
     model: nn.Module,
     train_examples: Sequence[ToyGRPOExample],
