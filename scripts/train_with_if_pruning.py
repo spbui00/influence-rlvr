@@ -52,6 +52,18 @@ REGIMES = ("if-guided", "round-robin", "random", "anti-if")
 SELECTION_POLICIES = ("top-k", "top-k-abs", "softmax")
 
 
+def _spearman(a: np.ndarray, b: np.ndarray) -> float:
+    """Spearman rho = Pearson correlation of ranks (no scipy dependency)."""
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    ra = np.argsort(np.argsort(a)).astype(np.float64)
+    rb = np.argsort(np.argsort(b)).astype(np.float64)
+    ra -= ra.mean()
+    rb -= rb.mean()
+    denom = np.sqrt((ra**2).sum() * (rb**2).sum())
+    return float((ra * rb).sum() / denom) if denom > 0 else float("nan")
+
+
 def init_model(ref_model: nn.Module, hidden_dim: int, seed: int) -> nn.Module:
     torch.manual_seed(seed)
     model = ToyAutoregressiveMLP(hidden_dim=hidden_dim)
@@ -232,6 +244,7 @@ def run_regime(
     run_dir: Path,
     if_method: str = "cg",
     label: str | None = None,
+    compare_methods: bool = False,
 ) -> dict:
     label = label or regime
     print(f"\n=== Regime: {label} ===")
@@ -246,6 +259,7 @@ def run_regime(
 
     picks_log: list[dict] = []
     reward_log: list[dict] = []
+    agreement_log: list[dict] = []
     last_scores: np.ndarray | None = None
     cycle_offset = 0
 
@@ -275,6 +289,21 @@ def run_regime(
                 f"  step {window_start}/{args.steps}: IFs recomputed in {time.time() - t0:.1f}s, "
                 f"score range [{scores.min():.3e}, {scores.max():.3e}]"
             )
+            # Method-agreement diagnostic: compute the OTHER method's scores at the
+            # SAME model state and correlate. ρ≈1 → cg and dot rank the pool
+            # identically (Fisher changes nothing); low ρ → curvature reorders the
+            # picks. Only on the cg trajectory (a canonical shared path) to avoid
+            # doubling cost on every run.
+            if compare_methods and if_method == "cg":
+                dot_scores = compute_train_scores(
+                    model, train_examples, test_examples, if_method="dot",
+                    lambda_damp=args.lambda_damp, cg_iters=args.cg_iters,
+                    cg_tol=args.cg_tol, beta=args.beta, ref_model=ref_model,
+                )
+                rho = _spearman(scores, dot_scores)
+                agreement_log.append({"step": window_start, "spearman_cg_dot": rho})
+                print(f"    [method-agreement] step {window_start}: "
+                      f"Spearman(cg, dot) = {rho:+.3f}")
 
         schedule = build_schedule(
             regime,
@@ -357,8 +386,23 @@ def run_regime(
         for row in reward_log:
             writer.writerow([row["step"], f"{row['mean_test_reward']:.6f}"] + row["per_test_reward"])
 
+    if agreement_log:
+        summary["mean_spearman_cg_dot"] = float(
+            np.mean([r["spearman_cg_dot"] for r in agreement_log])
+        )
+        with (regime_dir / "method_agreement.csv").open("w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["step", "spearman_cg_dot"])
+            for row in agreement_log:
+                writer.writerow([row["step"], f"{row['spearman_cg_dot']:.6f}"])
+
     print(f"  Final mean reward: {summary['final_mean_reward']:.4f}")
-    return {"summary": summary, "reward_log": reward_log, "picks_log": picks_log}
+    return {
+        "summary": summary,
+        "reward_log": reward_log,
+        "picks_log": picks_log,
+        "agreement_log": agreement_log,
+    }
 
 
 def build_datasets(args) -> tuple[list[ToyGRPOExample], list[ToyGRPOExample]]:
@@ -468,6 +512,7 @@ def main():
     # Build the run list: IF-dependent regimes run once per influence method
     # (so cg vs dot overlay on the plot); method-free baselines run once.
     multi = len(if_methods) > 1
+    compare_methods = ("cg" in if_methods) and ("dot" in if_methods)
     jobs: list[tuple[str, str, str]] = []  # (regime, if_method, label)
     for regime in regimes:
         if regime in ("if-guided", "anti-if"):
@@ -488,6 +533,7 @@ def main():
             run_dir=run_dir,
             if_method=if_method,
             label=label,
+            compare_methods=compare_methods,
         )
 
     with (run_dir / "summary.json").open("w") as f:
@@ -519,6 +565,15 @@ def main():
     for label, res in results.items():
         s = res["summary"]
         print(f"  {label:>18s}: {s['final_mean_reward']:.4f}  per-test={s['final_per_test_reward']}")
+
+    if compare_methods:
+        print("\n=== Method agreement: Spearman(cg, dot) over the pool ===")
+        print("  (ρ≈1 → curvature doesn't reorder picks → Fisher == dot-product)")
+        for label, res in results.items():
+            mean_rho = res["summary"].get("mean_spearman_cg_dot")
+            if mean_rho is not None:
+                per_window = [f"{r['spearman_cg_dot']:+.3f}" for r in res["agreement_log"]]
+                print(f"  {label:>18s}: mean ρ={mean_rho:+.3f}  per-recompute={per_window}")
 
 
 if __name__ == "__main__":
