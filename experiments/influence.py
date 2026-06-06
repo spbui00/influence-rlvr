@@ -90,9 +90,10 @@ def compute_pool_influence(
     save_dir: Path | None = None,
 ) -> np.ndarray:
     """Return per-train aggregated influence scores (1-D, len == len(train_pool))."""
-    if cfg.if_method in ("cg", "cg-empirical"):
+    if cfg.if_method in ("cg", "cg-empirical", "dot"):
         # CG influence: "cg" = matrix-free analytic per-token Fisher;
-        # "cg-empirical" = cached sampled-Fisher FVP.
+        # "cg-empirical" = cached sampled-Fisher FVP; "dot" = first-order
+        # gradient dot product (TracIn-style, no Fisher/solve).
         from .cg_influence import compute_cg_pool_influence
         return compute_cg_pool_influence(
             cfg, peft_model, tokenizer, train_pool, target_set, device,

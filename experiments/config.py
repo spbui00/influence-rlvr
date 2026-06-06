@@ -235,7 +235,7 @@ class ExperimentConfig:
             raise ValueError(
                 f"if_target_source must be webinstruct|mmlu_cs, got {self.if_target_source!r}"
             )
-        if self.if_method not in ("cg", "cg-empirical", "fisher"):
+        if self.if_method not in ("cg", "cg-empirical", "fisher", "dot"):
             raise ValueError(
                 f"if_method must be cg|cg-empirical|fisher, got {self.if_method!r}"
             )

@@ -186,17 +186,19 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
     main = rank == 0
     D = int(sum(p.numel() for p in model.parameters() if p.requires_grad))
 
-    # The Fisher FVP (and its double-backward machinery) is needed ONLY to solve
-    # for H — scoring is just H @ g_train and never touches it again. Build it here
-    # so it can be released before the memory-heavy scoring pass.
-    fvp = make_fvp()
-    cg = CGInfluence(fvp_fn=fvp, lambda_damp=cfg.lambda_damp,
-                     cg_iters=cfg.cg_iters, cg_tol=cfg.cg_tol)
+    # "dot" = first-order TracIn influence: h = g_test (no Fisher, no solve). The
+    # Fisher FVP/CG is needed ONLY to turn g_test into h; for dot we skip it
+    # entirely and set H = the raw target gradients.
+    use_fisher = cfg.if_method != "dot"
+    if use_fisher:
+        fvp = make_fvp()
+        cg = CGInfluence(fvp_fn=fvp, lambda_damp=cfg.lambda_damp,
+                         cg_iters=cfg.cg_iters, cg_tol=cfg.cg_tol)
 
     n_target = len(target_set)
     if main:
-        print(f"  CG: solving (F+λI)h = g_test for {n_target} targets "
-              f"(batch={B}, world={world})...")
+        what = "solving (F+λI)h = g_test" if use_fisher else "h = g_test (dot-product)"
+        print(f"  CG: {what} for {n_target} targets (batch={B}, world={world})...")
     H = torch.zeros(n_target, D, device=device, dtype=torch.float32)
     info: dict = {"status": "?", "n_iters": 0, "final_residual": float("nan")}
     my_targets = list(range(rank, n_target, world))
@@ -209,9 +211,12 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
             device=device, backend=backend, vllm_cfg=vllm_cfg, seed=cfg.seed + 10_000 + tids[0],
         )
         for j, g_test in zip(tids, grads):
-            h, info = cg.solve(g_test.to(device))
+            if use_fisher:
+                h, info = cg.solve(g_test.to(device))
+            else:
+                h = g_test.to(device)  # dot-product: h = g_test
             H[j] = h.to(H.dtype)
-        if main:
+        if main and use_fisher:
             print(f"    target {min(c + B, len(my_targets))}/{len(my_targets)} (rank0): "
                   f"CG {info['status']} in {info['n_iters']} iters "
                   f"(resid={info['final_residual']})")
@@ -221,7 +226,8 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
     # full-vocab-logit) scoring backward. Also re-enable gradient checkpointing: the
     # FVP needed it OFF for double-backward, but scoring only needs first-order grads,
     # so checkpointing here cuts activation memory and buys a bigger usable batch.
-    del cg, fvp
+    if use_fisher:
+        del cg, fvp
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
