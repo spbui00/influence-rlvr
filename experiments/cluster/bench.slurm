@@ -1,6 +1,4 @@
 #!/bin/bash
-# Unattended CG-scoring vectorization benchmark. Submit and walk away — it queues,
-# runs when scheduled, and writes the table to slurm-bench_cg-<jobid>.out.
 #
 #   sbatch experiments/cluster/bench.slurm
 #   # watch later:  tail -f slurm-bench_cg-*.out

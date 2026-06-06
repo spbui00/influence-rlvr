@@ -93,6 +93,12 @@ def main() -> None:
         lambdas = [float(x) for x in argv[i + 1].split(",")]
         del argv[i : i + 2]
 
+    # Descending: the high-λ values converge fast (early CG exit) AND are the
+    # decisive comparison (≈ dot-product ceiling), so they run first — if the job
+    # is killed, the partial table still has the values that matter. Low λ runs
+    # last because it's the slowest (never converges → burns every iter).
+    lambdas = sorted(lambdas, reverse=True)
+
     cfg = ExperimentConfig.from_cli(argv)
     rank, world, local_rank = init_distributed()
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
