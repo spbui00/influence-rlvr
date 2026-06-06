@@ -12,6 +12,7 @@ the helpers are no-ops, so the single-GPU path is unchanged.
 from __future__ import annotations
 
 import os
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
@@ -21,6 +22,13 @@ def init_distributed() -> tuple[int, int, int]:
     """Init the process group from torchrun env vars. Returns (rank, world, local_rank).
 
     No-op (returns 0,1,0) when not launched under torchrun.
+
+    Uses a long timeout and an immediate warm-up all-reduce: CG scoring runs a
+    LONG (tens of minutes) generation phase with no collectives, and ranks finish
+    their shards at different times. NCCL builds its communicator lazily on the
+    first collective — if that lands after a long, skewed compute phase, the
+    straggler blows past the default 10-min timeout. Warming up the communicator
+    here (while all ranks are synced at startup) avoids that entirely.
     """
     world = int(os.environ.get("WORLD_SIZE", "1"))
     if world <= 1:
@@ -29,7 +37,14 @@ def init_distributed() -> tuple[int, int, int]:
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
+        dist.init_process_group(
+            backend="nccl" if torch.cuda.is_available() else "gloo",
+            timeout=timedelta(hours=6),  # tolerate long, skewed generation between collectives
+        )
+    # Warm up the communicator NOW, while ranks are synchronized.
+    warm = torch.zeros(1, device=f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    dist.all_reduce(warm)
+    dist.barrier()
     return dist.get_rank(), dist.get_world_size(), local_rank
 
 
