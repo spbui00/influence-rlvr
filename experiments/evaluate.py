@@ -101,9 +101,9 @@ def _vllm_generate_answers(tokenizer, questions: list[str], cfg: ExperimentConfi
 @torch.inference_mode()
 def generate_answers(model, tokenizer, questions: list[str], cfg: ExperimentConfig,
                      device, batch_size: int = 8, max_new_tokens: int | None = None,
-                     vllm_adapter: str | None = None) -> list[str]:
+                     *, vllm: bool = False, vllm_adapter: str | None = None) -> list[str]:
     max_new_tokens = max_new_tokens or cfg.eval_max_new_tokens
-    if vllm_adapter is not None:
+    if vllm:  # vllm_adapter=None → base model (no adapter); a path → base+adapter
         return _vllm_generate_answers(tokenizer, questions, cfg, device, max_new_tokens, vllm_adapter)
     responses: list[str] = []
     for start in range(0, len(questions), batch_size):
@@ -132,7 +132,7 @@ def generate_answers(model, tokenizer, questions: list[str], cfg: ExperimentConf
 
 def score_examples(examples: list[dict], model, tokenizer, cfg: ExperimentConfig,
                    device, *, max_new_tokens: int | None = None,
-                   vllm_adapter: str | None = None) -> dict:
+                   vllm: bool = False, vllm_adapter: str | None = None) -> dict:
     """Generate + verifier-score a list of {question, solution, category} rows.
 
     Shared by the post-hoc benchmark eval and the in-training LiveEvalCallback.
@@ -143,7 +143,8 @@ def score_examples(examples: list[dict], model, tokenizer, cfg: ExperimentConfig
     questions = [e["question"] for e in examples]
     golds = [e["solution"] for e in examples]
     responses = generate_answers(model, tokenizer, questions, cfg, device,
-                                 max_new_tokens=max_new_tokens, vllm_adapter=vllm_adapter)
+                                 max_new_tokens=max_new_tokens, vllm=vllm,
+                                 vllm_adapter=vllm_adapter)
     students = [_student_answer(r) for r in responses]
     rewards = get_verifier_from_config(cfg).verify_batch(questions, golds, students)
 
@@ -160,11 +161,12 @@ def score_examples(examples: list[dict], model, tokenizer, cfg: ExperimentConfig
 
 
 def evaluate_benchmark(name: str, cfg: ExperimentConfig, model, tokenizer, device,
-                       vllm_adapter: str | None = None) -> dict:
+                       vllm: bool = False, vllm_adapter: str | None = None) -> dict:
     examples = load_eval_benchmark(name, cfg, cfg.eval_max_examples)
     print(f"  [{name}] generating {len(examples)} completions"
-          f"{' (vLLM)' if vllm_adapter else ''}...")
-    res = score_examples(examples, model, tokenizer, cfg, device, vllm_adapter=vllm_adapter)
+          f"{' (vLLM)' if vllm else ''}...")
+    res = score_examples(examples, model, tokenizer, cfg, device,
+                         vllm=vllm, vllm_adapter=vllm_adapter)
     print(f"  [{name}] accuracy = {res['accuracy']:.4f} (n={res['n']})")
     return {
         "benchmark": name,
@@ -235,7 +237,7 @@ def main(argv: list[str] | None = None) -> None:
     t0 = time.time()
     for name in benchmarks:
         results[name] = evaluate_benchmark(name, cfg, model, tokenizer, device,
-                                           vllm_adapter=vllm_adapter)
+                                           vllm=args.vllm, vllm_adapter=vllm_adapter)
 
     summary = {
         "run_name": cfg.run_name,
