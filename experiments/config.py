@@ -89,9 +89,11 @@ class ExperimentConfig:
     # keep "webinstruct_test" in eval_benchmarks with this on (it would leak).
     if_target_full_test: bool = False
     # Where the IF target comes from: "webinstruct" (held-out WebInstruct test
-    # partition) or "mmlu_cs" (held-out half of MMLU-CS — SAME distribution as the
-    # mmlu_cs eval, so the influence steers toward what we measure). Training pool
-    # is always WebInstruct (the cross-domain candidate set).
+    # partition), "mmlu_cs" (held-out half of MMLU-CS), or "mmlu_pro_cs" (held-out
+    # half of MMLU-Pro CS — harder, 10-option, more eval headroom). The MMLU(-Pro)
+    # options are the SAME distribution as their matching eval, so the influence
+    # steers toward what we measure. Training pool is always WebInstruct (the
+    # cross-domain candidate set).
     if_target_source: str = "webinstruct"
     max_prompt_length: int = 1024
 
@@ -231,9 +233,10 @@ class ExperimentConfig:
                     f"if_recompute_every ({self.if_recompute_every}) must be a "
                     f"multiple of save_steps ({self.save_steps})."
                 )
-        if self.if_target_source not in ("webinstruct", "mmlu_cs"):
+        if self.if_target_source not in ("webinstruct", "mmlu_cs", "mmlu_pro_cs"):
             raise ValueError(
-                f"if_target_source must be webinstruct|mmlu_cs, got {self.if_target_source!r}"
+                f"if_target_source must be webinstruct|mmlu_cs|mmlu_pro_cs, "
+                f"got {self.if_target_source!r}"
             )
         if self.if_method not in ("cg", "cg-empirical", "fisher", "dot"):
             raise ValueError(

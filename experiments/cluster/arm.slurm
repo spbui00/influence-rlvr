@@ -29,16 +29,20 @@ ARM_ARGS="${ARM_ARGS:?set ARM_ARGS}"
 # Shared experiment config — identical across all arms so the ONLY difference is
 # the arm (regime/selection/if-method). DYNAMIC pruning: warm up to step 40, then
 # re-score the pool and re-rank every 20 steps (triggers at 40/60/80) so the
-# selection adapts to the evolving policy. CS target+eval, validated influence
-# settings (if_g_train 8, 1024 tok, normalized Fisher, lambda 0.5, micro 1, B 4).
-COMMON="--if-target-source mmlu_cs --eval-benchmarks mmlu_cs,gsm8k,math500 \
-    --live-eval-benchmark mmlu_cs --n-train-pool 96 --n-if-target 16 \
+# selection adapts to the evolving policy.
+#   - Target + eval = MMLU-Pro CS (10-option, reasoning-heavy → real headroom vs
+#     the saturated MMLU-CS). gsm8k kept as a math specificity control.
+#   - n_if_target 32 (richer target → less noisy H); live-eval on 128 (the n=32
+#     curve was pure noise). Validated influence settings (if_g_train 8, 1024 tok,
+#     normalized Fisher, lambda 0.5, micro 1, B 4).
+COMMON="--if-target-source mmlu_pro_cs --eval-benchmarks mmlu_pro_cs,gsm8k \
+    --live-eval-benchmark mmlu_pro_cs --n-train-pool 96 --n-if-target 32 \
     --max-steps 100 --prune-step 40 --if-recompute-every 20 --save-steps 20 \
     --g-train 4 --per-device-batch 8 --grad-accum 1 --max-completion-length 1024 \
     --if-g-train 8 --if-max-new-tokens 1024 --cg-fisher-examples 8 --cg-fisher-g 2 \
     --cg-fisher-max-tokens 128 --cg-iters 50 --lambda-damp 0.5 \
     --if-logps-micro-batch 1 --if-score-batch 4 \
-    --live-eval-examples 32 --eval-max-examples 200"
+    --live-eval-examples 128 --eval-max-examples 200"
 
 echo "================ TRAIN ($RUN_NAME) ================"
 echo "arm: $ARM_ARGS"
