@@ -462,8 +462,11 @@ def _vllm_generate_rollout_batch(
     batch_size = int(prompt_ids.shape[0])
     prompts_list = []
     for b in range(batch_size):
-        n = int(prompt_attention_mask[b].sum().item())
-        prompts_list.append(prompt_ids[b, :n].detach().cpu().tolist())
+        # Gather only the attended tokens by mask — correct for LEFT or right
+        # padding. (Slicing [:n] assumed right-padding and fed leading pad tokens
+        # to vLLM on left-padded batches → corrupted prompts.)
+        mask = prompt_attention_mask[b].bool()
+        prompts_list.append(prompt_ids[b][mask].detach().cpu().tolist())
 
     outputs = _call_vllm_generate(
         engine,
