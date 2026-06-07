@@ -59,7 +59,6 @@ from .trajectory import (
     collect_train_infos,
     collect_checkpoint_infos,
 )
-from .training import HistoricalBatchGRPOTrainer
 from .lds import (
     LDSResult,
     ExtremesRow,
@@ -144,7 +143,6 @@ __all__ = [
     "taco_execution_reward_func",
     "taco_execution_rewards_and_codes",
     "collect_reward_infos",
-    "HistoricalBatchGRPOTrainer",
     "AutoregressiveLogisticRegression",
     "ToyGRPOExample",
     "ToyHistoricalInfluenceSummary",
