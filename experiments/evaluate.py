@@ -71,7 +71,7 @@ def load_base_policy(cfg: ExperimentConfig, device):
 
 
 def _vllm_generate_answers(tokenizer, questions: list[str], cfg: ExperimentConfig, device,
-                           max_new_tokens: int, adapter_path: str) -> list[str]:
+                           max_new_tokens: int, adapter_path: str | None) -> list[str]:
     """Batched greedy generation via vLLM (one engine, standalone process — safe).
 
     Reuses the SAME tested vLLM path as training (`generate_rollout_batch`), loading
