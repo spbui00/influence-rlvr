@@ -56,10 +56,41 @@ def load_policy(cfg: ExperimentConfig, checkpoint_dir: Path, device):
     return model, tokenizer
 
 
+def _vllm_generate_answers(tokenizer, questions: list[str], cfg: ExperimentConfig, device,
+                           max_new_tokens: int, adapter_path: str) -> list[str]:
+    """Batched greedy generation via vLLM (one engine, standalone process — safe).
+
+    Reuses the SAME tested vLLM path as training (`generate_rollout_batch`), loading
+    the base model + the checkpoint's LoRA adapter. vLLM's continuous batching does
+    all prompts at once → ~5× over HF. The HF policy model is NOT loaded in this mode.
+    """
+    from influence_rlvr.generation import generate_rollout_batch
+    from influence_rlvr.modes import GenerationBackend, VLLMConfig
+
+    chats = [build_reasoning_prompt(q) for q in questions]
+    prompts = [tokenizer.apply_chat_template(c, tokenize=False, add_generation_prompt=True)
+               for c in chats]
+    enc = tokenizer(prompts, return_tensors="pt", padding=True,
+                    truncation=True, max_length=cfg.max_prompt_length).to(device)
+    do_sample = bool(cfg.eval_temperature and cfg.eval_temperature > 0)
+    vcfg = VLLMConfig(gpu_memory_utilization=cfg.vllm_gpu_memory_utilization,
+                      max_model_len=cfg.vllm_max_model_len, max_lora_rank=cfg.lora_r)
+    rollout = generate_rollout_batch(
+        None, tokenizer, enc["input_ids"], enc["attention_mask"],
+        backend=GenerationBackend.VLLM, num_samples=1, max_new_tokens=max_new_tokens,
+        do_sample=do_sample, temperature=(cfg.eval_temperature or 0.0), top_p=cfg.eval_top_p,
+        vllm_config=vcfg, adapter_path=adapter_path, model_id=cfg.model_id,
+    )
+    return list(rollout.texts)
+
+
 @torch.inference_mode()
 def generate_answers(model, tokenizer, questions: list[str], cfg: ExperimentConfig,
-                     device, batch_size: int = 8, max_new_tokens: int | None = None) -> list[str]:
+                     device, batch_size: int = 8, max_new_tokens: int | None = None,
+                     vllm_adapter: str | None = None) -> list[str]:
     max_new_tokens = max_new_tokens or cfg.eval_max_new_tokens
+    if vllm_adapter is not None:
+        return _vllm_generate_answers(tokenizer, questions, cfg, device, max_new_tokens, vllm_adapter)
     responses: list[str] = []
     for start in range(0, len(questions), batch_size):
         batch = questions[start:start + batch_size]
@@ -86,15 +117,19 @@ def generate_answers(model, tokenizer, questions: list[str], cfg: ExperimentConf
 
 
 def score_examples(examples: list[dict], model, tokenizer, cfg: ExperimentConfig,
-                   device, *, max_new_tokens: int | None = None) -> dict:
+                   device, *, max_new_tokens: int | None = None,
+                   vllm_adapter: str | None = None) -> dict:
     """Generate + verifier-score a list of {question, solution, category} rows.
 
     Shared by the post-hoc benchmark eval and the in-training LiveEvalCallback.
+    `vllm_adapter` (a checkpoint path) routes generation through vLLM — only valid
+    for the standalone eval, NOT the in-training callback (that shares the trainer's
+    process/engine).
     """
     questions = [e["question"] for e in examples]
     golds = [e["solution"] for e in examples]
     responses = generate_answers(model, tokenizer, questions, cfg, device,
-                                 max_new_tokens=max_new_tokens)
+                                 max_new_tokens=max_new_tokens, vllm_adapter=vllm_adapter)
     students = [_student_answer(r) for r in responses]
     rewards = get_verifier_from_config(cfg).verify_batch(questions, golds, students)
 
@@ -110,10 +145,12 @@ def score_examples(examples: list[dict], model, tokenizer, cfg: ExperimentConfig
     }
 
 
-def evaluate_benchmark(name: str, cfg: ExperimentConfig, model, tokenizer, device) -> dict:
+def evaluate_benchmark(name: str, cfg: ExperimentConfig, model, tokenizer, device,
+                       vllm_adapter: str | None = None) -> dict:
     examples = load_eval_benchmark(name, cfg, cfg.eval_max_examples)
-    print(f"  [{name}] generating {len(examples)} completions...")
-    res = score_examples(examples, model, tokenizer, cfg, device)
+    print(f"  [{name}] generating {len(examples)} completions"
+          f"{' (vLLM)' if vllm_adapter else ''}...")
+    res = score_examples(examples, model, tokenizer, cfg, device, vllm_adapter=vllm_adapter)
     print(f"  [{name}] accuracy = {res['accuracy']:.4f} (n={res['n']})")
     return {
         "benchmark": name,
@@ -136,6 +173,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--benchmarks", default=None,
                    help="Comma-separated; defaults to config.eval_benchmarks.")
     p.add_argument("--eval-max-examples", type=int, default=None)
+    p.add_argument("--vllm", action="store_true",
+                   help="Generate with vLLM (~5× faster). Standalone eval only — "
+                        "loads base+adapter in a vLLM engine; skips the HF policy.")
     args = p.parse_args(argv)
 
     run_dir = Path(args.output_root).expanduser().resolve() / args.run_name
@@ -150,13 +190,26 @@ def main(argv: list[str] | None = None) -> None:
     device = detect_device()
     ckpt = _resolve_checkpoint(cfg, args.checkpoint_step)
     step = checkpoint_step(str(ckpt))
-    print(f"Evaluating {cfg.run_name} @ checkpoint-{step} on {list(benchmarks)}")
-    model, tokenizer = load_policy(cfg, ckpt, device)
+    print(f"Evaluating {cfg.run_name} @ checkpoint-{step} on {list(benchmarks)}"
+          f"{' [vLLM]' if args.vllm else ''}")
+
+    if args.vllm:
+        # vLLM loads base+adapter itself; skip the HF policy (saves the GPU room the
+        # engine + verifier need). Only the tokenizer is loaded here.
+        tokenizer = AutoTokenizer.from_pretrained(cfg.model_id)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left"
+        model, vllm_adapter = None, str(ckpt)
+    else:
+        model, tokenizer = load_policy(cfg, ckpt, device)
+        vllm_adapter = None
 
     results = {}
     t0 = time.time()
     for name in benchmarks:
-        results[name] = evaluate_benchmark(name, cfg, model, tokenizer, device)
+        results[name] = evaluate_benchmark(name, cfg, model, tokenizer, device,
+                                           vllm_adapter=vllm_adapter)
 
     summary = {
         "run_name": cfg.run_name,
