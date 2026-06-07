@@ -44,14 +44,28 @@ def _resolve_checkpoint(cfg: ExperimentConfig, step_spec: str) -> Path:
     raise FileNotFoundError(f"No checkpoint-{target} under {out}.")
 
 
-def load_policy(cfg: ExperimentConfig, checkpoint_dir: Path, device):
+def _load_tokenizer(cfg: ExperimentConfig):
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_id)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
+    return tokenizer
+
+
+def load_policy(cfg: ExperimentConfig, checkpoint_dir: Path, device):
+    tokenizer = _load_tokenizer(cfg)
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     base = AutoModelForCausalLM.from_pretrained(cfg.model_id, dtype=dtype).to(device)
     model = PeftModel.from_pretrained(base, str(checkpoint_dir)).to(device)
+    model.eval()
+    return model, tokenizer
+
+
+def load_base_policy(cfg: ExperimentConfig, device):
+    """The base model with NO LoRA adapter — for base-model headroom checks."""
+    tokenizer = _load_tokenizer(cfg)
+    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    model = AutoModelForCausalLM.from_pretrained(cfg.model_id, dtype=dtype).to(device)
     model.eval()
     return model, tokenizer
 
@@ -176,10 +190,17 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--vllm", action="store_true",
                    help="Generate with vLLM (~5× faster). Standalone eval only — "
                         "loads base+adapter in a vLLM engine; skips the HF policy.")
+    p.add_argument("--base", action="store_true",
+                   help="Eval the BASE model (no LoRA adapter) — for headroom checks.")
+    p.add_argument("--model-id", default=None,
+                   help="Override cfg.model_id (e.g. Qwen/Qwen3-1.7B) — pair with --base "
+                        "to headroom-check a different base without a trained run.")
     args = p.parse_args(argv)
 
     run_dir = Path(args.output_root).expanduser().resolve() / args.run_name
     cfg = ExperimentConfig.load(run_dir / "config.json")
+    if args.model_id:
+        cfg.model_id = args.model_id
     if args.eval_max_examples is not None:
         cfg.eval_max_examples = args.eval_max_examples
     benchmarks = (
@@ -188,21 +209,26 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     device = detect_device()
-    ckpt = _resolve_checkpoint(cfg, args.checkpoint_step)
-    step = checkpoint_step(str(ckpt))
-    print(f"Evaluating {cfg.run_name} @ checkpoint-{step} on {list(benchmarks)}"
-          f"{' [vLLM]' if args.vllm else ''}")
+    if args.base:
+        step = "base"
+        ckpt = None
+        print(f"Evaluating {cfg.model_id} BASE (no adapter) on {list(benchmarks)}"
+              f"{' [vLLM]' if args.vllm else ''}")
+    else:
+        ckpt = _resolve_checkpoint(cfg, args.checkpoint_step)
+        step = checkpoint_step(str(ckpt))
+        print(f"Evaluating {cfg.run_name} @ checkpoint-{step} on {list(benchmarks)}"
+              f"{' [vLLM]' if args.vllm else ''}")
 
     if args.vllm:
-        # vLLM loads base+adapter itself; skip the HF policy (saves the GPU room the
-        # engine + verifier need). Only the tokenizer is loaded here.
-        tokenizer = AutoTokenizer.from_pretrained(cfg.model_id)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.padding_side = "left"
-        model, vllm_adapter = None, str(ckpt)
+        # vLLM loads base(+adapter) itself; skip the HF policy (saves GPU room for the
+        # engine + verifier). Only the tokenizer is loaded here.
+        tokenizer = _load_tokenizer(cfg)
+        model = None
+        vllm_adapter = None if args.base else str(ckpt)
     else:
-        model, tokenizer = load_policy(cfg, ckpt, device)
+        model, tokenizer = (load_base_policy(cfg, device) if args.base
+                            else load_policy(cfg, ckpt, device))
         vllm_adapter = None
 
     results = {}
