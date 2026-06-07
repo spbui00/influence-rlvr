@@ -9,6 +9,7 @@ import torch
 
 from influence_rlvr import CGInfluence
 from influence_rlvr.attribution.cg import policy_fisher_fvp_from_grad_cache
+from influence_rlvr.preconditioner import load_adam_preconditioner_from_checkpoint
 from influence_rlvr.fisher_fvp import FisherRow, build_policy_fisher_fvp
 from influence_rlvr.generation import generate_rollout_batch
 from influence_rlvr.gradients import (
@@ -186,18 +187,48 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
     main = rank == 0
     D = int(sum(p.numel() for p in model.parameters() if p.requires_grad))
 
-    # "dot" = first-order TracIn influence: h = g_test (no Fisher, no solve). The
-    # Fisher FVP/CG is needed ONLY to turn g_test into h; for dot we skip it
-    # entirely and set H = the raw target gradients.
-    use_fisher = cfg.if_method != "dot"
+    # First-order TracIn influence skips the Fisher/CG solve and sets h directly:
+    #   "dot"         → h = g_test           (plain gradient dot product)
+    #   "tracin-adam" → h = P_adam ⊙ g_test  (Adam-preconditioned dot: the faithful
+    #                   first-order effect of one AdamW step, with the diagonal
+    #                   P_d = 1/(√v̂_d+ε) read from this checkpoint's optimizer.pt)
+    # The Fisher FVP/CG is needed ONLY to turn g_test into h; both first-order
+    # methods skip it and stream the (optionally preconditioned) target gradients.
+    # These are the streaming analogs of attribution.TracInInfluence /
+    # TracInAdamInfluence (which stack the whole pool at once): we fold P into h
+    # once per target and stream g_train one batch at a time to bound memory.
+    use_fisher = cfg.if_method not in ("dot", "tracin-adam")
+    use_adam = cfg.if_method == "tracin-adam"
     if use_fisher:
         fvp = make_fvp()
         cg = CGInfluence(fvp_fn=fvp, lambda_damp=cfg.lambda_damp,
                          cg_iters=cfg.cg_iters, cg_tol=cfg.cg_tol)
 
+    precond = None
+    if use_adam:
+        ckpt_dir = cfg.grpo_output_dir / f"checkpoint-{checkpoint_step}"
+        eps = cfg.tracin_adam_eps if cfg.tracin_adam_eps and cfg.tracin_adam_eps > 0 else None
+        precond = load_adam_preconditioner_from_checkpoint(
+            model, ckpt_dir, device=device, eps=eps)
+        if precond is None and main:
+            print(f"  [tracin-adam] WARNING: no optimizer.pt under {ckpt_dir}; "
+                  f"falling back to un-preconditioned dot product.")
+        elif precond is not None and main:
+            # Log P's dynamic range: a very large max (dormant coords, v̂≈0) can
+            # dominate the influence dot → raise --tracin-adam-eps if ρ is noisy.
+            print(f"  [tracin-adam] Adam diagonal preconditioner loaded "
+                  f"(D={precond.numel()}) from {ckpt_dir.name}/optimizer.pt; "
+                  f"P-range [{precond.min():.2e}, median {precond.median():.2e}, "
+                  f"{precond.max():.2e}]" + (f", eps={eps:g}" if eps else ""))
+
     n_target = len(target_set)
     if main:
-        what = "solving (F+λI)h = g_test" if use_fisher else "h = g_test (dot-product)"
+        if use_fisher:
+            what = "solving (F+λI)h = g_test"
+        elif precond is not None:
+            what = "h = P_adam ⊙ g_test (Adam-preconditioned dot)"
+        else:
+            what = "h = g_test (dot-product)"
         print(f"  CG: {what} for {n_target} targets (batch={B}, world={world})...")
     H = torch.zeros(n_target, D, device=device, dtype=torch.float32)
     info: dict = {"status": "?", "n_iters": 0, "final_residual": float("nan")}
@@ -213,6 +244,8 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
         for j, g_test in zip(tids, grads):
             if use_fisher:
                 h, info = cg.solve(g_test.to(device))
+            elif precond is not None:
+                h = g_test.to(device) * precond  # Adam-preconditioned dot
             else:
                 h = g_test.to(device)  # dot-product: h = g_test
             H[j] = h.to(H.dtype)
@@ -220,6 +253,7 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
             print(f"    target {min(c + B, len(my_targets))}/{len(my_targets)} (rank0): "
                   f"CG {info['status']} in {info['n_iters']} iters "
                   f"(resid={info['final_residual']})")
+    precond = None  # free the D-vector before the memory-heavy scoring backward
     all_reduce_sum_(H)  # each rank filled disjoint rows → SUM assembles full H
 
     # Release the FVP + flush the CG double-backward graphs before the (memory-heavy,
@@ -302,10 +336,11 @@ def compute_cg_pool_influence(
         def make_fvp():
             return _build_empirical_fvp(cfg, model, tokenizer, train_pool, device, backend, vllm_cfg)
         tag = "cg_empirical"
-    else:  # "cg" — true analytic per-token Fisher
+    else:  # "cg" (true analytic per-token Fisher) or a first-order method (dot /
+           # tracin-adam) that ignores make_fvp entirely — tag names the artifacts.
         def make_fvp():
             return _build_true_fisher_fvp(cfg, model, tokenizer, train_pool, device, backend, vllm_cfg)
-        tag = "cg"
+        tag = {"dot": "dot", "tracin-adam": "tracin_adam"}.get(cfg.if_method, "cg")
 
     return _run_cg(
         cfg, model, tokenizer, train_pool, target_set, device, make_fvp,

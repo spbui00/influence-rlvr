@@ -2,6 +2,7 @@ from .attribution import (
     BaseInfluenceMethod,
     InfluenceCalculator,
     TracInInfluence,
+    TracInAdamInfluence,
     DataInfInfluence,
     TrajectoryTracInInfluence,
     TrajectoryDataInfInfluence,
@@ -12,6 +13,10 @@ from .attribution import (
 )
 from .attribution.cg import policy_fisher_fvp_from_grad_cache
 from .fisher_fvp import FisherRow, build_policy_fisher_fvp
+from .preconditioner import (
+    adam_diagonal_preconditioner,
+    load_adam_preconditioner_from_checkpoint,
+)
 from .gradients import (
     compute_policy_gradient_bundle,
     compute_policy_gradient_bundle_batch,
@@ -93,6 +98,7 @@ __all__ = [
     "BaseInfluenceMethod",
     "InfluenceCalculator",
     "TracInInfluence",
+    "TracInAdamInfluence",
     "DataInfInfluence",
     "MeanScoreFisherInfluence",
     "TrueFisherInfluence",
@@ -103,6 +109,8 @@ __all__ = [
     "policy_fisher_fvp_from_grad_cache",
     "FisherRow",
     "build_policy_fisher_fvp",
+    "adam_diagonal_preconditioner",
+    "load_adam_preconditioner_from_checkpoint",
     "InfluenceMode",
     "ExperimentMode",
     "GenerationBackend",

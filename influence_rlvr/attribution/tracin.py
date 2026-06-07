@@ -1,3 +1,5 @@
+from typing import Sequence
+
 import numpy as np
 import torch
 
@@ -75,6 +77,84 @@ class TracInInfluence(BaseInfluenceMethod):
             g_train = g_train / (g_train.norm() + 1e-12)
         weight = float(train_info.get("historical_weight", 1.0))
         return (self.learning_rate * weight * torch.dot(g_test, g_train)).item()
+
+
+class TracInAdamInfluence(BaseInfluenceMethod):
+    """
+    Adam-preconditioned first-order (TracIn) influence.
+
+    Plain TracIn scores g_test · g_train — the first-order effect of one *SGD*
+    step on a train example. Real training uses Adam, whose update rescales each
+    coordinate by the diagonal P_d = 1/(√v̂_d + ε), with v̂ Adam's bias-corrected
+    second moment. The faithful first-order effect of one *AdamW* step is therefore
+    a diagonally-preconditioned dot product:
+
+        IF(train → test) = lr · g_test · (P ⊙ g_train) = lr · (P ⊙ g_test) · g_train,
+
+    (P is diagonal, so it may be folded into either side). Build P from a
+    checkpoint's optimizer state with
+    `influence_rlvr.preconditioner.adam_diagonal_preconditioner` /
+    `load_adam_preconditioner_from_checkpoint`; it must be a flat D-vector in the
+    SAME parameter order as test_info["grad"]/train_info["grad"].
+
+    Sign convention matches `TracInInfluence`: helpful-positive (P > 0 elementwise,
+    so it only rescales per-coordinate magnitudes, never flips a score's sign).
+
+    When `normalize=True`, gradients are L2-normalized before the preconditioned
+    dot (a "preconditioned cosine"); the global learning rate is then just an
+    overall scale and is irrelevant to ranking.
+
+    Required keys: test_info["grad"], train_info["grad"].
+    """
+
+    def __init__(self, preconditioner: torch.Tensor, learning_rate: float = 1.0,
+                 normalize: bool = False):
+        self.preconditioner = preconditioner.detach().to(dtype=torch.float32)
+        self.learning_rate = float(learning_rate)
+        self.normalize = bool(normalize)
+
+    def _precond_on(self, like: torch.Tensor) -> torch.Tensor:
+        if self.preconditioner.numel() != like.numel():
+            raise ValueError(
+                f"preconditioner has {self.preconditioner.numel()} entries but "
+                f"gradients have {like.numel()}; build P in the same "
+                f"trainable-parameter order as the gradients."
+            )
+        if self.preconditioner.device != like.device:
+            self.preconditioner = self.preconditioner.to(like.device)
+        return self.preconditioner
+
+    def compute_score(self, test_info: dict, train_info: dict) -> float:
+        g_test = test_info["grad"].to(dtype=torch.float32)
+        g_train = train_info["grad"].to(dtype=torch.float32, device=g_test.device)
+        P = self._precond_on(g_test)
+        if self.normalize:
+            g_test = g_test / (g_test.norm() + 1e-12)
+            g_train = g_train / (g_train.norm() + 1e-12)
+        weight = float(train_info.get("historical_weight", 1.0))
+        return (self.learning_rate * weight * torch.dot(g_test, P * g_train)).item()
+
+    def compute_all_scores(self, test_info: dict, train_infos: Sequence[dict]) -> np.ndarray:
+        n = len(train_infos)
+        if n == 0:
+            return np.zeros(0, dtype=np.float32)
+        g_test = test_info["grad"].to(dtype=torch.float32)
+        P = self._precond_on(g_test)
+        if self.normalize:
+            g_test = g_test / (g_test.norm() + 1e-12)
+        # Fold the diagonal into the test side once, then one matmul over the pool.
+        h = P * g_test
+        G = torch.stack([
+            ti["grad"].to(dtype=torch.float32, device=g_test.device) for ti in train_infos
+        ])
+        if self.normalize:
+            G = G / (G.norm(dim=1, keepdim=True) + 1e-12)
+        weights = torch.tensor(
+            [float(ti.get("historical_weight", 1.0)) for ti in train_infos],
+            dtype=torch.float32, device=g_test.device,
+        )
+        scores = self.learning_rate * weights * (G @ h)
+        return scores.detach().cpu().numpy().astype(np.float32, copy=False)
 
 
 class TrajectoryTracInInfluence:

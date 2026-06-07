@@ -1,5 +1,5 @@
 from .base import BaseInfluenceMethod, InfluenceCalculator
-from .tracin import TracInInfluence, TrajectoryTracInInfluence
+from .tracin import TracInInfluence, TracInAdamInfluence, TrajectoryTracInInfluence
 from .datainf import DataInfInfluence, TrajectoryDataInfInfluence
 from .fisher import (
     MeanScoreFisherInfluence,
@@ -12,6 +12,7 @@ __all__ = [
     "BaseInfluenceMethod",
     "InfluenceCalculator",
     "TracInInfluence",
+    "TracInAdamInfluence",
     "DataInfInfluence",
     "MeanScoreFisherInfluence",
     "TrueFisherInfluence",

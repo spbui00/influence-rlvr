@@ -146,7 +146,19 @@ class ExperimentConfig:
     #                  (rank ≤ N·G). Cheaper, coarser; good for ablation/compare.
     # "fisher"       — damped "outer-of-means" inverse, closed-form Woodbury
     #                  (rank ≤ N). Cheapest; for fast smoke runs.
+    # "dot"          — first-order TracIn: IF = g_train·g_test (no Fisher/solve).
+    # "tracin-adam"  — first-order TracIn preconditioned by Adam's diagonal,
+    #                  IF = g_train·(P⊙g_test), P_d=1/(√v̂_d+ε) read from the
+    #                  checkpoint's optimizer.pt. The faithful first-order effect
+    #                  of one *AdamW* step (what training actually does), not SGD.
+    #                  No λ/CG → nothing to converge; skips the Fisher entirely.
     if_method: str = "cg"
+    # tracin-adam only: override Adam's optimization ε (≈1e-8) with a larger floor
+    # on the preconditioner denominator 1/(√v̂+ε). 0 = use the optimizer's own ε
+    # (faithful). Raise it (e.g. 1e-4) if dormant-coordinate P-spikes make the
+    # influence ranking noisy — check the [tracin-adam] P-range log + seed-to-seed
+    # ρ. Ignored by every other if_method.
+    tracin_adam_eps: float = 0.0
     lambda_damp: float = 0.1
     cg_iters: int = 50
     cg_tol: float = 1e-6
@@ -238,9 +250,10 @@ class ExperimentConfig:
                 f"if_target_source must be webinstruct|mmlu_cs|mmlu_pro_cs, "
                 f"got {self.if_target_source!r}"
             )
-        if self.if_method not in ("cg", "cg-empirical", "fisher", "dot"):
+        if self.if_method not in ("cg", "cg-empirical", "fisher", "dot", "tracin-adam"):
             raise ValueError(
-                f"if_method must be cg|cg-empirical|fisher, got {self.if_method!r}"
+                f"if_method must be cg|cg-empirical|fisher|dot|tracin-adam, "
+                f"got {self.if_method!r}"
             )
 
     # ── Derived paths ───────────────────────────────────────────────────────
