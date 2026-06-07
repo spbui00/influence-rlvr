@@ -7,6 +7,13 @@
 #   RUN_NAME=exp_ifg_dot     SEED=42 ARM_ARGS="--regime if_prune --selection if-guided --if-method dot" sbatch experiments/cluster/arm.slurm
 #   RUN_NAME=exp_anti_dot    SEED=42 ARM_ARGS="--regime if_prune --selection anti-if  --if-method dot" sbatch experiments/cluster/arm.slurm
 #   RUN_NAME=exp_ifg_cg      SEED=42 ARM_ARGS="--regime if_prune --selection if-guided --if-method cg"  sbatch experiments/cluster/arm.slurm
+#   RUN_NAME=exp_ifg_tadam   SEED=42 ARM_ARGS="--regime if_prune --selection if-guided --if-method tracin-adam" sbatch experiments/cluster/arm.slurm
+#
+# tracin-adam = first-order TracIn preconditioned by Adam's diagonal 1/(√v̂+ε),
+# read from the prune checkpoint's optimizer.pt. No λ/CG (nothing to converge);
+# the faithful first-order effect of one AdamW step. Reuses the same target/pool
+# gradients as `dot`, so it's ~as cheap as the dot arm and cheaper than cg (no
+# Fisher build / CG solve). The CG-only flags in COMMON are simply ignored.
 #
 #   reward curve per run -> outputs/<RUN_NAME>/live_eval.csv
 #
@@ -53,7 +60,7 @@ srun python -m experiments.train --run-name "$RUN_NAME" --seed "$SEED" $COMMON $
 
 echo "================ EVAL ($RUN_NAME) ================"
 srun python -m experiments.evaluate --run-name "$RUN_NAME" --checkpoint-step latest \
-    --benchmarks mmlu_cs,gsm8k,math500 --eval-max-examples 200
+    --benchmarks mmlu_pro_cs,gsm8k --eval-max-examples 200 --vllm
 
 echo "================ DONE ================"
 echo "reward curve: outputs/$RUN_NAME/live_eval.csv"
