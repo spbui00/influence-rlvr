@@ -35,7 +35,10 @@ ARM_ARGS="${ARM_ARGS:?set ARM_ARGS}"
 #   - n_if_target 32 (richer target → less noisy H); live-eval on 128 (the n=32
 #     curve was pure noise). Validated influence settings (if_g_train 8, 1024 tok,
 #     normalized Fisher, lambda 0.5, micro 1, B 4).
-COMMON="--if-target-source mmlu_pro_cs --eval-benchmarks mmlu_pro_cs,gsm8k \
+# MODEL: override at submit, e.g. MODEL=Qwen/Qwen3-1.7B (smaller base = lower
+# baseline + more malleable → more room for a data-selection effect to show).
+COMMON="--model-id ${MODEL:-Qwen/Qwen3-4B} \
+    --if-target-source mmlu_pro_cs --eval-benchmarks mmlu_pro_cs,gsm8k \
     --live-eval-benchmark mmlu_pro_cs --n-train-pool 96 --n-if-target 32 \
     --max-steps 100 --prune-step 40 --if-recompute-every 20 --save-steps 20 \
     --g-train 4 --per-device-batch 8 --grad-accum 1 --max-completion-length 1024 \
