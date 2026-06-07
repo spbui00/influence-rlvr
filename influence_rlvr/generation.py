@@ -392,9 +392,8 @@ def _build_lora_request(adapter_path: str | Path | None):
         raise FileNotFoundError(f"vLLM adapter path does not exist: {adapter}")
     _, _, LoRARequest = _load_vllm_types()
     digest = hashlib.sha256(str(adapter.resolve()).encode()).hexdigest()
-    request_id = int(digest[:12], 16)
-    if request_id <= 0:
-        request_id = 1
+    # vLLM's lora_int_id must fit in a signed int32; clamp the hash into that range.
+    request_id = (int(digest[:12], 16) % (2**31 - 1)) or 1
     return LoRARequest(
         lora_name=adapter.name,
         lora_int_id=request_id,
