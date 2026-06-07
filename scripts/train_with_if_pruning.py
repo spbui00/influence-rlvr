@@ -34,6 +34,7 @@ from lds_eval_toy_grpo import (  # noqa: E402
     ToyAutoregressiveMLP,
     compute_toy_cg_influence,
     compute_toy_dot_influence,
+    compute_toy_tracin_adam_influence,
     generate_clustered_dataset,
     generate_dataset,
 )
@@ -123,12 +124,16 @@ def compute_train_scores(
     cg_tol: float,
     beta: float,
     ref_model: nn.Module,
+    optimizer: torch.optim.Optimizer | None = None,
 ) -> np.ndarray:
     """
     Per-train aggregated IF score: mean of per-test influence across all test
     examples. `if_method` selects the influence operator:
-      - "cg"  : second-order, (F+λI)^{-1} g_test via CG+FVP (the policy Fisher).
-      - "dot" : first-order dot product g_train·g_test (TracIn-style, no Fisher).
+      - "cg"          : second-order, (F+λI)^{-1} g_test via CG+FVP (policy Fisher).
+      - "dot"         : first-order dot g_train·g_test (TracIn-style, SGD step).
+      - "tracin-adam" : first-order dot preconditioned by the LIVE Adam diagonal
+                        P=1/(√v̂+ε), i.e. g_train·(P⊙g_test) — the faithful
+                        first-order effect of one AdamW step (needs `optimizer`).
 
     Note: rebuilds the grad/prob caches once per test point — O(n_test) redundant
     builds per recompute. Cheap on toy; optimize at LLM scale by reusing the cache.
@@ -142,6 +147,17 @@ def compute_train_scores(
                 model,
                 train_examples=train_examples,
                 test_example=te,
+                beta=beta,
+                ref_model=ref_model,
+            )
+        elif if_method == "tracin-adam":
+            if optimizer is None:
+                raise ValueError("tracin-adam needs the live optimizer to read Adam's diagonal")
+            scores, _ = compute_toy_tracin_adam_influence(
+                model,
+                train_examples=train_examples,
+                test_example=te,
+                optimizer=optimizer,
                 beta=beta,
                 ref_model=ref_model,
             )
@@ -283,6 +299,7 @@ def run_regime(
                 cg_tol=args.cg_tol,
                 beta=args.beta,
                 ref_model=ref_model,
+                optimizer=optimizer,
             )
             last_scores = scores
             print(
@@ -465,8 +482,10 @@ def main():
     parser.add_argument("--regimes", type=str, default=",".join(REGIMES),
                         help=f"Comma-separated regimes to run. Choices: {REGIMES}")
     parser.add_argument("--if-methods", type=str, default="cg",
-                        help="Comma-separated influence methods for IF regimes (cg, dot). "
-                             "Pass 'cg,dot' to overlay both on the comparison plot.")
+                        help="Comma-separated influence methods for IF regimes "
+                             "(cg, dot, tracin-adam). Pass e.g. 'cg,dot,tracin-adam' "
+                             "to overlay all on the comparison plot. tracin-adam "
+                             "requires Adam (not --no-adam).")
     parser.add_argument("--selection-policy", choices=list(SELECTION_POLICIES), default="top-k")
     parser.add_argument("--softmax-temperature", type=float, default=1.0)
     parser.add_argument("--if-recompute-mode", choices=["fixed", "log"], default="fixed")
@@ -491,8 +510,10 @@ def main():
 
     if_methods = [m.strip() for m in args.if_methods.split(",") if m.strip()]
     for m in if_methods:
-        if m not in ("cg", "dot"):
-            raise SystemExit(f"Unknown if-method: {m!r}. Choices: ('cg', 'dot')")
+        if m not in ("cg", "dot", "tracin-adam"):
+            raise SystemExit(f"Unknown if-method: {m!r}. Choices: ('cg', 'dot', 'tracin-adam')")
+    if "tracin-adam" in if_methods and args.no_adam:
+        raise SystemExit("tracin-adam needs the Adam optimizer; drop --no-adam.")
 
     train_examples, test_examples = build_datasets(args)
     print(f"Dataset: {args.dataset}, train={len(train_examples)}, test={len(test_examples)}")

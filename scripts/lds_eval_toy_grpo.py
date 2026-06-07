@@ -662,6 +662,57 @@ def compute_toy_dot_influence(
     return scores.cpu(), {"method": "dot", "n_train": len(train_infos)}
 
 
+def _toy_adam_preconditioner(optimizer, model, *, dtype=torch.float32) -> torch.Tensor:
+    """Flat P = 1/(√v̂+ε) over the model's trainable params, read from a LIVE Adam
+    optimizer's state. Same param order as `build_toy_policy_fisher_inputs` flattens
+    gradients (model.parameters() filtered to requires_grad). Params not yet stepped
+    (or SGD, which has no exp_avg_sq) get P=1 → tracin-adam degenerates to dot."""
+    group = optimizer.param_groups[0]
+    beta2 = float(group.get("betas", (0.9, 0.999))[1])
+    eps = float(group.get("eps", 1e-8))
+    parts: list[torch.Tensor] = []
+    for p in model.parameters():
+        if not p.requires_grad:
+            continue
+        st = optimizer.state.get(p, {})
+        v = st.get("exp_avg_sq")
+        if v is None:
+            parts.append(torch.ones(p.numel(), dtype=dtype))
+            continue
+        step = st.get("step")
+        t = float(step.item()) if torch.is_tensor(step) else float(step or 0)
+        bc2 = 1.0 - beta2 ** t if t > 0 else 1.0
+        v_hat = v.detach().to(dtype) / bc2
+        parts.append((1.0 / (v_hat.sqrt() + eps)).reshape(-1))
+    return torch.cat(parts)
+
+
+def compute_toy_tracin_adam_influence(
+    model: nn.Module,
+    train_examples: Sequence[ToyGRPOExample],
+    test_example: ToyGRPOExample,
+    optimizer: torch.optim.Optimizer,
+    beta: float = 0.0,
+    ref_model: nn.Module | None = None,
+) -> tuple[torch.Tensor, dict]:
+    """Adam-preconditioned first-order influence: IF = g_test · (P ⊙ g_train),
+    P = 1/(√v̂+ε) from the LIVE Adam optimizer. The faithful first-order effect of
+    one AdamW step (vs `dot`, which assumes an SGD step). Same gradients as `dot`."""
+    g_test, _gc, _pc, train_infos = build_toy_policy_fisher_inputs(
+        model, train_examples, test_example, beta=beta, ref_model=ref_model,
+    )
+    gt = g_test.detach().to(dtype=torch.float32)
+    P = _toy_adam_preconditioner(optimizer, model).to(gt.device)
+    if P.numel() != gt.numel():
+        raise ValueError(f"Adam preconditioner ({P.numel()}) != grad dim ({gt.numel()})")
+    h = P * gt  # fold the diagonal into the test side once
+    scores = torch.stack([
+        torch.dot(ti["grad"].detach().to(dtype=torch.float32, device=gt.device), h)
+        for ti in train_infos
+    ])
+    return scores.cpu(), {"method": "tracin-adam", "n_train": len(train_infos)}
+
+
 def compute_toy_true_fisher_influence(
     model: nn.Module,
     train_examples: Sequence[ToyGRPOExample],
