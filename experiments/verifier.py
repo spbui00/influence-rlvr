@@ -248,8 +248,8 @@ def _gr_score(extracted, gold, verdict, tokenizer, *,
       verifier correct (verdict >= 0.5)        -> +1 - length_penalty
       verifier wrong                           ->  0
     """
-    if extracted is None:
-        return -extraction_penalty
+    if extracted is None or not str(extracted).strip():
+        return -extraction_penalty   # empty \boxed{} is NOT a valid answer (reward-hack guard)
     if verdict >= 0.5:
         return 1.0 - _length_penalty(tokenizer, extracted, gold, length_coef, length_cap)
     return 0.0

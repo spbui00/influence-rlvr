@@ -237,19 +237,19 @@ def _normalize_symbolic_answer(text):
 def extract_math_final_answer(text):
     answer_region = _answer_region_after_think(text)
     boxed_answer = _extract_boxed_answer(answer_region)
-    if boxed_answer is not None:
+    if boxed_answer is not None and boxed_answer.strip():
         return boxed_answer.strip()
 
     boxed_answer = _extract_boxed_answer(text)
-    if boxed_answer is not None:
+    if boxed_answer is not None and boxed_answer.strip():
         return boxed_answer.strip()
 
     answer_tag = _extract_answer_tag(answer_region)
-    if answer_tag is not None:
+    if answer_tag:
         return answer_tag
 
     answer_tag = _extract_answer_tag(text)
-    if answer_tag is not None:
+    if answer_tag:
         return answer_tag
 
     stripped_region = answer_region.strip()
