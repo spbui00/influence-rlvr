@@ -149,6 +149,16 @@ class ExperimentConfig:
     # Run the verifier on a separate device if available (e.g. "cuda:1"); else
     # it shares the policy GPU. None -> auto.
     verifier_device: str | None = None
+    # Verifier generation backend. "hf" = in-process HF .generate() (shares the
+    # policy GPU; the whole batch stalls on the slowest "Final Decision:" — slow).
+    # "vllm" = query a standalone OpenAI-compatible vLLM server (continuous
+    # batching, ~10-20x faster). The verifier is a FIXED model, so the server needs
+    # NO weight sync — just `vllm serve <verifier> on its own GPU`. With "vllm" you
+    # can afford a high verifier_max_new_tokens (1024) so the verifier's reasoning
+    # isn't truncated before its decision line (512 silently mis-grades the tail).
+    verifier_backend: str = "hf"          # "hf" | "vllm"
+    verifier_server_host: str = "127.0.0.1"
+    verifier_server_port: int = 8100
 
     # ── Influence (IF) computation ──────────────────────────────────────────
     # "cg"           — true policy Fisher (analytic per-token softmax metric

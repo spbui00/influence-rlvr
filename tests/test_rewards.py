@@ -9,7 +9,7 @@ from influence_rlvr.rewards import (
     taco_execution_reward_func,
 )
 from influence_rlvr.taco_convert import tac_try_convert_row
-from experiments.verifier import _gr_score, _length_penalty
+from experiments.verifier import VLLMServerVerifier, _gr_score, _length_penalty
 
 
 class _WordTok:
@@ -149,6 +149,29 @@ class GeneralReasonerRewardTests(unittest.TestCase):
     def test_length_penalty_helper_unit_is_tokens(self):
         self.assertAlmostEqual(_length_penalty(self.TOK, "a b c", "a", 0.05, 10), 0.05 * 2)
         self.assertEqual(_length_penalty(self.TOK, "a b c", "a", 0.0, 10), 0.0)  # disabled
+
+
+class VLLMVerifierParseTests(unittest.TestCase):
+    """vLLM /v1/completions returns a `choices` array whose order is NOT
+    guaranteed; each choice carries its input `index`. Mis-mapping would silently
+    assign one rollout's verdict to another -> corrupt rewards."""
+
+    def test_decisions_are_remapped_by_index(self):
+        choices = [  # deliberately out of order
+            {"index": 2, "text": "the answers differ. Final Decision: No"},
+            {"index": 0, "text": "Final Decision: Yes"},
+            {"index": 1, "text": "equivalent. Final Decision: Yes"},
+        ]
+        self.assertEqual(
+            VLLMServerVerifier._decisions_from_choices(choices, 3), [1.0, 1.0, 0.0]
+        )
+
+    def test_missing_choice_defaults_to_zero(self):
+        # a dropped/empty choice -> no decision found -> 0.0 (not a false "Yes")
+        out = VLLMServerVerifier._decisions_from_choices(
+            [{"index": 0, "text": "Final Decision: Yes"}], 2
+        )
+        self.assertEqual(out, [1.0, 0.0])
 
 
 if __name__ == "__main__":

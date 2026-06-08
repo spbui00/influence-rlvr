@@ -31,6 +31,7 @@ from __future__ import annotations
 import re
 from functools import lru_cache
 
+import requests
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -132,6 +133,69 @@ class GeneralVerifier:
         return rewards
 
 
+class VLLMServerVerifier:
+    """Verifier backed by a standalone OpenAI-compatible vLLM server.
+
+    The general-verifier is a FIXED model (never updated during training), so it
+    serves trivially — `vllm serve TIGER-Lab/general-verifier` on its own GPU, no
+    weight sync. vLLM's continuous batching makes grading ~10-20x faster than the
+    in-process HF path (where the batch stalls on the slowest "Final Decision:"),
+    so we can run a high max_new_tokens without truncating the verifier's reasoning
+    before its decision line. Same interface as GeneralVerifier (incl. .tokenizer,
+    which the GR reward uses for the length penalty)."""
+
+    def __init__(self, model_id: str, *, host: str = "127.0.0.1", port: int = 8100,
+                 max_new_tokens: int = 1024, timeout: float = 600.0):
+        self.model_id = model_id
+        self.max_new_tokens = max_new_tokens
+        self.base_url = f"http://{host}:{port}/v1"
+        self.timeout = timeout
+        # tokenizer for chat-templating the prompts + token counting in the reward
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+    def _render(self, question: str, ground_truth: str, student_answer: str) -> str:
+        body = _VERIFIER_TEMPLATE.format(
+            question=question, ground_truth=ground_truth, student_answer=student_answer,
+        )
+        return self.tokenizer.apply_chat_template(
+            [{"role": "user", "content": body}],
+            tokenize=False, add_generation_prompt=True,
+        )
+
+    @staticmethod
+    def _decisions_from_choices(choices: list, n: int) -> list[float]:
+        """Map a vLLM /v1/completions `choices` array (each carries its input
+        `index`) back to per-prompt decisions, order-safe."""
+        texts = [""] * n
+        for c in choices:
+            i = int(c.get("index", 0))
+            if 0 <= i < n:
+                texts[i] = c.get("text", "") or ""
+        return [GeneralVerifier._parse_decision(t) for t in texts]
+
+    @torch.inference_mode()
+    def verify_batch(self, questions, ground_truths, student_answers) -> list[float]:
+        assert len(questions) == len(ground_truths) == len(student_answers)
+        if not questions:
+            return []
+        prompts = [
+            self._render(q, g, s)
+            for q, g, s in zip(questions, ground_truths, student_answers)
+        ]
+        resp = requests.post(
+            f"{self.base_url}/completions",
+            json={
+                "model": self.model_id, "prompt": prompts,
+                "max_tokens": self.max_new_tokens, "temperature": 0.0,
+            },
+            timeout=self.timeout,
+        )
+        resp.raise_for_status()
+        return self._decisions_from_choices(resp.json()["choices"], len(prompts))
+
+
 @lru_cache(maxsize=2)
 def get_verifier(model_id: str, device: str | None, max_new_tokens: int,
                  batch_size: int) -> GeneralVerifier:
@@ -140,7 +204,19 @@ def get_verifier(model_id: str, device: str | None, max_new_tokens: int,
     )
 
 
-def get_verifier_from_config(cfg: ExperimentConfig) -> GeneralVerifier:
+@lru_cache(maxsize=2)
+def get_vllm_verifier(model_id: str, host: str, port: int,
+                      max_new_tokens: int) -> VLLMServerVerifier:
+    return VLLMServerVerifier(model_id, host=host, port=port, max_new_tokens=max_new_tokens)
+
+
+def get_verifier_from_config(cfg: ExperimentConfig):
+    """Return the configured verifier (HF in-process, or the vLLM HTTP server)."""
+    if cfg.verifier_backend == "vllm":
+        return get_vllm_verifier(
+            cfg.verifier_model_id, cfg.verifier_server_host,
+            cfg.verifier_server_port, cfg.verifier_max_new_tokens,
+        )
     return get_verifier(
         cfg.verifier_model_id, cfg.verifier_device,
         cfg.verifier_max_new_tokens, cfg.verifier_batch_size,

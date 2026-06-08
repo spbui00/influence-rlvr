@@ -62,8 +62,9 @@ COMMON="--model-id ${MODEL} \
     --if-target-source mmlu_pro_cs --eval-benchmarks mmlu_pro_cs,gsm8k \
     --live-eval-benchmark mmlu_pro_cs --n-train-pool 96 --n-if-target 32 \
     --max-steps ${STEPS} --save-steps 50 \
-    --g-train 8 --per-device-batch 8 --grad-accum 8 --max-completion-length 1024 \
+    --g-train 8 --per-device-batch 8 --grad-accum 8 --max-completion-length 2048 \
     --use-vllm \
+    --verifier-batch-size 32 \
     --live-eval-examples 128 --eval-max-examples 200"
 
 echo "================ PHASE-0 SIGNAL CHECK ($RUN_NAME) ================"

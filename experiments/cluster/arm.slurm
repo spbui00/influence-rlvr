@@ -59,7 +59,7 @@ COMMON="--model-id ${MODEL:-Qwen/Qwen3-4B-Base} \
     --if-target-source mmlu_pro_cs --eval-benchmarks mmlu_pro_cs,gsm8k \
     --live-eval-benchmark mmlu_pro_cs --n-train-pool 96 --n-if-target 32 \
     --max-steps 400 --prune-step 100 --if-recompute-every 100 --save-steps 50 \
-    --g-train 8 --per-device-batch 8 --grad-accum 8 --max-completion-length 1024 \
+    --g-train 8 --per-device-batch 8 --grad-accum 8 --max-completion-length 2048 \
     --if-g-train 8 --if-max-new-tokens 1024 --cg-fisher-examples 8 --cg-fisher-g 2 \
     --cg-fisher-max-tokens 128 --cg-iters 50 --lambda-damp 0.5 \
     --if-logps-micro-batch 1 --if-score-batch 4 \
