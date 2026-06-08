@@ -1,0 +1,16 @@
+# Accelerate config for multi-GPU DATA-PARALLEL (DDP) GRPO training.
+# LoRA optimizer states are tiny, so plain DDP is enough — no DeepSpeed/ZeRO
+# needed (ZeRO-2 gives ~no benefit for LoRA; ZeRO-3/FSDP are untested with the
+# TRL vLLM weight-sync path, so avoid them). bf16 throughout.
+#
+# num_processes and gpu_ids are passed on the CLI (one process per training GPU),
+# e.g.  accelerate launch --config_file <this> --num_processes 7 -m experiments.train ...
+compute_environment: LOCAL_MACHINE
+distributed_type: MULTI_GPU
+mixed_precision: bf16
+num_machines: 1
+machine_rank: 0
+rdzv_backend: static
+same_network: true
+use_cpu: false
+debug: false
