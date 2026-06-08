@@ -39,6 +39,7 @@ MODEL="${MODEL:-Qwen/Qwen3-4B-Base}"
 VERIFIER="${VERIFIER:-TIGER-Lab/general-verifier}"
 VPORT="${VPORT:-8100}"
 VERIFIER_GMU="${VERIFIER_GMU:-0.85}"      # verifier server's share of GPU 1
+export IFRLVR_DEBUG_SAMPLES="${IFRLVR_DEBUG_SAMPLES:-2}"   # dump 2 rollouts/5 steps to the log
 
 # ── Launch the verifier vLLM server on GPU 1 ────────────────────────────────
 echo "Launching verifier vLLM server (GPU1, model=$VERIFIER, port=$VPORT)..."
