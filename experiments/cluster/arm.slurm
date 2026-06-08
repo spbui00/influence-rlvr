@@ -34,21 +34,32 @@ SEED="${SEED:-42}"
 ARM_ARGS="${ARM_ARGS:?set ARM_ARGS}"
 
 # Shared experiment config — identical across all arms so the ONLY difference is
-# the arm (regime/selection/if-method). DYNAMIC pruning: warm up to step 40, then
-# re-score the pool and re-rank every 20 steps (triggers at 40/60/80) so the
-# selection adapts to the evolving policy.
+# the arm (regime/selection/if-method). DYNAMIC pruning: warm up to step 100, then
+# re-score the pool and re-rank every 100 steps (triggers at 100/200/300) so the
+# selection adapts to the evolving policy — 3 influence windows, matching the
+# compute estimate.
 #   - Target + eval = MMLU-Pro CS (10-option, reasoning-heavy → real headroom vs
 #     the saturated MMLU-CS). gsm8k kept as a math specificity control.
 #   - n_if_target 32 (richer target → less noisy H); live-eval on 128 (the n=32
 #     curve was pure noise). Validated influence settings (if_g_train 8, 1024 tok,
 #     normalized Fisher, lambda 0.5, micro 1, B 4).
-# MODEL: override at submit, e.g. MODEL=Qwen/Qwen3-1.7B (smaller base = lower
+#
+# SIGNAL FIX (was the v2 null): the old COMMON overrode the good config defaults
+# with weak values (g_train 4, grad_accum 1 → 2 prompts/step, 100 steps) on the
+# *instruct* model → training barely learned, so selection had nothing to split.
+# Now: BASE model, g_train 8 + grad_accum 8 (effective batch 64 → 8 prompts/step),
+# 400 steps. RUN experiments/cluster/phase0_signalcheck.slurm FIRST and clear its
+# gate before launching this grid.
+# STILL TODO for the full Phase-1 scale (need code, not just flags): larger pool
+# with distractors (--n-train-pool 800+), keep_fraction 0.25, vLLM *server* mode
+# (so if_prune generation isn't HF), and multi-GPU sharded influence scoring.
+# MODEL: override at submit, e.g. MODEL=Qwen/Qwen3-1.7B-Base (smaller base = lower
 # baseline + more malleable → more room for a data-selection effect to show).
-COMMON="--model-id ${MODEL:-Qwen/Qwen3-4B} \
+COMMON="--model-id ${MODEL:-Qwen/Qwen3-4B-Base} \
     --if-target-source mmlu_pro_cs --eval-benchmarks mmlu_pro_cs,gsm8k \
     --live-eval-benchmark mmlu_pro_cs --n-train-pool 96 --n-if-target 32 \
-    --max-steps 100 --prune-step 40 --if-recompute-every 20 --save-steps 20 \
-    --g-train 4 --per-device-batch 8 --grad-accum 1 --max-completion-length 1024 \
+    --max-steps 400 --prune-step 100 --if-recompute-every 100 --save-steps 50 \
+    --g-train 8 --per-device-batch 8 --grad-accum 8 --max-completion-length 1024 \
     --if-g-train 8 --if-max-new-tokens 1024 --cg-fisher-examples 8 --cg-fisher-g 2 \
     --cg-fisher-max-tokens 128 --cg-iters 50 --lambda-damp 0.5 \
     --if-logps-micro-batch 1 --if-score-batch 4 \
