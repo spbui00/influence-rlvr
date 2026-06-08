@@ -46,58 +46,71 @@ RESUME_ARG=""; [ "${RESUME:-0}" = "1" ] && RESUME_ARG="--resume"
 MODEL="${MODEL:-Qwen/Qwen3-4B-Base}"
 VERIFIER="${VERIFIER:-TIGER-Lab/general-verifier}"
 VPORT="${VPORT:-8100}"
-# vLLM SERVER mode (NOT colocate): TRL 0.29's colocate path collides against the
-# cluster's vLLM 0.22 (per-process device handoff -> two engines on one GPU). The
-# plain vLLM server works on 0.22 (the verifier proves it), so we also run the
-# policy generator as its own `trl vllm-serve` process. GPU layout:
-#   0 .. N_TRAIN_GPU-1  = DP training workers
-#   N_TRAIN_GPU         = policy-generation vLLM server (weight-synced each step)
-#   N_TRAIN_GPU + 1     = verifier vLLM server (fixed model)
-# => full 8-GPU node: N_TRAIN_GPU=6 ; 4-GPU smoke: N_TRAIN_GPU=2.
-N_TRAIN_GPU="${N_TRAIN_GPU:-6}"
-GRAD_ACCUM="${GRAD_ACCUM:-16}"           # 6 x GRAD_ACCUM x 2 = prompts/step (16 -> 192)
-GENPORT="${GENPORT:-51216}"              # policy-gen server (trl vllm-serve); train connects here.
-                                         # MUST NOT be 8000 — vLLM spawns an internal service on 8000
-                                         # and a --port 8000 collides with it (Errno 98).
+# POLICY generation backend:
+#   USE_VLLM_GEN=0 (default) -> HF transformers.generate. Slower, but ZERO vLLM
+#     version surface — it just works. Both vLLM-training paths are broken against
+#     the cluster's vLLM 0.22: colocate (memory-profiling race) AND server (the
+#     trainer<->server weight-sync TCPStore handshake mismatches). HF gets the
+#     science now (batch SCALE is what we're testing; the gen backend only affects
+#     speed, not whether the model learns).
+#   USE_VLLM_GEN=1 -> policy-gen vLLM server (trl vllm-serve). Faster; flip ON only
+#     once a TRL/vLLM pair with a working weight-sync is installed (avail_wheels).
+# Verifier ALWAYS uses its own `vllm serve` (that works on 0.22). GPU layout:
+# 0..N_TRAIN_GPU-1 = DP train, then verifier (and gen if USE_VLLM_GEN=1).
+#   HF gen   -> 8-GPU: N_TRAIN_GPU=7 ; 4-GPU smoke: N_TRAIN_GPU=3
+#   vLLM gen -> 8-GPU: N_TRAIN_GPU=6 ; 4-GPU smoke: N_TRAIN_GPU=2
+USE_VLLM_GEN="${USE_VLLM_GEN:-0}"
+N_TRAIN_GPU="${N_TRAIN_GPU:-7}"
+GRAD_ACCUM="${GRAD_ACCUM:-16}"           # 7 x GRAD_ACCUM x 2 = prompts/step (16 -> 224)
+GENPORT="${GENPORT:-51216}"              # policy-gen server port (NOT 8000 — vLLM uses 8000 internally)
 POOL="${POOL:-1500}"
 export IFRLVR_DEBUG_SAMPLES="${IFRLVR_DEBUG_SAMPLES:-2}"
-GEN_GPU=$N_TRAIN_GPU
-VERIFIER_GPU=$((N_TRAIN_GPU + 1))
+if [ "$USE_VLLM_GEN" = "1" ]; then
+    GEN_GPU=$N_TRAIN_GPU; VERIFIER_GPU=$((N_TRAIN_GPU + 1))
+    VLLM_ARGS="--use-vllm --vllm-mode server --vllm-server-host 127.0.0.1 --vllm-server-port $GENPORT"
+else
+    VERIFIER_GPU=$N_TRAIN_GPU
+    VLLM_ARGS="--no-use-vllm"
+fi
 
-# ── vLLM servers: policy generation (weight-synced) + verifier (fixed) ──────
-echo "Launching policy-gen vLLM server on GPU $GEN_GPU (trl vllm-serve, port $GENPORT)..."
-CUDA_VISIBLE_DEVICES=$GEN_GPU trl vllm-serve \
-    --model "$MODEL" --host 127.0.0.1 --port "$GENPORT" \
-    --gpu_memory_utilization 0.85 --max_model_len 8192 \
-    > "vllm-gen-${SLURM_JOB_ID}.log" 2>&1 &
-GENSERVER_PID=$!
+# ── verifier vLLM server (always); policy-gen vLLM server (only if USE_VLLM_GEN=1) ─
 echo "Launching verifier vLLM server on GPU $VERIFIER_GPU (model=$VERIFIER, port=$VPORT)..."
 CUDA_VISIBLE_DEVICES=$VERIFIER_GPU vllm serve "$VERIFIER" \
     --port "$VPORT" --gpu-memory-utilization 0.85 --max-model-len 4096 \
     > "vllm-verifier-${SLURM_JOB_ID}.log" 2>&1 &
 VSERVER_PID=$!
-trap 'echo "stopping vLLM servers"; kill $GENSERVER_PID $VSERVER_PID 2>/dev/null || true' EXIT
+GENSERVER_PID=""
+if [ "$USE_VLLM_GEN" = "1" ]; then
+    echo "Launching policy-gen vLLM server on GPU $GEN_GPU (trl vllm-serve, port $GENPORT)..."
+    CUDA_VISIBLE_DEVICES=$GEN_GPU trl vllm-serve \
+        --model "$MODEL" --host 127.0.0.1 --port "$GENPORT" \
+        --gpu_memory_utilization 0.85 --max_model_len 8192 \
+        > "vllm-gen-${SLURM_JOB_ID}.log" 2>&1 &
+    GENSERVER_PID=$!
+fi
+trap 'echo "stopping vLLM servers"; kill $VSERVER_PID $GENSERVER_PID 2>/dev/null || true' EXIT
 
-echo "Waiting for both vLLM servers (gen :$GENPORT, verifier :$VPORT) ..."
-python - "$GENPORT" "$VPORT" <<'PY'
+echo "Waiting for vLLM server(s) (verifier :$VPORT$([ "$USE_VLLM_GEN" = "1" ] && echo ", gen :$GENPORT")) ..."
+python - "$VPORT" "$USE_VLLM_GEN" "$GENPORT" <<'PY'
 import socket, sys, time, urllib.request
-gport, vport = int(sys.argv[1]), int(sys.argv[2])
+vport, use_gen, gport = int(sys.argv[1]), sys.argv[2] == "1", int(sys.argv[3])
 deadline = time.time() + 900
-def gen_up():
-    try:
-        with socket.create_connection(("127.0.0.1", gport), timeout=3): return True
-    except OSError:
-        return False
 def verifier_up():
     try:
         return urllib.request.urlopen(f"http://127.0.0.1:{vport}/v1/models", timeout=3).status == 200
     except Exception:
         return False
+def gen_up():
+    if not use_gen: return True
+    try:
+        with socket.create_connection(("127.0.0.1", gport), timeout=3): return True
+    except OSError:
+        return False
 while time.time() < deadline:
-    if gen_up() and verifier_up():
-        print("both vLLM servers are up."); sys.exit(0)
+    if verifier_up() and gen_up():
+        print("vLLM server(s) up."); sys.exit(0)
     time.sleep(5)
-print("ERROR: vLLM servers did not come up in 900s", file=sys.stderr); sys.exit(1)
+print("ERROR: vLLM server(s) did not come up in 900s", file=sys.stderr); sys.exit(1)
 PY
 
 # ── Data-parallel training on GPUs 0..N-1 (generation via the policy-gen server) ─
@@ -115,7 +128,7 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     --g-train 8 --per-device-batch 16 --grad-accum "$GRAD_ACCUM" \
     --max-completion-length 4096 --grpo-temperature 0.7 --grpo-epsilon-high 0.3 \
     --learning-rate 1e-5 \
-    --use-vllm --vllm-mode server --vllm-server-host 127.0.0.1 --vllm-server-port "$GENPORT" \
+    $VLLM_ARGS \
     --verifier-backend vllm --verifier-server-port "$VPORT" --verifier-max-new-tokens 1024 \
     --live-eval-examples 64 --eval-max-examples 200
 
