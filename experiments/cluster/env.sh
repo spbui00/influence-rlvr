@@ -2,15 +2,18 @@
 #
 #   source experiments/cluster/env.sh
 #
-# It enforces the Alliance ordering rule — `module load` BEFORE activating the
-# venv — which is what bites you if you do it by hand (the python module shadows
-# the venv's python; the arrow module provides PyArrow). Safe to source repeatedly.
+# Works on ALL the Alliance clusters we use (Killarney L40S, Nibi H100) — the
+# module set below is the same one setup.sh builds the venv against, and it loads
+# on both. It enforces the Alliance ordering rule — `module load` BEFORE activating
+# the venv (the python module shadows the venv's python; arrow provides PyArrow).
+# Safe to source repeatedly. Override paths via env vars (VENV_DIR, HF_HOME, ...).
 #
-# Override paths via env vars before sourcing if needed (VENV_DIR, HF_HOME, ...).
+# If a module version is unavailable on some cluster, `module spider <name>` and
+# adjust this line (keep it in sync with setup.sh).
 
-# NOTE: do NOT `module purge`/`module reset` on Killarney — it strips
-# /cm/local/modulefiles (Bright Cluster Manager), which provides salloc/sbatch.
-# Just layer our modules on top of the default environment.
+# NOTE: do NOT `module purge`/`module reset` on Alliance clusters — it strips the
+# scheduler modulefiles (e.g. Killarney's /cm/local Bright Cluster Manager) that
+# provide salloc/sbatch. Just layer our modules on top of the default environment.
 module load StdEnv/2023 gcc/12.3 python/3.11 cuda/12.2 arrow/21.0.0 opencv/4.13.0
 
 source "${VENV_DIR:-$HOME/envs/influence-rlvr}/bin/activate"
