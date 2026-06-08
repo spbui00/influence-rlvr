@@ -24,17 +24,19 @@ from datasets import Dataset, concatenate_datasets, load_dataset
 from .config import DOMAIN_TO_CATEGORIES, ExperimentConfig
 
 
-# General reasoning instruction (domain-agnostic): think, then box the answer so
-# both the verifier and a fallback parser can extract a final answer.
+# EXACT General-Reasoner recipe (their data_preprocess.py): GR-faithful ZERO-SHOT
+# — the question + this one instruction line, single user message, joined by a
+# space. No <think>, no system prompt, no exemplars. A base model bootstraps the
+# format from the reward over many steps (GR did this on Qwen3-4B-Base — but at a
+# MUCH larger batch than ours; that scale is what makes zero-shot bootstrap work).
+# Used for BOTH train and eval (one source so they stay consistent).
 GENERAL_REASONING_INSTRUCTION = (
-    "Please reason step by step inside <think></think> tags. "
-    "After the thinking block, state the final answer on its own line "
-    "within \\boxed{}."
+    "Please reason step by step, and put your final answer within \\boxed{}."
 )
 
 
 def build_reasoning_prompt(question: str) -> list[dict]:
-    return [{"role": "user", "content": f"{question}\n\n{GENERAL_REASONING_INSTRUCTION}"}]
+    return [{"role": "user", "content": f"{question} {GENERAL_REASONING_INSTRUCTION}"}]
 
 
 def _categories_for_domains(domains: Iterable[str]) -> set[str]:

@@ -66,9 +66,7 @@ class ExperimentConfig:
     # ── Dataset ─────────────────────────────────────────────────────────────
     domains: tuple[str, ...] = ("math", "cs", "finance")
     train_dataset: str = "TIGER-Lab/WebInstruct-verified"
-    # Cap the training pool (per the IF-pruning study we don't need all 229k).
-    # <=0 means "use everything after filtering".
-    n_train_pool: int = 6000
+    n_train_pool: int = 6000 # <=0 means "use everything after filtering".
     # Draw an equal share from each domain (n_train_pool/#domains) instead of a
     # random (Math-heavy) sample. Keep on so a single-domain IF target (e.g. CS)
     # can pull in helpful examples from the other domains.
