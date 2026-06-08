@@ -46,35 +46,60 @@ RESUME_ARG=""; [ "${RESUME:-0}" = "1" ] && RESUME_ARG="--resume"
 MODEL="${MODEL:-Qwen/Qwen3-4B-Base}"
 VERIFIER="${VERIFIER:-TIGER-Lab/general-verifier}"
 VPORT="${VPORT:-8100}"
-N_TRAIN_GPU="${N_TRAIN_GPU:-7}"          # GPUs 0..N-1 train; the last GPU runs the verifier
-GRAD_ACCUM="${GRAD_ACCUM:-14}"           # 7 x GRAD_ACCUM x 2 = prompts/step (14 -> 196)
+# vLLM SERVER mode (NOT colocate): TRL 0.29's colocate path collides against the
+# cluster's vLLM 0.22 (per-process device handoff -> two engines on one GPU). The
+# plain vLLM server works on 0.22 (the verifier proves it), so we also run the
+# policy generator as its own `trl vllm-serve` process. GPU layout:
+#   0 .. N_TRAIN_GPU-1  = DP training workers
+#   N_TRAIN_GPU         = policy-generation vLLM server (weight-synced each step)
+#   N_TRAIN_GPU + 1     = verifier vLLM server (fixed model)
+# => full 8-GPU node: N_TRAIN_GPU=6 ; 4-GPU smoke: N_TRAIN_GPU=2.
+N_TRAIN_GPU="${N_TRAIN_GPU:-6}"
+GRAD_ACCUM="${GRAD_ACCUM:-16}"           # 6 x GRAD_ACCUM x 2 = prompts/step (16 -> 192)
+GENPORT="${GENPORT:-8000}"               # policy-gen server (trl vllm-serve); train connects here
 POOL="${POOL:-1500}"
 export IFRLVR_DEBUG_SAMPLES="${IFRLVR_DEBUG_SAMPLES:-2}"
+GEN_GPU=$N_TRAIN_GPU
+VERIFIER_GPU=$((N_TRAIN_GPU + 1))
 
-# ── Verifier vLLM server on the LAST GPU ────────────────────────────────────
-VGPU=$N_TRAIN_GPU
-echo "Launching verifier vLLM server on GPU $VGPU (model=$VERIFIER, port=$VPORT)..."
-CUDA_VISIBLE_DEVICES=$VGPU vllm serve "$VERIFIER" \
+# ── vLLM servers: policy generation (weight-synced) + verifier (fixed) ──────
+echo "Launching policy-gen vLLM server on GPU $GEN_GPU (trl vllm-serve, port $GENPORT)..."
+CUDA_VISIBLE_DEVICES=$GEN_GPU trl vllm-serve \
+    --model "$MODEL" --host 127.0.0.1 --port "$GENPORT" \
+    --gpu_memory_utilization 0.85 --max_model_len 8192 \
+    > "vllm-gen-${SLURM_JOB_ID}.log" 2>&1 &
+GENSERVER_PID=$!
+echo "Launching verifier vLLM server on GPU $VERIFIER_GPU (model=$VERIFIER, port=$VPORT)..."
+CUDA_VISIBLE_DEVICES=$VERIFIER_GPU vllm serve "$VERIFIER" \
     --port "$VPORT" --gpu-memory-utilization 0.85 --max-model-len 4096 \
     > "vllm-verifier-${SLURM_JOB_ID}.log" 2>&1 &
 VSERVER_PID=$!
-trap 'echo "stopping verifier server $VSERVER_PID"; kill $VSERVER_PID 2>/dev/null || true' EXIT
+trap 'echo "stopping vLLM servers"; kill $GENSERVER_PID $VSERVER_PID 2>/dev/null || true' EXIT
 
-echo "Waiting for verifier server on 127.0.0.1:$VPORT ..."
-python - "$VPORT" <<'PY'
-import sys, time, urllib.request
-port = int(sys.argv[1]); deadline = time.time() + 600
-while time.time() < deadline:
+echo "Waiting for both vLLM servers (gen :$GENPORT, verifier :$VPORT) ..."
+python - "$GENPORT" "$VPORT" <<'PY'
+import socket, sys, time, urllib.request
+gport, vport = int(sys.argv[1]), int(sys.argv[2])
+deadline = time.time() + 900
+def gen_up():
     try:
-        if urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=3).status == 200:
-            print("verifier server is up."); sys.exit(0)
+        with socket.create_connection(("127.0.0.1", gport), timeout=3): return True
+    except OSError:
+        return False
+def verifier_up():
+    try:
+        return urllib.request.urlopen(f"http://127.0.0.1:{vport}/v1/models", timeout=3).status == 200
     except Exception:
-        time.sleep(4)
-print("ERROR: verifier server did not come up in 600s", file=sys.stderr); sys.exit(1)
+        return False
+while time.time() < deadline:
+    if gen_up() and verifier_up():
+        print("both vLLM servers are up."); sys.exit(0)
+    time.sleep(5)
+print("ERROR: vLLM servers did not come up in 900s", file=sys.stderr); sys.exit(1)
 PY
 
-# ── Data-parallel training on GPUs 0..N-1 (colocate vLLM per worker) ─────────
-TRAIN_GPUS=$(seq -s, 0 $((N_TRAIN_GPU - 1)))   # e.g. 0,1,2,3,4,5,6
+# ── Data-parallel training on GPUs 0..N-1 (generation via the policy-gen server) ─
+TRAIN_GPUS=$(seq -s, 0 $((N_TRAIN_GPU - 1)))   # e.g. 0,1,2,3,4,5
 echo "================ TIER-1 DP TRAIN ($RUN_NAME) — GPUs $TRAIN_GPUS, grad_accum=$GRAD_ACCUM ================"
 CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     --config_file experiments/cluster/accelerate_ddp.yaml \
@@ -88,7 +113,7 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     --g-train 8 --per-device-batch 16 --grad-accum "$GRAD_ACCUM" \
     --max-completion-length 4096 --grpo-temperature 0.7 --grpo-epsilon-high 0.3 \
     --learning-rate 1e-5 \
-    --use-vllm --vllm-mode colocate --vllm-gpu-memory-utilization 0.35 \
+    --use-vllm --vllm-mode server --vllm-server-host 127.0.0.1 --vllm-server-port "$GENPORT" \
     --verifier-backend vllm --verifier-server-port "$VPORT" --verifier-max-new-tokens 1024 \
     --live-eval-examples 64 --eval-max-examples 200
 
