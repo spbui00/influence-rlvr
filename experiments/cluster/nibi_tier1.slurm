@@ -73,10 +73,17 @@ else
     VLLM_ARGS="--no-use-vllm"
 fi
 
+# Pre-flight: show GPU memory so a squatting process (e.g. a leaked vLLM worker
+# from a prior job that landed on this node) is obvious immediately, not after a
+# 15-min timeout. A non-empty "memory.used" on our GPUs here = trouble.
+echo "GPU state at launch:"; nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv,noheader || true
+
 # ── verifier vLLM server (always); policy-gen vLLM server (only if USE_VLLM_GEN=1) ─
+# 0.30 util is plenty for a 1.5B verifier (~10 GiB incl. KV) and far more robust to
+# a partly-occupied GPU than 0.85 (which demands 67 GiB).
 echo "Launching verifier vLLM server on GPU $VERIFIER_GPU (model=$VERIFIER, port=$VPORT)..."
 CUDA_VISIBLE_DEVICES=$VERIFIER_GPU vllm serve "$VERIFIER" \
-    --port "$VPORT" --gpu-memory-utilization 0.85 --max-model-len 4096 \
+    --port "$VPORT" --gpu-memory-utilization 0.30 --max-model-len 4096 \
     > "vllm-verifier-${SLURM_JOB_ID}.log" 2>&1 &
 VSERVER_PID=$!
 GENSERVER_PID=""
@@ -88,7 +95,9 @@ if [ "$USE_VLLM_GEN" = "1" ]; then
         > "vllm-gen-${SLURM_JOB_ID}.log" 2>&1 &
     GENSERVER_PID=$!
 fi
-trap 'echo "stopping vLLM servers"; kill $VSERVER_PID $GENSERVER_PID 2>/dev/null || true' EXIT
+# Kill the server AND its children (vLLM forks an EngineCore worker; killing only
+# the parent leaks it -> it squats GPU memory for the next job on this node).
+trap 'echo "stopping vLLM servers"; for p in $VSERVER_PID $GENSERVER_PID; do [ -n "$p" ] && { pkill -P "$p" 2>/dev/null; kill "$p" 2>/dev/null; }; done; true' EXIT
 
 echo "Waiting for vLLM server(s) (verifier :$VPORT$([ "$USE_VLLM_GEN" = "1" ] && echo ", gen :$GENPORT")) ..."
 python - "$VPORT" "$USE_VLLM_GEN" "$GENPORT" <<'PY'
