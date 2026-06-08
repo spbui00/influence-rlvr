@@ -83,7 +83,7 @@ echo "GPU state at launch:"; nvidia-smi --query-gpu=index,memory.used,memory.fre
 # a partly-occupied GPU than 0.85 (which demands 67 GiB).
 echo "Launching verifier vLLM server on GPU $VERIFIER_GPU (model=$VERIFIER, port=$VPORT)..."
 CUDA_VISIBLE_DEVICES=$VERIFIER_GPU vllm serve "$VERIFIER" \
-    --port "$VPORT" --gpu-memory-utilization 0.30 --max-model-len 4096 \
+    --port "$VPORT" --gpu-memory-utilization 0.50 --max-model-len 4096 \
     > "vllm-verifier-${SLURM_JOB_ID}.log" 2>&1 &
 VSERVER_PID=$!
 GENSERVER_PID=""
