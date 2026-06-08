@@ -56,7 +56,9 @@ VPORT="${VPORT:-8100}"
 # => full 8-GPU node: N_TRAIN_GPU=6 ; 4-GPU smoke: N_TRAIN_GPU=2.
 N_TRAIN_GPU="${N_TRAIN_GPU:-6}"
 GRAD_ACCUM="${GRAD_ACCUM:-16}"           # 6 x GRAD_ACCUM x 2 = prompts/step (16 -> 192)
-GENPORT="${GENPORT:-8000}"               # policy-gen server (trl vllm-serve); train connects here
+GENPORT="${GENPORT:-51216}"              # policy-gen server (trl vllm-serve); train connects here.
+                                         # MUST NOT be 8000 — vLLM spawns an internal service on 8000
+                                         # and a --port 8000 collides with it (Errno 98).
 POOL="${POOL:-1500}"
 export IFRLVR_DEBUG_SAMPLES="${IFRLVR_DEBUG_SAMPLES:-2}"
 GEN_GPU=$N_TRAIN_GPU
