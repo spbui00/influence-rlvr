@@ -46,7 +46,6 @@ CUDA_VISIBLE_DEVICES=1 vllm serve "$VERIFIER" \
     --port "$VPORT" \
     --gpu-memory-utilization "$VERIFIER_GMU" \
     --max-model-len 4096 \
-    --disable-log-requests \
     > "vllm-verifier-${SLURM_JOB_ID}.log" 2>&1 &
 VSERVER_PID=$!
 trap 'echo "stopping verifier server $VSERVER_PID"; kill $VSERVER_PID 2>/dev/null || true' EXIT
