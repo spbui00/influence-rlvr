@@ -18,6 +18,13 @@ import torch
 import torch.distributed as dist
 
 
+def env_is_main() -> bool:
+    """Rank-0 check from the launcher's RANK env var — valid even BEFORE the
+    process group / accelerator is initialized (unlike is_main(), which needs the
+    group). Use this to guard file I/O under `accelerate launch` / torchrun."""
+    return os.environ.get("RANK", "0") == "0"
+
+
 def init_distributed() -> tuple[int, int, int]:
     """Init the process group from torchrun env vars. Returns (rank, world, local_rank).
 

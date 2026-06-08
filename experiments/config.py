@@ -98,6 +98,10 @@ class ExperimentConfig:
     # ── GRPO ────────────────────────────────────────────────────────────────
     max_steps: int = 400
     save_steps: int = 25
+    # Resume baseline training from the latest checkpoint in the run dir (set via
+    # --resume). Survives time-limit kills, and lets you train N steps then bump
+    # max_steps and continue. checkpoint-0 is the base anchor, not a resume point.
+    resume: bool = False
     learning_rate: float = 1e-5
     # Effective batch = per_device_batch × grad_accum × num_processes = 64 here,
     # giving prompts_per_step = 64 / g_train = 8 distinct prompts per optimizer
@@ -110,6 +114,8 @@ class ExperimentConfig:
     generation_batch_size: int | None = None
     grpo_beta: float = 0.0            # KL coeff; 0 disables the reference model
     grpo_epsilon: float = 0.2
+    grpo_epsilon_high: float = 0.3    # asymmetric upper clip ("clip-higher", GR-4B/DAPO)
+    grpo_temperature: float = 0.7     # rollout sampling temperature (GR-4B Table 9)
     max_completion_length: int = 2048
     # Reward shaping matches General-Reasoner (the WebInstruct-verified authors,
     # same Qwen3-4B-Base + GRPO): extraction fails (no \boxed{}/marker) -> reward

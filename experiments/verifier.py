@@ -307,21 +307,22 @@ def make_verifier_reward_func(cfg: ExperimentConfig):
             for i in range(len(responses))
         ]
 
-        # --- per-step diagnostic breakdown (always on; cheap one-liner) ---
-        n = len(responses) or 1
-        n_box = sum(a is not None for a in extracted)
-        n_correct = sum(1 for i in range(len(responses)) if verdicts.get(i, 0.0) >= 0.5)
-        print(f"[reward] step~{_step[0]} n={len(responses)} no_box={len(responses) - n_box} "
-              f"wrong={n_box - n_correct} correct={n_correct} "
-              f"box_rate={n_box / n:.2f} acc={n_correct / n:.2f} mean={sum(scores) / n:+.3f}",
-              flush=True)
-        # --- optional: dump a few full rollouts (IFRLVR_DEBUG_SAMPLES=2) ---
-        if _debug_samples and _step[0] % 5 == 0:
-            for i in range(min(_debug_samples, len(responses))):
-                print(f"  [sample {i}] boxed={extracted[i] is not None} "
-                      f"extracted={extracted[i]!r} gold={solution[i]!r} "
-                      f"verdict={verdicts.get(i, 0.0)} score={scores[i]:+.2f}", flush=True)
-                print(f"    completion(tail 600): ...{responses[i][-600:]}", flush=True)
+        # --- per-step diagnostic breakdown (rank 0 only under DP; cheap) ---
+        if os.environ.get("RANK", "0") == "0":
+            n = len(responses) or 1
+            n_box = sum(a is not None for a in extracted)
+            n_correct = sum(1 for i in range(len(responses)) if verdicts.get(i, 0.0) >= 0.5)
+            print(f"[reward] step~{_step[0]} n={len(responses)} no_box={len(responses) - n_box} "
+                  f"wrong={n_box - n_correct} correct={n_correct} "
+                  f"box_rate={n_box / n:.2f} acc={n_correct / n:.2f} mean={sum(scores) / n:+.3f}",
+                  flush=True)
+            # --- optional: dump a few full rollouts (IFRLVR_DEBUG_SAMPLES=2) ---
+            if _debug_samples and _step[0] % 5 == 0:
+                for i in range(min(_debug_samples, len(responses))):
+                    print(f"  [sample {i}] boxed={extracted[i] is not None} "
+                          f"extracted={extracted[i]!r} gold={solution[i]!r} "
+                          f"verdict={verdicts.get(i, 0.0)} score={scores[i]:+.2f}", flush=True)
+                    print(f"    completion(tail 600): ...{responses[i][-600:]}", flush=True)
         _step[0] += 1
         return scores
 

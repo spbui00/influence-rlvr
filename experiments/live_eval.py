@@ -18,6 +18,7 @@ import torch
 from transformers import TrainerCallback
 
 from .config import ExperimentConfig
+from .dist_utils import env_is_main
 
 
 class LiveEvalCallback(TrainerCallback):
@@ -30,14 +31,17 @@ class LiveEvalCallback(TrainerCallback):
         self.csv_path = Path(csv_path)
         self.every = int(every)
         self._last_step = -1
-        self.csv_path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.csv_path.exists():
-            with self.csv_path.open("w", newline="") as f:
-                csv.writer(f).writerow(["step", "n", "accuracy", "per_category_json"])
+        if env_is_main():  # DP: only rank 0 owns the CSV
+            self.csv_path.parent.mkdir(parents=True, exist_ok=True)
+            if not self.csv_path.exists():
+                with self.csv_path.open("w", newline="") as f:
+                    csv.writer(f).writerow(["step", "n", "accuracy", "per_category_json"])
 
     def on_step_end(self, args, state, control, model=None, **kwargs):
         if self.every <= 0 or not self.eval_examples or model is None:
             return
+        if not state.is_world_process_zero:
+            return  # DP: rank 0 alone runs the held-out eval + writes CSV/wandb
         step = int(state.global_step)
         if step == self._last_step or step % self.every != 0:
             return

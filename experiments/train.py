@@ -36,6 +36,7 @@ from influence_rlvr.rewards import format_guardrail_reward_func
 
 from .config import ExperimentConfig
 from .data import load_eval_benchmark, load_if_target_set, load_train_pool
+from .dist_utils import env_is_main
 from .influence import compute_pool_influence
 from .live_eval import LiveEvalCallback
 from .verifier import make_verifier_reward_func
@@ -121,6 +122,8 @@ def make_grpo_config(cfg: ExperimentConfig, *, max_steps: int, shuffle: bool = T
         "num_generations": cfg.g_train,
         "beta": cfg.grpo_beta,
         "epsilon": cfg.grpo_epsilon,
+        "epsilon_high": cfg.grpo_epsilon_high,   # clip-higher (GR-4B); filtered if unsupported
+        "temperature": cfg.grpo_temperature,     # rollout temperature (GR-4B = 0.7)
         "importance_sampling_level": "token",
         "scale_rewards": "group",
         "loss_type": "grpo",
@@ -215,6 +218,60 @@ def _ranked_order(scores: np.ndarray, *, selection: str, seed: int) -> np.ndarra
     raise ValueError(f"Unknown selection {selection!r}")
 
 
+def _resume_checkpoint(cfg) -> bool | None:
+    """For `trainer.train(resume_from_checkpoint=...)`: return True (HF picks the
+    latest checkpoint in the run dir) when --resume is set AND a real (>0) checkpoint
+    exists; else None (fresh start). Lets a time-limit-killed run be resubmitted, or
+    a short run be extended (raise --max-steps, --resume, continue)."""
+    if not cfg.resume:
+        return None
+    steps = [int(p.name.split("-")[-1]) for p in cfg.grpo_output_dir.glob("checkpoint-*")
+             if p.name.split("-")[-1].isdigit() and int(p.name.split("-")[-1]) > 0]
+    if not steps:
+        if env_is_main():
+            print("[resume] --resume set but no >0 checkpoint found; starting fresh")
+        return None
+    if env_is_main():
+        print(f"[resume] continuing from checkpoint-{max(steps)} in {cfg.grpo_output_dir}")
+    return True
+
+
+def _assert_resume_compatible(cfg) -> None:
+    """Refuse a --resume that would continue a DIFFERENT config. HF happily resumes
+    a checkpoint under whatever args you pass, so resubmitting the same --run-name
+    with a changed model/LoRA/batch/LR/GRPO/reward/data would silently mix state (and
+    main() would overwrite config.json, erasing the record). Compare the run dir's
+    saved config.json against the current config and abort on any training-critical
+    mismatch; only max_steps/save_steps and eval/verifier-/vllm-infra knobs may
+    change (extend a run; swap monitoring or serving infra)."""
+    saved_path = cfg.run_dir / "config.json"
+    if not (cfg.resume and saved_path.exists()):
+        return
+    saved = json.loads(saved_path.read_text())
+    current = cfg.to_dict()
+    may_differ = {
+        "resume", "max_steps", "save_steps",
+        "eval_benchmarks", "eval_max_examples", "eval_max_new_tokens",
+        "eval_temperature", "eval_top_p",
+        "live_eval", "live_eval_every", "live_eval_examples",
+        "live_eval_max_new_tokens", "live_eval_benchmark",
+        "verifier_backend", "verifier_server_host", "verifier_server_port",
+        "verifier_device", "verifier_batch_size", "verifier_max_new_tokens",
+        "use_vllm", "vllm_mode", "vllm_gpu_memory_utilization", "vllm_max_model_len",
+        "vllm_enable_sleep_mode", "vllm_server_host", "vllm_server_port",
+    }
+    diffs = {k: (saved[k], current[k]) for k in current
+             if k in saved and k not in may_differ and saved[k] != current[k]}
+    if diffs:
+        lines = "\n".join(f"    {k}: was {s!r}, now {n!r}" for k, (s, n) in sorted(diffs.items()))
+        raise SystemExit(
+            f"\n[resume] REFUSING to resume run '{cfg.run_name}' — its saved config.json "
+            f"disagrees on training-critical fields:\n{lines}\n"
+            "  A resume must keep the same model / LoRA / batch / LR / GRPO / reward / data.\n"
+            "  Use a NEW --run-name for a different config (or drop --resume to start fresh).\n"
+        )
+
+
 def run_baseline(cfg, model, tokenizer, train_pool, device):
     print("\n" + "=" * 80)
     print(f"BASELINE GRPO — {cfg.max_steps} steps on {len(train_pool)} prompts")
@@ -223,7 +280,7 @@ def run_baseline(cfg, model, tokenizer, train_pool, device):
     trainer = build_trainer(cfg, model, tokenizer, train_pool, max_steps=cfg.max_steps,
                             callbacks=[live_eval] if live_eval else None)
     t0 = time.time()
-    trainer.train()
+    trainer.train(resume_from_checkpoint=_resume_checkpoint(cfg))
     print(f"Baseline training finished in {time.time() - t0:.1f}s")
     clear_cache(device)
 
@@ -355,12 +412,20 @@ def main(argv: list[str] | None = None) -> None:
 
     device = detect_device()
     print(f"Device: {device} | model: {cfg.model_id} | regime: {cfg.regime}")
-    cfg.grpo_output_dir.mkdir(parents=True, exist_ok=True)
-    cfg.save()
-    print(f"Config saved to {cfg.run_dir / 'config.json'}")
+    # All ranks: abort BEFORE save() overwrites config.json if --resume targets a
+    # run whose saved config disagrees on training-critical fields.
+    _assert_resume_compatible(cfg)
+    # Under `accelerate launch` (DP) only rank 0 touches the filesystem — config,
+    # checkpoint-0, and (in the callback) the live-eval CSV. Other ranks build the
+    # same model/data and let TRL handle distributed checkpointing.
+    if env_is_main():
+        cfg.grpo_output_dir.mkdir(parents=True, exist_ok=True)
+        cfg.save()
+        print(f"Config saved to {cfg.run_dir / 'config.json'}")
 
     model, tokenizer = build_model(cfg, device)
-    _save_base_checkpoint(model, tokenizer, cfg.grpo_output_dir)
+    if env_is_main():
+        _save_base_checkpoint(model, tokenizer, cfg.grpo_output_dir)
 
     print("\nLoading training pool (WebInstruct-verified, domains="
           f"{','.join(cfg.domains)})...")
