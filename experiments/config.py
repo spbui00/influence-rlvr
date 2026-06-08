@@ -113,9 +113,21 @@ class ExperimentConfig:
     grpo_beta: float = 0.0            # KL coeff; 0 disables the reference model
     grpo_epsilon: float = 0.2
     max_completion_length: int = 2048
-    # Light format guardrail reward in addition to the verifier (encourages
-    # <think>…</think> + \boxed{}). Set False for verifier-only reward.
-    use_format_guardrail: bool = True
+    # Reward shaping matches General-Reasoner (the WebInstruct-verified authors,
+    # same Qwen3-4B-Base + GRPO): extraction fails (no \boxed{}/marker) -> reward
+    # -extraction_penalty; verifier correct -> +1 - length_penalty; wrong -> 0.
+    # The -0.5 keeps answers parseable AND injects within-group reward variance so
+    # all-wrong GRPO groups still produce a gradient (the v2 null was a strict
+    # <think>+\boxed guardrail that fired ~never -> dead term + group collapse).
+    # length_penalty = length_penalty_coef * min(length_penalty_cap,
+    #   |tok(answer) - tok(gold)|), correct answers only. Set extraction_penalty=0
+    # AND length_penalty_coef=0 for pure verifier-only {0,1}.
+    extraction_penalty: float = 0.5
+    length_penalty_coef: float = 0.05
+    length_penalty_cap: int = 10
+    # Optional EXTRA \boxed{}/<think> shaping bonus on top of the GR reward. Off by
+    # default (GR uses no separate format reward; its extraction penalty subsumes it).
+    use_format_guardrail: bool = False
 
     # ── Generation backend ──────────────────────────────────────────────────
     use_vllm: bool = True

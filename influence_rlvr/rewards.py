@@ -529,14 +529,27 @@ def format_reward_func(completions, **kwargs):
 
 
 def format_guardrail_reward_func(completions, **kwargs):
+    r"""Dense shaping reward for the reason->answer format.
+
+    A base model (Qwen3-*-Base) reliably learns to emit ``\boxed{}`` — which the
+    verifier needs to extract an answer — long before it learns to wrap reasoning
+    in literal ``<think></think>`` tags. The original guardrail required BOTH, so
+    on a base model it fired ~never (mean 0.000 across a whole run): a dead term
+    that also left every all-incorrect GRPO group at zero reward-variance (zero
+    advantage -> zero gradient -> ~half of all steps wasted). Reward ``\boxed{}``
+    as the primary, achievable target — with a smaller bonus for the think-wrapper
+    so the intended reason->box format is still shaped, not required. This fires
+    the term, shapes toward the gradeable format (which compounds into denser
+    verifier signal), and yields non-degenerate advantages even when every rollout
+    in a group is wrong. ``\boxed{}`` is aligned with correctness (you can't be
+    graded right without it), so there is nothing to reward-hack here.
+    """
     rewards = []
     for response in _extract_responses(completions):
         tl = response.lower()
         boxed = r"\boxed{" in response or "boxed{" in response
-        if "<think>" in tl and "</think>" in tl and boxed:
-            rewards.append(0.1)
-        else:
-            rewards.append(0.0)
+        has_think = "<think>" in tl and "</think>" in tl
+        rewards.append((0.1 if boxed else 0.0) + (0.05 if has_think else 0.0))
     return rewards
 
 

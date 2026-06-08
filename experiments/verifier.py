@@ -153,11 +153,43 @@ def _student_answer(text: str) -> str:
     return ans if ans is not None else text.strip()
 
 
-def make_verifier_reward_func(cfg: ExperimentConfig):
-    """Build a TRL GRPO reward function backed by the general-verifier.
+def _length_penalty(tokenizer, answer: str, gold: str, coef: float, cap: int) -> float:
+    """General-Reasoner length penalty: coef * min(cap, |tok(answer) - tok(gold)|),
+    measured in tokenizer tokens of the extracted answer vs the reference."""
+    if coef <= 0.0:
+        return 0.0
+    la = len(tokenizer.encode(answer, add_special_tokens=False))
+    lg = len(tokenizer.encode(str(gold), add_special_tokens=False))
+    return coef * min(cap, abs(la - lg))
 
-    TRL passes dataset columns as kwargs, so the training rows must carry
-    `question` and `solution` (see data.py). Returns rewards in {0.0, 1.0}.
+
+def _gr_score(extracted, gold, verdict, tokenizer, *,
+              extraction_penalty: float, length_coef: float, length_cap: int) -> float:
+    """Per-rollout General-Reasoner reward (pure; no model call).
+
+      extracted is None (no \\boxed{}/marker) -> -extraction_penalty
+      verifier correct (verdict >= 0.5)        -> +1 - length_penalty
+      verifier wrong                           ->  0
+    """
+    if extracted is None:
+        return -extraction_penalty
+    if verdict >= 0.5:
+        return 1.0 - _length_penalty(tokenizer, extracted, gold, length_coef, length_cap)
+    return 0.0
+
+
+def make_verifier_reward_func(cfg: ExperimentConfig):
+    """TRL GRPO reward matching General-Reasoner (arXiv 2505.14652 — the
+    WebInstruct-verified authors, same Qwen3-4B-Base + GRPO, no SFT).
+
+    TRL passes dataset columns as kwargs, so rows must carry `question` and
+    `solution` (see data.py). Per rollout: extract the boxed/marked final answer;
+    if none is extractable the reward is `-extraction_penalty` (default -0.5,
+    without a verifier call); otherwise the general-verifier judges equivalence to
+    the reference -> +1 minus a small length penalty when correct, 0 when wrong.
+    The -0.5 keeps outputs parseable AND injects within-group variance so all-wrong
+    groups still have a gradient. Pure verifier-only {0,1} is recovered with
+    extraction_penalty=0 and length_penalty_coef=0.
     """
     def verifier_reward_func(completions, question=None, solution=None, **kwargs):
         if question is None or solution is None:
@@ -166,10 +198,31 @@ def make_verifier_reward_func(cfg: ExperimentConfig):
                 "in the dataset (see experiments/data.py)."
             )
         responses = [c[0]["content"] for c in completions]
-        students = [_student_answer(r) for r in responses]
+        extracted = [extract_math_final_answer(r) for r in responses]
         verifier = get_verifier_from_config(cfg)
-        return verifier.verify_batch(list(question), list(solution), students)
+
+        # Call the heavyweight verifier ONLY on rollouts with an extractable answer;
+        # unextractable ones get the penalty without a verifier pass.
+        idx = [i for i, a in enumerate(extracted) if a is not None]
+        verdicts: dict[int, float] = {}
+        if idx:
+            v = verifier.verify_batch(
+                [question[i] for i in idx],
+                [solution[i] for i in idx],
+                [extracted[i] for i in idx],
+            )
+            verdicts = dict(zip(idx, v))
+
+        return [
+            _gr_score(
+                extracted[i], solution[i], verdicts.get(i, 0.0), verifier.tokenizer,
+                extraction_penalty=cfg.extraction_penalty,
+                length_coef=cfg.length_penalty_coef,
+                length_cap=cfg.length_penalty_cap,
+            )
+            for i in range(len(responses))
+        ]
 
     # Name shows up in TRL/W&B reward logs.
-    verifier_reward_func.__name__ = "general_verifier_reward"
+    verifier_reward_func.__name__ = "general_reasoner_reward"
     return verifier_reward_func
