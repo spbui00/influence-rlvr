@@ -66,7 +66,7 @@ N_TRAIN_GPU="${N_TRAIN_GPU:-7}"
 # generation to ONE device-round (grad_accum still accumulates rounds into the full
 # effective batch). max_completion 2048 (4096 OOMs HF gen — KV scales with it).
 PER_DEVICE_BATCH="${PER_DEVICE_BATCH:-8}"
-MAX_COMPLETION="${MAX_COMPLETION:-2048}"
+MAX_COMPLETION="${MAX_COMPLETION:-4096}"   # GR's value; fits now that GEN_BATCH bounds the rollout
 GRAD_ACCUM="${GRAD_ACCUM:-16}"           # prompts/step = N_TRAIN_GPU x GRAD_ACCUM x (PDB/g_train)
 GENPORT="${GENPORT:-51216}"              # policy-gen server port (NOT 8000 — vLLM uses 8000 internally)
 POOL="${POOL:-1500}"
