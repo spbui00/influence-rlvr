@@ -146,7 +146,14 @@ class ExperimentConfig:
     vllm_max_model_len: int | None = 4096
     vllm_enable_sleep_mode: bool = True        # colocate only
     vllm_server_host: str = "127.0.0.1"        # server mode
-    vllm_server_port: int = 8000               # server mode
+    vllm_server_port: int = 8000               # server mode (HTTP API)
+    # TRL's weight-sync NCCL group port (server mode, TRL>=1.x). MUST differ from
+    # vllm_server_port: TRL's own default for this is 51216 — which is exactly the
+    # HTTP port our old slurm used, so the sync TCPStore hit the HTTP server and
+    # failed ("Ping failed, invalid value"). Keep them disjoint. Ignored by TRL
+    # 0.29 (filtered out in make_grpo_config), so the HF path is unaffected.
+    vllm_group_port: int = 51217               # server mode (weight-sync group)
+    vllm_server_timeout: float = 240.0         # server mode (init/connect timeout, s)
 
     # ── Verifier (reward model) ─────────────────────────────────────────────
     verifier_model_id: str = "TIGER-Lab/general-verifier"

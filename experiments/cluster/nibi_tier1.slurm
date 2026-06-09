@@ -48,20 +48,24 @@ MODEL="${MODEL:-Qwen/Qwen3-4B-Base}"
 VERIFIER="${VERIFIER:-TIGER-Lab/general-verifier}"
 VPORT="${VPORT:-8100}"
 # POLICY generation backend:
-#   USE_VLLM_GEN=0 (default) -> HF transformers.generate. Slower, but ZERO vLLM
-#     version surface — it just works. Both vLLM-training paths are broken against
-#     the cluster's vLLM 0.22: colocate (memory-profiling race) AND server (the
-#     trainer<->server weight-sync TCPStore handshake mismatches). HF gets the
-#     science now (batch SCALE is what we're testing; the gen backend only affects
-#     speed, not whether the model learns).
-#   USE_VLLM_GEN=1 -> policy-gen vLLM server (trl vllm-serve). Faster; flip ON only
-#     once a TRL/vLLM pair with a working weight-sync is installed (avail_wheels).
-# Verifier ALWAYS uses its own `vllm serve` (that works on 0.22). GPU layout:
-# 0..N_TRAIN_GPU-1 = DP train, then verifier (and gen if USE_VLLM_GEN=1).
+#   USE_VLLM_GEN=1 -> policy-gen vLLM server (trl vllm-serve). FAST (~2-3x). Needs
+#     trl>=1.2.0 (the Alliance wheelhouse pair with vllm 0.22): 1.2.0 routes the
+#     weight-sync through a dedicated vllm_group_port DISTINCT from the HTTP port,
+#     fixing the 0.29 collision (the sync TCPStore used to hit the HTTP server ->
+#     "Ping failed"). DP workers connect over HTTP and sync LoRA weights each step.
+#   USE_VLLM_GEN=0 (default) -> HF transformers.generate. Slower but ZERO vLLM
+#     version surface — the version-proof fallback if the sync still misbehaves.
+# Verifier ALWAYS uses its own `vllm serve` (works on 0.22; no weight sync). Ports
+# (ALL disjoint — a collision here is what broke the old sync):
+#   verifier HTTP :VPORT(8100) | policy-gen HTTP :GENPORT | weight-sync :GENPORT+1
+#   | accelerate DDP :29500. GPU layout 0..N_TRAIN_GPU-1 = DP train, then verifier
+#   (HF) or gen+verifier (vLLM):
 #   HF gen   -> 8-GPU: N_TRAIN_GPU=7 ; 4-GPU smoke: N_TRAIN_GPU=3
 #   vLLM gen -> 8-GPU: N_TRAIN_GPU=6 ; 4-GPU smoke: N_TRAIN_GPU=2
 USE_VLLM_GEN="${USE_VLLM_GEN:-0}"
-N_TRAIN_GPU="${N_TRAIN_GPU:-7}"
+# vLLM gen needs a dedicated GPU for the gen server, so default to one fewer
+# training GPU (gen on GPU N_TRAIN_GPU, verifier on N_TRAIN_GPU+1 = GPU 7).
+if [ "$USE_VLLM_GEN" = "1" ]; then N_TRAIN_GPU="${N_TRAIN_GPU:-6}"; else N_TRAIN_GPU="${N_TRAIN_GPU:-7}"; fi
 G_TRAIN="${G_TRAIN:-8}"                   # GRPO group size (completions/prompt; GR-4B = 8)
 # Training-step peak memory is dominated by the LM-head LOGITS tensor in the loss:
 #   per_device_batch x seq x vocab(151936) x 4 bytes (fp32). At per_device=8,
@@ -75,7 +79,8 @@ G_TRAIN="${G_TRAIN:-8}"                   # GRPO group size (completions/prompt;
 PER_DEVICE_BATCH="${PER_DEVICE_BATCH:-4}"
 MAX_COMPLETION="${MAX_COMPLETION:-2048}"
 GRAD_ACCUM="${GRAD_ACCUM:-32}"           # prompts/step = N_TRAIN_GPU x GRAD_ACCUM x (PDB/g_train)
-GENPORT="${GENPORT:-51216}"              # policy-gen server port (NOT 8000 — vLLM uses 8000 internally)
+GENPORT="${GENPORT:-51216}"              # policy-gen HTTP server port (NOT 8000 — vLLM uses 8000 internally)
+GROUPPORT="${GROUPPORT:-$((GENPORT + 1))}"  # weight-sync NCCL group port; MUST differ from GENPORT
 POOL="${POOL:-1500}"
 export IFRLVR_DEBUG_SAMPLES="${IFRLVR_DEBUG_SAMPLES:-2}"
 # generation_batch_size must divide evenly by BOTH (per_device x num_proc) AND
@@ -86,7 +91,7 @@ _PDNP=$((PER_DEVICE_BATCH * N_TRAIN_GPU))
 GEN_BATCH=$(( _PDNP * G_TRAIN / $(_gcd "$_PDNP" "$G_TRAIN") ))   # lcm(per_device*num_proc, g_train)
 if [ "$USE_VLLM_GEN" = "1" ]; then
     GEN_GPU=$N_TRAIN_GPU; VERIFIER_GPU=$((N_TRAIN_GPU + 1))
-    VLLM_ARGS="--use-vllm --vllm-mode server --vllm-server-host 127.0.0.1 --vllm-server-port $GENPORT"
+    VLLM_ARGS="--use-vllm --vllm-mode server --vllm-server-host 127.0.0.1 --vllm-server-port $GENPORT --vllm-group-port $GROUPPORT"
 else
     VERIFIER_GPU=$N_TRAIN_GPU
     VLLM_ARGS="--no-use-vllm --generation-batch-size $GEN_BATCH"

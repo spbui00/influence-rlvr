@@ -139,7 +139,9 @@ def make_grpo_config(cfg: ExperimentConfig, *, max_steps: int, shuffle: bool = T
         if cfg.vllm_mode == "server":
             # Engine lives in a separate `trl vllm-serve` process; just point at it.
             kw["vllm_server_host"] = cfg.vllm_server_host
-            kw["vllm_server_port"] = cfg.vllm_server_port
+            kw["vllm_server_port"] = cfg.vllm_server_port      # HTTP API
+            kw["vllm_group_port"] = cfg.vllm_group_port        # weight-sync NCCL group (must != HTTP)
+            kw["vllm_server_timeout"] = cfg.vllm_server_timeout
         else:  # colocate
             kw["vllm_gpu_memory_utilization"] = cfg.vllm_gpu_memory_utilization
             kw["vllm_enable_sleep_mode"] = cfg.vllm_enable_sleep_mode

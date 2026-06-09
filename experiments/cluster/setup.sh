@@ -46,7 +46,10 @@ pip install -e "$PROJECT_DIR" --no-deps
 # Remaining runtime deps. transformers/trl/peft/accelerate come from the
 # wheelhouse and pull most transitive deps; the trailing names backfill torch's
 # runtime deps that --no-deps skipped (these caused import errors otherwise).
-pip install transformers accelerate trl peft math-verify wandb \
+# trl is PINNED to 1.2.0: it's the Alliance wheelhouse's pair with vllm 0.22 and
+# the first version whose vLLM weight-sync (dedicated vllm_group_port) works with
+# it — 0.29's sync collides the group port with the HTTP port. See nibi_tier1.slurm.
+pip install transformers accelerate trl==1.2.0 peft math-verify wandb \
             typing_extensions sympy mpmath networkx jinja2 filelock fsspec
 
 python -c "import torch, transformers, trl, peft, datasets, pyarrow, numpy, scipy, pandas; \
