@@ -13,9 +13,10 @@
 #              windows => colocate is fine (one engine per process).
 #   GPU 7    : verifier vLLM server (fixed model, no weight sync).
 #
-# Batch: 7 workers x grad_accum x (per_device_batch/g_train) = 7 x 14 x (16/8=2)
-#        = 196 prompts/step  (~1/5 of GR's 1024; ~24x our old 8).
-# GR HPs: response 4096, temp 0.7, clip-higher 0.3, LoRA r32, lr 1e-5 (LoRA).
+# Batch: N_TRAIN_GPU x grad_accum x (per_device_batch/g_train) = 7 x 32 x (4/8)
+#        = 112 prompts/step  (~1/9 of GR's 1024; ~14x our old 8).
+# GR HPs: temp 0.7, clip-higher 0.3, LoRA r32, lr 1e-5 (LoRA). Response capped at
+#         2048 (not GR's 4096) so the LM-head logits fit in 80 GB — see batch note.
 #
 #   sbatch experiments/cluster/nibi_tier1.slurm
 #   STEPS=400 GRAD_ACCUM=22 sbatch experiments/cluster/nibi_tier1.slurm   # bigger
@@ -61,17 +62,28 @@ VPORT="${VPORT:-8100}"
 #   vLLM gen -> 8-GPU: N_TRAIN_GPU=6 ; 4-GPU smoke: N_TRAIN_GPU=2
 USE_VLLM_GEN="${USE_VLLM_GEN:-0}"
 N_TRAIN_GPU="${N_TRAIN_GPU:-7}"
-# HF generate is memory-bound (no paged attention), so keep the per-GPU rollout
-# small. per_device_batch=8 = g_train(8) -> 1 prompt/device/round; GEN_BATCH caps
-# generation to ONE device-round (grad_accum still accumulates rounds into the full
-# effective batch). max_completion 2048 (4096 OOMs HF gen — KV scales with it).
-PER_DEVICE_BATCH="${PER_DEVICE_BATCH:-8}"
-MAX_COMPLETION="${MAX_COMPLETION:-4096}"   # GR's value; fits now that GEN_BATCH bounds the rollout
-GRAD_ACCUM="${GRAD_ACCUM:-16}"           # prompts/step = N_TRAIN_GPU x GRAD_ACCUM x (PDB/g_train)
+G_TRAIN="${G_TRAIN:-8}"                   # GRPO group size (completions/prompt; GR-4B = 8)
+# Training-step peak memory is dominated by the LM-head LOGITS tensor in the loss:
+#   per_device_batch x seq x vocab(151936) x 4 bytes (fp32). At per_device=8,
+#   seq=4096 that ONE tensor is 18.55 GiB and OOMs the backward on an 80 GB H100
+#   (gradient checkpointing can't help — the head is outside the checkpointed
+#   blocks). Fix: shrink the MICRO-batch (per_device=4) and recover the full
+#   effective batch with gradient accumulation (grad_accum=32) -> identical
+#   optimizer step, ~half the peak. max_completion 2048 (vs GR's 4096) halves the
+#   logits again for headroom and still covers ~all WebInstruct reasoning. Both
+#   are pure MEMORY knobs — prompts/step (what Tier-1 tests) is held at 112.
+PER_DEVICE_BATCH="${PER_DEVICE_BATCH:-4}"
+MAX_COMPLETION="${MAX_COMPLETION:-2048}"
+GRAD_ACCUM="${GRAD_ACCUM:-32}"           # prompts/step = N_TRAIN_GPU x GRAD_ACCUM x (PDB/g_train)
 GENPORT="${GENPORT:-51216}"              # policy-gen server port (NOT 8000 — vLLM uses 8000 internally)
 POOL="${POOL:-1500}"
 export IFRLVR_DEBUG_SAMPLES="${IFRLVR_DEBUG_SAMPLES:-2}"
-GEN_BATCH=$((N_TRAIN_GPU * PER_DEVICE_BATCH))   # one device-round; bounds HF-gen peak KV memory
+# generation_batch_size must divide evenly by BOTH (per_device x num_proc) AND
+# g_train. The least common multiple is the smallest valid rollout chunk -> keeps
+# HF-gen peak memory low (TRL just runs more, smaller generation rounds per step).
+_gcd() { local a=$1 b=$2 t; while [ "$b" -ne 0 ]; do t=$b; b=$((a % b)); a=$t; done; echo "$a"; }
+_PDNP=$((PER_DEVICE_BATCH * N_TRAIN_GPU))
+GEN_BATCH=$(( _PDNP * G_TRAIN / $(_gcd "$_PDNP" "$G_TRAIN") ))   # lcm(per_device*num_proc, g_train)
 if [ "$USE_VLLM_GEN" = "1" ]; then
     GEN_GPU=$N_TRAIN_GPU; VERIFIER_GPU=$((N_TRAIN_GPU + 1))
     VLLM_ARGS="--use-vllm --vllm-mode server --vllm-server-host 127.0.0.1 --vllm-server-port $GENPORT"
@@ -141,7 +153,7 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     --if-target-source mmlu_pro_cs --eval-benchmarks mmlu_pro_cs,gsm8k \
     --live-eval-benchmark mmlu_pro_cs --n-train-pool "$POOL" --n-if-target 64 \
     --max-steps "$STEPS" --save-steps 50 \
-    --g-train 8 --per-device-batch "$PER_DEVICE_BATCH" --grad-accum "$GRAD_ACCUM" \
+    --g-train "$G_TRAIN" --per-device-batch "$PER_DEVICE_BATCH" --grad-accum "$GRAD_ACCUM" \
     --max-completion-length "$MAX_COMPLETION" --grpo-temperature 0.7 --grpo-epsilon-high 0.3 \
     --learning-rate 1e-5 \
     $VLLM_ARGS \
