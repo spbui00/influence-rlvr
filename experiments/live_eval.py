@@ -37,6 +37,21 @@ class LiveEvalCallback(TrainerCallback):
                 with self.csv_path.open("w", newline="") as f:
                     csv.writer(f).writerow(["step", "n", "accuracy", "per_category_json"])
 
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        """Anchor a step-0 baseline (untrained model) so the gate sees the FULL
+        held-out rise — on_step_end's first eval is at step=`every`, by which point
+        the fast early gains are already banked, so without this the gate can read
+        a false NO-GO. Fresh starts only (skip on --resume); also an early canary
+        that the eval path works before we sink hours into training."""
+        if self.every <= 0 or not self.eval_examples or not state.is_world_process_zero:
+            return
+        if int(state.global_step) != 0:   # resume: the trajectory already has its anchor
+            return
+        mdl = model if model is not None else kwargs.get("model")
+        if mdl is not None:
+            self._last_step = 0
+            self._safe_evaluate(mdl, 0)
+
     def on_step_end(self, args, state, control, model=None, **kwargs):
         if self.every <= 0 or not self.eval_examples or model is None:
             return
@@ -46,11 +61,25 @@ class LiveEvalCallback(TrainerCallback):
         if step == self._last_step or step % self.every != 0:
             return
         self._last_step = step
-        self._evaluate(model, step)
+        self._safe_evaluate(model, step)
+
+    def _safe_evaluate(self, model, step: int) -> None:
+        """A held-out eval must never crash training — a broken eval path should
+        cost one data point, not a multi-hour run. Failures print and continue;
+        checkpoints are still saved, so the trajectory can be rebuilt offline."""
+        try:
+            self._evaluate(model, step)
+        except Exception as e:
+            print(f"[live-eval] eval at step {step} skipped ({type(e).__name__}: {e})")
 
     @torch.inference_mode()
     def _evaluate(self, model, step: int) -> None:
         from .evaluate import score_examples  # local import avoids any import cycle
+
+        # DP: the trainer may hand us a DDP/accelerate-wrapped module — .generate
+        # and .config live on the inner model, so unwrap (no-op if already plain).
+        while hasattr(model, "module"):
+            model = model.module
 
         was_training = model.training
         prev_use_cache = getattr(model.config, "use_cache", None)

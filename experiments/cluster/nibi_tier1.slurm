@@ -41,6 +41,11 @@ source experiments/cluster/env.sh
 RUN_NAME="${RUN_NAME:-nibi_t1_baseline}"
 SEED="${SEED:-42}"
 STEPS="${STEPS:-300}"
+# Checkpoint + held-out eval cadence. Eval fires at step 0 (baseline anchor) then
+# every SAVE_STEPS; checkpoints at the same cadence double as --resume points if a
+# job hits its time limit. Smaller = finer gate trajectory + cheaper resume, but
+# each eval pauses training briefly.
+SAVE_STEPS="${SAVE_STEPS:-50}"
 # RESUME=1 continues from the latest checkpoint under outputs/$RUN_NAME (same
 # RUN_NAME) — use it to recover a time-limit kill, or to extend max-steps later.
 RESUME_ARG=""; [ "${RESUME:-0}" = "1" ] && RESUME_ARG="--resume"
@@ -157,7 +162,7 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     --model-id "$MODEL" --lora-r 32 \
     --if-target-source mmlu_pro_cs --eval-benchmarks mmlu_pro_cs,gsm8k \
     --live-eval-benchmark mmlu_pro_cs --n-train-pool "$POOL" --n-if-target 64 \
-    --max-steps "$STEPS" --save-steps 50 \
+    --max-steps "$STEPS" --save-steps "$SAVE_STEPS" \
     --g-train "$G_TRAIN" --per-device-batch "$PER_DEVICE_BATCH" --grad-accum "$GRAD_ACCUM" \
     --max-completion-length "$MAX_COMPLETION" --grpo-temperature 0.7 --grpo-epsilon-high 0.3 \
     --learning-rate 1e-5 \
