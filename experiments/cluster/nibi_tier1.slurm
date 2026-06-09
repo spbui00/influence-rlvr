@@ -61,16 +61,23 @@ VPORT="${VPORT:-8100}"
 #   vLLM gen -> 8-GPU: N_TRAIN_GPU=6 ; 4-GPU smoke: N_TRAIN_GPU=2
 USE_VLLM_GEN="${USE_VLLM_GEN:-0}"
 N_TRAIN_GPU="${N_TRAIN_GPU:-7}"
-GRAD_ACCUM="${GRAD_ACCUM:-16}"           # 7 x GRAD_ACCUM x 2 = prompts/step (16 -> 224)
+# HF generate is memory-bound (no paged attention), so keep the per-GPU rollout
+# small. per_device_batch=8 = g_train(8) -> 1 prompt/device/round; GEN_BATCH caps
+# generation to ONE device-round (grad_accum still accumulates rounds into the full
+# effective batch). max_completion 2048 (4096 OOMs HF gen — KV scales with it).
+PER_DEVICE_BATCH="${PER_DEVICE_BATCH:-8}"
+MAX_COMPLETION="${MAX_COMPLETION:-2048}"
+GRAD_ACCUM="${GRAD_ACCUM:-16}"           # prompts/step = N_TRAIN_GPU x GRAD_ACCUM x (PDB/g_train)
 GENPORT="${GENPORT:-51216}"              # policy-gen server port (NOT 8000 — vLLM uses 8000 internally)
 POOL="${POOL:-1500}"
 export IFRLVR_DEBUG_SAMPLES="${IFRLVR_DEBUG_SAMPLES:-2}"
+GEN_BATCH=$((N_TRAIN_GPU * PER_DEVICE_BATCH))   # one device-round; bounds HF-gen peak KV memory
 if [ "$USE_VLLM_GEN" = "1" ]; then
     GEN_GPU=$N_TRAIN_GPU; VERIFIER_GPU=$((N_TRAIN_GPU + 1))
     VLLM_ARGS="--use-vllm --vllm-mode server --vllm-server-host 127.0.0.1 --vllm-server-port $GENPORT"
 else
     VERIFIER_GPU=$N_TRAIN_GPU
-    VLLM_ARGS="--no-use-vllm"
+    VLLM_ARGS="--no-use-vllm --generation-batch-size $GEN_BATCH"
 fi
 
 # Pre-flight: show GPU memory so a squatting process (e.g. a leaked vLLM worker
@@ -134,8 +141,8 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     --if-target-source mmlu_pro_cs --eval-benchmarks mmlu_pro_cs,gsm8k \
     --live-eval-benchmark mmlu_pro_cs --n-train-pool "$POOL" --n-if-target 64 \
     --max-steps "$STEPS" --save-steps 50 \
-    --g-train 8 --per-device-batch 16 --grad-accum "$GRAD_ACCUM" \
-    --max-completion-length 4096 --grpo-temperature 0.7 --grpo-epsilon-high 0.3 \
+    --g-train 8 --per-device-batch "$PER_DEVICE_BATCH" --grad-accum "$GRAD_ACCUM" \
+    --max-completion-length "$MAX_COMPLETION" --grpo-temperature 0.7 --grpo-epsilon-high 0.3 \
     --learning-rate 1e-5 \
     $VLLM_ARGS \
     --verifier-backend vllm --verifier-server-port "$VPORT" --verifier-max-new-tokens 1024 \
