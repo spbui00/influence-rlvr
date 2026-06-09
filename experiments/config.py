@@ -9,6 +9,8 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import types
+import typing
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -333,7 +335,30 @@ class ExperimentConfig:
     # ── CLI ─────────────────────────────────────────────────────────────────
     @classmethod
     def add_arguments(cls, parser: argparse.ArgumentParser) -> None:
-        """Register one --flag per scalar field, with the dataclass default."""
+        """Register one --flag per scalar field, with the dataclass default.
+
+        Dispatch the argparse ``type=`` from the field's DECLARED type, not the
+        default's runtime type. A field like ``generation_batch_size: int | None
+        = None`` has default ``None``, so ``isinstance(default, int)`` is False —
+        it would silently parse as a string ("56"), which then blows up
+        downstream (TRL does ``"56" % n`` -> "not all arguments converted during
+        string formatting"). Resolving the annotation handles ``int | None``.
+        """
+        try:
+            hints = typing.get_type_hints(cls)
+        except Exception:
+            hints = {}
+
+        def scalar_type(field_name: str):
+            """Non-None scalar of a field's type, unwrapping Optional / ``X|None``."""
+            tp = hints.get(field_name)
+            origin = typing.get_origin(tp)
+            if origin is typing.Union or origin is getattr(types, "UnionType", object()):
+                non_none = [a for a in typing.get_args(tp) if a is not type(None)]
+                if len(non_none) == 1:
+                    return non_none[0]
+            return tp
+
         parser.add_argument("--config", type=str, default=None,
                             help="Path to a config.json to load as the base (CLI flags override).")
         for f in dataclasses.fields(cls):
@@ -341,7 +366,8 @@ class ExperimentConfig:
                 continue
             default = f.default
             name = "--" + f.name.replace("_", "-")
-            if f.type == "bool" or isinstance(default, bool):
+            base = scalar_type(f.name)
+            if base is bool or isinstance(default, bool):
                 # Support --flag / --no-flag.
                 parser.add_argument(name, dest=f.name, action="store_true", default=None)
                 parser.add_argument("--no-" + f.name.replace("_", "-"),
@@ -349,9 +375,9 @@ class ExperimentConfig:
             elif f.name in {"lora_target_modules", "domains", "eval_benchmarks", "webinstruct_test_domains"}:
                 parser.add_argument(name, type=str, default=None,
                                     help="Comma-separated list.")
-            elif isinstance(default, int):
+            elif base is int or (base is None and isinstance(default, int)):
                 parser.add_argument(name, type=int, default=None)
-            elif isinstance(default, float):
+            elif base is float or (base is None and isinstance(default, float)):
                 parser.add_argument(name, type=float, default=None)
             else:
                 parser.add_argument(name, type=str, default=None)
