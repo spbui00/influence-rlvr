@@ -42,8 +42,12 @@ class LiveEvalCallback(TrainerCallback):
         held-out rise — on_step_end's first eval is at step=`every`, by which point
         the fast early gains are already banked, so without this the gate can read
         a false NO-GO. Fresh starts only (skip on --resume); also an early canary
-        that the eval path works before we sink hours into training."""
-        if self.every <= 0 or not self.eval_examples or not state.is_world_process_zero:
+        that the eval path works before we sink hours into training.
+
+        ALL ranks must call this — the eval is sharded + all-reduced, so gating it
+        to rank 0 would let the others race into the next collective and hang the
+        NCCL watchdog (the rank-0-only eval took longer than rank 1's heartbeat)."""
+        if self.every <= 0 or not self.eval_examples:
             return
         if int(state.global_step) != 0:   # resume: the trajectory already has its anchor
             return
@@ -53,10 +57,12 @@ class LiveEvalCallback(TrainerCallback):
             self._safe_evaluate(mdl, 0)
 
     def on_step_end(self, args, state, control, model=None, **kwargs):
+        # Every rank runs this — the eval shards across ranks and all-reduces, so
+        # they stay in lockstep. The cadence checks key off the (rank-identical)
+        # global_step, so all ranks enter or skip together (a divergence here would
+        # desync the all-reduce).
         if self.every <= 0 or not self.eval_examples or model is None:
             return
-        if not state.is_world_process_zero:
-            return  # DP: rank 0 alone runs the held-out eval + writes CSV/wandb
         step = int(state.global_step)
         if step == self._last_step or step % self.every != 0:
             return
@@ -74,13 +80,30 @@ class LiveEvalCallback(TrainerCallback):
 
     @torch.inference_mode()
     def _evaluate(self, model, step: int) -> None:
+        """Held-out eval, SHARDED across DP ranks: each rank scores
+        eval_examples[rank::world] and the (correct, n) counts are all-reduced, so
+        every rank stays in lockstep and finishes together. A rank-0-only eval (the
+        old design) let the other ranks race into the next training collective,
+        which then sat pending past the NCCL heartbeat and aborted. Only rank 0
+        logs/writes; every rank MUST reach the all-reduce."""
         from .evaluate import score_examples  # local import avoids any import cycle
+        import torch.distributed as dist
 
         # DP: the trainer may hand us a DDP/accelerate-wrapped module — .generate
         # and .config live on the inner model, so unwrap (no-op if already plain).
         while hasattr(model, "module"):
             model = model.module
 
+        ddp = dist.is_available() and dist.is_initialized()
+        world = dist.get_world_size() if ddp else 1
+        rank = dist.get_rank() if ddp else 0
+        shard = self.eval_examples[rank::world] if world > 1 else self.eval_examples
+        dev = next(model.parameters()).device
+
+        # Score this rank's shard. A failure contributes 0 but STILL falls through
+        # to the all-reduce below — no rank may be left waiting at the collective.
+        local_correct = local_n = 0.0
+        cats: list[str] = []
         was_training = model.training
         prev_use_cache = getattr(model.config, "use_cache", None)
         try:
@@ -88,10 +111,16 @@ class LiveEvalCallback(TrainerCallback):
             if hasattr(model, "gradient_checkpointing_disable"):
                 model.gradient_checkpointing_disable()
             model.eval()
-            res = score_examples(
-                self.eval_examples, model, self.tokenizer, self.cfg, self.device,
-                max_new_tokens=self.cfg.live_eval_max_new_tokens,
-            )
+            if shard:
+                res = score_examples(
+                    shard, model, self.tokenizer, self.cfg, dev,
+                    max_new_tokens=self.cfg.live_eval_max_new_tokens,
+                )
+                local_n = float(res["n"])
+                local_correct = float(res["accuracy"]) * local_n
+                cats = list(res.get("per_category", {}).keys())
+        except Exception as e:
+            print(f"[live-eval] rank {rank} shard failed ({type(e).__name__}: {e})")
         finally:
             if prev_use_cache is not None:
                 model.config.use_cache = prev_use_cache
@@ -100,10 +129,24 @@ class LiveEvalCallback(TrainerCallback):
             if was_training:
                 model.train()
 
-        logs = {"eval/accuracy": res["accuracy"], "eval/n": res["n"]}
-        for cat, acc in res["per_category"].items():
-            key = cat.lower().replace(" ", "_") or "unknown"
-            logs[f"eval/acc_{key}"] = acc
+        # Reduce counts across ranks — EVERY rank reaches this (else NCCL desyncs).
+        if world > 1:
+            t = torch.tensor([local_correct, local_n], dtype=torch.float64, device=dev)
+            dist.all_reduce(t)
+            correct, n = float(t[0].item()), float(t[1].item())
+        else:
+            correct, n = local_correct, local_n
+        accuracy = correct / max(n, 1.0)
+
+        if rank != 0:
+            return  # only rank 0 logs + owns the CSV/wandb
+
+        # Single-benchmark live eval -> per-category is the overall accuracy under
+        # its label (exact for the one-category MMLU-Pro-CS target).
+        per_category = {c: accuracy for c in cats}
+        logs = {"eval/accuracy": accuracy, "eval/n": int(n)}
+        for cat, acc in per_category.items():
+            logs[f"eval/acc_{cat.lower().replace(' ', '_') or 'unknown'}"] = acc
         try:
             import wandb
             if wandb.run is not None:
@@ -113,8 +156,8 @@ class LiveEvalCallback(TrainerCallback):
         with self.csv_path.open("a", newline="") as f:
             import json
             csv.writer(f).writerow(
-                [step, res["n"], f"{res['accuracy']:.6f}", json.dumps(res["per_category"])]
+                [step, int(n), f"{accuracy:.6f}", json.dumps(per_category)]
             )
-        cats = ", ".join(f"{c}={a:.3f}" for c, a in res["per_category"].items())
-        print(f"[live-eval] step {step}: held-out acc={res['accuracy']:.4f} "
-              f"(n={res['n']}){' | ' + cats if cats else ''}")
+        catstr = ", ".join(f"{c}={a:.3f}" for c, a in per_category.items())
+        print(f"[live-eval] step {step}: held-out acc={accuracy:.4f} "
+              f"(n={int(n)}){' | ' + catstr if catstr else ''}")

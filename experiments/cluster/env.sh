@@ -25,6 +25,10 @@ export WANDB_DIR="${WANDB_DIR:-$HOME/scratch/wandb}"; mkdir -p "$WANDB_DIR"
 export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-$HOME/scratch/wandb/cache}"; mkdir -p "$WANDB_CACHE_DIR"
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True   # reduce fragmentation OOMs
+# The in-training held-out eval shards across DP ranks (live_eval.py). Raise the
+# NCCL watchdog heartbeat (default 480s) so a slightly-slower rank's eval shard
+# can't trip the collective-progress timeout while the others wait at the all-reduce.
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-1800}"
 # Compute nodes here have internet, so we leave HF online (warm cache is used
 # anyway). Uncomment to force offline reads:
 # export HF_HUB_OFFLINE=1
