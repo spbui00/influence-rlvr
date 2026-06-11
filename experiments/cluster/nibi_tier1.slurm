@@ -112,6 +112,19 @@ fi
 # 15-min timeout. A non-empty "memory.used" on our GPUs here = trouble.
 echo "GPU state at launch:"; nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv,noheader || true
 
+# Fail FAST if the GPU layout doesn't fit the allocation. The classic miss: forget
+# the `N_TRAIN_GPU=2` env prefix on a 4-GPU job, so N_TRAIN_GPU defaults to 6/7 and
+# the verifier is placed on a GPU that doesn't exist -> vLLM dies with an opaque
+# NVML error only after the 900s wait. VERIFIER_GPU is the highest index we use.
+NGPU_ALLOC=$(nvidia-smi -L 2>/dev/null | wc -l)
+if [ "${NGPU_ALLOC:-0}" -gt 0 ] && [ "$VERIFIER_GPU" -ge "$NGPU_ALLOC" ]; then
+    echo "ERROR: layout needs GPU index up to $VERIFIER_GPU but only $NGPU_ALLOC GPU(s) allocated."
+    echo "  USE_VLLM_GEN=$USE_VLLM_GEN N_TRAIN_GPU=$N_TRAIN_GPU -> train 0..$((N_TRAIN_GPU-1)),$([ "$USE_VLLM_GEN" = "1" ] && echo " gen $GEN_GPU,") verifier $VERIFIER_GPU."
+    echo "  Did you forget the env prefix? For --gres=gpu:h100:$NGPU_ALLOC use:"
+    echo "    vLLM gen: N_TRAIN_GPU=$((NGPU_ALLOC-2))   |   HF gen: N_TRAIN_GPU=$((NGPU_ALLOC-1))"
+    exit 1
+fi
+
 # ── verifier vLLM server (always); policy-gen vLLM server (only if USE_VLLM_GEN=1) ─
 # 0.30 util is plenty for a 1.5B verifier (~10 GiB incl. KV) and far more robust to
 # a partly-occupied GPU than 0.85 (which demands 67 GiB).
