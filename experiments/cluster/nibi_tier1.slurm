@@ -46,6 +46,11 @@ STEPS="${STEPS:-300}"
 # job hits its time limit. Smaller = finer gate trajectory + cheaper resume, but
 # each eval pauses training briefly.
 SAVE_STEPS="${SAVE_STEPS:-50}"
+# LoRA learning rate. GR's 5e-7 is for FULL-param; LoRA (66M params, B inits at 0)
+# needs a much larger lr or it crawls — at 1e-5 the per-step update was ~lr*grad_norm
+# ~1e-6, so the adapter barely moved in the first steps. 5e-5 gets it actually
+# training; sweep up toward 1e-4 if still slow, down if reward collapses.
+LR="${LR:-5e-5}"
 # RESUME=1 continues from the latest checkpoint under outputs/$RUN_NAME (same
 # RUN_NAME) — use it to recover a time-limit kill, or to extend max-steps later.
 RESUME_ARG=""; [ "${RESUME:-0}" = "1" ] && RESUME_ARG="--resume"
@@ -165,7 +170,7 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     --max-steps "$STEPS" --save-steps "$SAVE_STEPS" \
     --g-train "$G_TRAIN" --per-device-batch "$PER_DEVICE_BATCH" --grad-accum "$GRAD_ACCUM" \
     --max-completion-length "$MAX_COMPLETION" --grpo-temperature 0.7 --grpo-epsilon-high 0.3 \
-    --learning-rate 1e-5 \
+    --learning-rate "$LR" \
     $VLLM_ARGS \
     --verifier-backend vllm --verifier-server-port "$VPORT" --verifier-max-new-tokens 1024 \
     --live-eval-examples 64 --eval-max-examples 200
