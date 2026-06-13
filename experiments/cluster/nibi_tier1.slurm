@@ -51,6 +51,18 @@ SAVE_STEPS="${SAVE_STEPS:-50}"
 # ~1e-6, so the adapter barely moved in the first steps. 5e-5 gets it actually
 # training; sweep up toward 1e-4 if still slow, down if reward collapses.
 LR="${LR:-5e-5}"
+# ── Target + eval ─────────────────────────────────────────────────────────────
+# Held-out WebInstruct (free-form REASONING) is the default target: training
+# transfers to it and the general-verifier handles it — unlike MMLU-Pro-CS, which
+# is CS knowledge/judgment MCQ and stayed flat (the model learned, box_rate 0.91,
+# but the gains don't apply). IF target and eval should match. TEST_DOMAINS empty
+# = all of `domains`; set one (e.g. "finance") to target a single domain for the
+# cross-domain IF study (does math/cs data help that domain?).
+IF_TARGET="${IF_TARGET:-webinstruct}"
+LIVE_EVAL_BENCH="${LIVE_EVAL_BENCH:-webinstruct_test}"
+EVAL_BENCH="${EVAL_BENCH:-webinstruct_test}"
+TEST_DOMAINS="${TEST_DOMAINS:-}"
+TEST_DOMAINS_ARG=""; [ -n "$TEST_DOMAINS" ] && TEST_DOMAINS_ARG="--webinstruct-test-domains $TEST_DOMAINS"
 # RESUME=1 continues from the latest checkpoint under outputs/$RUN_NAME (same
 # RUN_NAME) — use it to recover a time-limit kill, or to extend max-steps later.
 RESUME_ARG=""; [ "${RESUME:-0}" = "1" ] && RESUME_ARG="--resume"
@@ -178,8 +190,8 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     -m experiments.train \
     --run-name "$RUN_NAME" --seed "$SEED" --regime baseline $RESUME_ARG \
     --model-id "$MODEL" --lora-r 32 \
-    --if-target-source mmlu_pro_cs --eval-benchmarks mmlu_pro_cs,gsm8k \
-    --live-eval-benchmark mmlu_pro_cs --n-train-pool "$POOL" --n-if-target 64 \
+    --if-target-source "$IF_TARGET" --eval-benchmarks "$EVAL_BENCH" $TEST_DOMAINS_ARG \
+    --live-eval-benchmark "$LIVE_EVAL_BENCH" --n-train-pool "$POOL" --n-if-target 64 \
     --max-steps "$STEPS" --save-steps "$SAVE_STEPS" \
     --g-train "$G_TRAIN" --per-device-batch "$PER_DEVICE_BATCH" --grad-accum "$GRAD_ACCUM" \
     --max-completion-length "$MAX_COMPLETION" --grpo-temperature 0.7 --grpo-epsilon-high 0.3 \
