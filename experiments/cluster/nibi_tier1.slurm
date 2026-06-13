@@ -60,7 +60,8 @@ LR="${LR:-5e-5}"
 # cross-domain IF study (does math/cs data help that domain?).
 IF_TARGET="${IF_TARGET:-webinstruct}"
 LIVE_EVAL_BENCH="${LIVE_EVAL_BENCH:-webinstruct_test}"
-EVAL_BENCH="${EVAL_BENCH:-webinstruct_test}"
+EVAL_BENCH="${EVAL_BENCH:-webinstruct_test}"   # used by BOTH live + final eval
+FINAL_EVAL_MAX="${FINAL_EVAL_MAX:-500}"        # final eval size (train-heldout = 1000 avail)
 TEST_DOMAINS="${TEST_DOMAINS:-}"
 TEST_DOMAINS_ARG=""; [ -n "$TEST_DOMAINS" ] && TEST_DOMAINS_ARG="--webinstruct-test-domains $TEST_DOMAINS"
 # TEST_FROM_TRAIN=1: carve the IF target + held-out eval from the TRAIN split, not
@@ -213,7 +214,7 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
 # ── Final held-out eval on GPU 0 (grades via the still-running verifier server) ─
 echo "================ EVAL ($RUN_NAME) ================"
 CUDA_VISIBLE_DEVICES=0 python -m experiments.evaluate --run-name "$RUN_NAME" \
-    --checkpoint-step latest --benchmarks mmlu_pro_cs,gsm8k --eval-max-examples 200 --vllm \
+    --checkpoint-step latest --benchmarks "$EVAL_BENCH" --eval-max-examples "$FINAL_EVAL_MAX" --vllm \
     --verifier-backend vllm --verifier-server-port "$VPORT" --verifier-max-new-tokens 1024
 
 echo "================ GATE VERDICT ($RUN_NAME) ================"
