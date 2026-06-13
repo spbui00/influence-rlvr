@@ -6,8 +6,8 @@ RLVR run.
 
 | Piece     | Choice |
 |-----------|--------|
-| Policy    | `Qwen/Qwen3-4B` + LoRA (rank 16, all attn+MLP proj) |
-| Algorithm | GRPO (TRL), vLLM-colocated generation |
+| Policy    | `Qwen3-4B-Base` / `Qwen3-1.7B-Base` + LoRA (rank 32, attn+MLP proj) |
+| Algorithm | GRPO (TRL), vLLM generation (server or colocate) |
 | Reward    | `TIGER-Lab/general-verifier` — generative answer-equivalence verifier |
 | Data      | `TIGER-Lab/WebInstruct-verified` filtered to **Math / CS / Finance** |
 | Influence | **conjugate gradients on the true sampled policy Fisher** (cached-gradient FVP) |
@@ -52,19 +52,26 @@ overlap, so the eval isn't measuring the examples the data-selection was tuned o
 The training pool comes from the `train` split, disjoint from both. External
 benchmarks (`gsm8k`, `math500`, …) are separate datasets — the cleanest signal.
 
-**Targeting a single domain (e.g. Computer Science):** `--webinstruct-test-domains cs`
-restricts *both* the IF target and the `webinstruct_test` eval to CS, while training
-still spans all `--domains`. So you prune the (math+cs+finance) pool by influence on
-held-out **CS** and test on held-out **CS**:
+**Targeting a single domain (e.g. Finance):** `--webinstruct-test-domains finance`
+restricts *both* the IF target and the `webinstruct_test` eval to Finance, while
+training still spans all `--domains` — so you prune the (math+cs+finance) pool by
+influence on held-out **Finance** and test on held-out **Finance**.
+
+But the WebInstruct **test slice is tiny and math-skewed** (1000 rows: 351 Math /
+62 Finance / **5 CS**), so a single-domain target/eval can't live there. Pass
+**`--test-from-train`** (slurm: `TEST_FROM_TRAIN=1`) to carve the target + eval from
+the huge **train** split instead (Finance = 13k rows), kept disjoint from the pool by
+construction — same per-domain shuffle as the pool, sliced *after* the pool's share,
+plus an any-seed guard (`data.py:_train_heldout_for_target`). **CS is too small to be
+a target** (5 test / 1.2k train rows) — it can only be a *source* in the pool.
 
 ```bash
-sbatch --export=ALL,REGIME=if_prune,RUN_NAME=qwen3_4b_prune_cs,\
-EXTRA_ARGS="--webinstruct-test-domains cs --eval-benchmarks webinstruct_test" \
-  experiments/cluster/train.slurm
+# add these to the step-4 submit below:
+TEST_FROM_TRAIN=1 TEST_DOMAINS=finance N_IF_TARGET=256 TEST_EVAL=1000 ...
 ```
 
-(When `webinstruct_test` spans all three domains, `evaluate.py` already reports a
-per-category accuracy breakdown, so you also get CS/Math/Finance numbers separately.)
+(When `webinstruct_test` spans all three domains, `evaluate.py` reports a per-category
+accuracy breakdown too, so you also get CS/Math/Finance numbers separately.)
 
 ### Held-out accuracy *during* training (the comparison curve)
 
@@ -93,7 +100,8 @@ experiments/
   influence.py  per-train influence at a checkpoint (reuses collect_checkpoint_infos)
   train.py      driver: `baseline` and `if_prune` regimes
   evaluate.py   score a checkpoint on benchmark suites (verifier-judged)
-  cluster/      setup.sh · prefetch.py · train.slurm · eval.slurm
+  cluster/      setup.sh · prefetch.py · nibi_tier1.slurm (train) · eval.slurm
+                bench.slurm / bench_shard.slurm (CG-scoring throughput) · arm.slurm (Tier-2 arms, WIP)
 ```
 
 ## Local smoke (tiny, CPU/1-GPU)
@@ -133,26 +141,29 @@ HF_HOME=$HOME/scratch/hf_cache python experiments/cluster/prefetch.py
 ```
 Caches Qwen3-4B, general-verifier, WebInstruct-verified, GSM8K, MATH-500.
 
-**3. Set your Slurm account.** Edit `#SBATCH --account=` in `train.slurm` /
-`eval.slurm` to your group: `rrg-zhijing` (RRG 2026, rapi `hqw-052-ab`) or
-`def-zhijing` for the default allocation. Confirm with `sshare -U $USER` or
-`sacctmgr show user $USER`.
+**3. Set your Slurm account.** Pass `--account=` on the `sbatch` line — it overrides
+the `#SBATCH` default in `nibi_tier1.slurm`: `def-zhijing` / `def-rgrosse` on **Nibi**
+(H100), `aip-rgrosse` on **Killarney** (L40S). Confirm with `sshare -U $USER`.
 
-**4. Submit (from a login node)**
+**4. Submit (from a login node).** Training goes through **`nibi_tier1.slurm`**,
+driven by env vars (every knob has a default; see the head of the file). The Tier-1
+baseline — *does training on the balanced pool move the held-out target?*:
 ```bash
-# baseline and if-prune, separate jobs (run several seeds for significance)
-sbatch --export=ALL,REGIME=baseline,RUN_NAME=qwen3_4b_base,SEED=42  experiments/cluster/train.slurm
-sbatch --export=ALL,REGIME=if_prune,RUN_NAME=qwen3_4b_prune,SEED=42 experiments/cluster/train.slurm
-
-# extra flags pass through EXTRA_ARGS, e.g. an anti-IF ablation:
-sbatch --export=ALL,REGIME=if_prune,RUN_NAME=qwen3_4b_antiif,EXTRA_ARGS="--selection anti-if" \
-       experiments/cluster/train.slurm
+RUN_NAME=q1p7b_fin USE_VLLM_GEN=1 MODEL=Qwen/Qwen3-1.7B-Base \
+TEST_FROM_TRAIN=1 TEST_DOMAINS=finance N_IF_TARGET=256 POOL=3000 \
+N_TRAIN_GPU=2 PER_DEVICE_BATCH=4 GRAD_ACCUM=96 SAVE_STEPS=5 STEPS=100 \
+  sbatch --account=def-zhijing --gres=gpu:h100:4 --time=12:00:00 \
+         --cpus-per-task=24 --mem=240G experiments/cluster/nibi_tier1.slurm
 ```
-The job requests **2 H100s** by default and puts the verifier on `cuda:1` so it
-doesn't compete with the policy + vLLM for VRAM on `cuda:0`. For a single GPU
-use `--gpus-per-node=h100:1` (verifier colocates) and lower
-`--vllm-gpu-memory-utilization`. On **Narval** switch to `--gpus-per-node=a100:N`
-and the Narval account.
+GPU layout (vLLM server mode): GPUs `0..N_TRAIN_GPU-1` = DP training, then one for the
+policy-gen vLLM server, then one for the verifier server — so 4 GPUs ⇒ `N_TRAIN_GPU=2`
+(2 train + gen + verifier). The script **fails fast** if the layout doesn't fit the
+allocation. On Killarney swap `--account=aip-rgrosse --gres=gpu:l40s:4`.
+
+The **if_prune arms** (random / if-guided / anti-if × cg / dot / tracin-adam) use the
+same `train.py` regimes; the Tier-2 grid that sweeps them is being wired into
+`nibi_tier1.slurm` (`arm.slurm` holds the validated influence flags meanwhile). Run
+several **seeds** per arm for significance.
 
 **5. Evaluate**
 ```bash
