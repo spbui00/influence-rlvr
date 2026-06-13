@@ -128,6 +128,10 @@ class ExperimentConfig:
     grpo_epsilon_high: float = 0.3    # asymmetric upper clip ("clip-higher", GR-4B/DAPO)
     grpo_temperature: float = 0.7     # rollout sampling temperature (GR-4B Table 9)
     max_completion_length: int = 2048
+    # NCCL collective timeout (s), applied via GRPOConfig/TrainingArguments (NOT the
+    # accelerate YAML — the Alliance build rejects a ddp_timeout key there). Default
+    # 1800 (30 min) aborts a slow HF-gen round; 7200 covers any realistic generation.
+    ddp_timeout: int = 7200
     # Reward shaping matches General-Reasoner (the WebInstruct-verified authors,
     # same Qwen3-4B-Base + GRPO): extraction fails (no \boxed{}/marker) -> reward
     # -extraction_penalty; verifier correct -> +1 - length_penalty; wrong -> 0.

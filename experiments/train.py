@@ -117,6 +117,10 @@ def make_grpo_config(cfg: ExperimentConfig, *, max_steps: int, shuffle: bool = T
         "save_strategy": "steps",
         "save_steps": cfg.save_steps,
         "save_total_limit": None,
+        # NCCL collective timeout (s). Set HERE (transformers TrainingArguments ->
+        # Accelerator InitProcessGroupKwargs), NOT in accelerate_ddp.yaml — the
+        # Alliance accelerate build rejects a `ddp_timeout` YAML key ("unknown keys").
+        "ddp_timeout": cfg.ddp_timeout,
         "bf16": device.type == "cuda",
         "use_vllm": cfg.use_vllm,
         "num_generations": cfg.g_train,

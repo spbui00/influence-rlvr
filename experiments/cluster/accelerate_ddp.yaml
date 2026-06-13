@@ -8,11 +8,12 @@
 compute_environment: LOCAL_MACHINE
 distributed_type: MULTI_GPU
 mixed_precision: bf16
-# NCCL collective timeout (s). Default 1800 (30 min) is too tight: one generation
-# round can be a single multi-minute /generate/ call, and on a busy/shared node a
-# big batch (e.g. 2048 completions) ran ~42 min — past 30 min the watchdog aborts
-# the run mid-generation (ALLGATHER timeout). 2h covers any realistic gen round.
-ddp_timeout: 7200
+# NCCL collective timeout is set in CODE — GRPOConfig(ddp_timeout=cfg.ddp_timeout)
+# in train.py, which feeds the Accelerator's InitProcessGroupKwargs. This Alliance
+# accelerate build (paired with torch 2.11) REJECTS a `ddp_timeout` key in this YAML
+# ("had unknown keys (['ddp_timeout'])") and aborts before training. Default 1800
+# (30 min) is too tight for big HF-gen rounds (a 42-min generation tripped ALLGATHER),
+# so cfg.ddp_timeout defaults to 7200 — applied via TrainingArguments, not here.
 num_machines: 1
 machine_rank: 0
 rdzv_backend: static
