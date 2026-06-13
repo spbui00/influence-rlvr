@@ -135,6 +135,60 @@ def _webinstruct_test_partition(cfg: ExperimentConfig) -> tuple[Dataset, Dataset
     return raw.select(range(n_if)), raw.select(range(n_if, n))
 
 
+def _train_heldout_for_target(cfg: ExperimentConfig) -> tuple[Dataset, Dataset]:
+    """`test_from_train`: carve a DISJOINT (if_target, eval) from the TRAIN split.
+
+    The WebInstruct *test* split is tiny + math-skewed (351 Math / 62 Finance / 5 CS),
+    so a single-domain target/eval can't live there. The *train* split is huge
+    (78k / 13k / 1.2k). For each `webinstruct_test_domain` we hold out a slice from the
+    SAME shuffle `load_train_pool` draws from (`_load_train_domain(d).shuffle(seed)`),
+    but AFTER the pool's share `per`, so target+eval never overlap the pool. Layout per
+    domain (one fixed shuffle):
+        [0 : per]              -> consumed by load_train_pool (the training pool)
+        [per : per+n_if]       -> IF target
+        [per+n_if : +n_eval]   -> held-out eval
+    `per` is the pool's per-domain share IFF d is a balanced pool domain, else 0.
+    """
+    n_if = cfg.n_if_target if cfg.n_if_target and cfg.n_if_target > 0 else 64
+    n_eval = (cfg.test_from_train_eval if cfg.test_from_train_eval
+              and cfg.test_from_train_eval > 0 else 1000)
+    if_parts, eval_parts = [], []
+    for d in _webinstruct_test_domains(cfg):
+        raw = _load_train_domain(cfg, d).shuffle(seed=cfg.seed)
+        n = len(raw)
+        # The pool consumes the first `per` of THIS identical shuffle iff d is one of
+        # the balanced pool domains; otherwise none of d is in the pool.
+        per = 0
+        if d in cfg.domains and cfg.balance_domains and cfg.n_train_pool > 0:
+            per = min(cfg.n_train_pool // len(cfg.domains), n)
+        if per + n_if >= n:
+            raise ValueError(
+                f"test_from_train: domain {d!r} has only {n} train rows; the pool "
+                f"takes {per}, leaving {n - per} for IF target+eval (need > {n_if}). "
+                f"Lower --n-train-pool or --n-if-target.")
+        if_end = min(per + n_if, n)
+        eval_end = min(if_end + n_eval, n)
+        if_parts.append(raw.select(range(per, if_end)))
+        eval_parts.append(raw.select(range(if_end, eval_end)))
+        print(f"  [data] test_from_train {d!r}: pool[0:{per}] | "
+              f"IF[{per}:{if_end}]={if_end - per} | eval[{if_end}:{eval_end}]="
+              f"{eval_end - if_end}  (of {n} train rows)")
+    if_raw = concatenate_datasets(if_parts) if len(if_parts) > 1 else if_parts[0]
+    eval_raw = concatenate_datasets(eval_parts) if len(eval_parts) > 1 else eval_parts[0]
+    # Airtight guard for ANY seed: the index offset separates UNIQUE questions from the
+    # pool, but WebInstruct has ~2.5% duplicate questions and 134 questions tagged under
+    # >1 category — either could drop a target/eval question into the pool's share at a
+    # different seed. So additionally drop any target/eval row whose question text is in
+    # the actual training pool, and any eval row whose question is in the IF target.
+    # (For the default seed this removes 0 — the index partition is already clean.)
+    pool_q = set(load_train_pool(cfg)["question"])
+    if_raw = if_raw.filter(lambda e: e["question"] not in pool_q)
+    tgt_q = set(if_raw["question"])
+    eval_raw = eval_raw.filter(
+        lambda e: e["question"] not in pool_q and e["question"] not in tgt_q)
+    return if_raw, eval_raw
+
+
 def load_if_target_set(cfg: ExperimentConfig) -> Dataset:
     """Held-out target set the influence is measured against.
 
@@ -153,7 +207,9 @@ def load_if_target_set(cfg: ExperimentConfig) -> Dataset:
         return raw.map(_format_webinstruct_row, with_indices=True,
                        remove_columns=raw.column_names)
 
-    if cfg.if_target_full_test:
+    if cfg.test_from_train:
+        if_raw, _ = _train_heldout_for_target(cfg)
+    elif cfg.if_target_full_test:
         cats = _categories_for_domains(_webinstruct_test_domains(cfg))
         raw = load_dataset(cfg.train_dataset, split="test")
         raw = raw.filter(lambda ex: ex.get("category") in cats)
@@ -194,9 +250,13 @@ def _eval_row(question: str, solution: str, *, source: str,
 
 
 def load_webinstruct_test(cfg: ExperimentConfig, limit: int) -> list[dict]:
-    """In-distribution eval — the eval half of the test partition (disjoint from
-    the IF target). Respects `webinstruct_test_domains` (e.g. CS-only)."""
-    _, eval_raw = _webinstruct_test_partition(cfg)
+    """In-distribution eval — the eval half of the partition (disjoint from the IF
+    target). With `test_from_train` the partition is the train-held-out slice;
+    otherwise the test slice. Respects `webinstruct_test_domains` (e.g. finance-only)."""
+    if cfg.test_from_train:
+        _, eval_raw = _train_heldout_for_target(cfg)
+    else:
+        _, eval_raw = _webinstruct_test_partition(cfg)
     if limit and len(eval_raw) > limit:
         eval_raw = eval_raw.select(range(limit))
     return [

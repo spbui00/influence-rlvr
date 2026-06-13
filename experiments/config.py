@@ -95,6 +95,15 @@ class ExperimentConfig:
     # steers toward what we measure. Training pool is always WebInstruct (the
     # cross-domain candidate set).
     if_target_source: str = "webinstruct"
+    # Draw the IF target + held-out eval from the TRAIN split instead of the tiny,
+    # math-skewed test slice (1000 rows total: 351 Math / 62 Finance / 5 CS). For a
+    # single-domain target (e.g. finance) the test slice is far too small/noisy to
+    # resolve arms; the train split is huge (78k / 13k / 1.2k). Carved from the SAME
+    # per-domain shuffle the pool draws from but AFTER the pool's share, so the
+    # target/eval stay DISJOINT from the training pool. Pick the target domain via
+    # `webinstruct_test_domains` (e.g. ("finance",)). Pool stays all `domains`.
+    test_from_train: bool = False
+    test_from_train_eval: int = 1000   # held-out eval pool size per target domain
     max_prompt_length: int = 1024
 
     # ── GRPO ────────────────────────────────────────────────────────────────
