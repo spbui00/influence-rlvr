@@ -80,6 +80,11 @@ RESUME_ARG=""; [ "${RESUME:-0}" = "1" ] && RESUME_ARG="--resume"
 MODEL="${MODEL:-Qwen/Qwen3-4B-Base}"
 VERIFIER="${VERIFIER:-TIGER-Lab/general-verifier}"
 VPORT="${VPORT:-8100}"
+# Verifier context window. It grades (question + gold + the FULL student completion,
+# up to MAX_COMPLETION) and generates up to --verifier-max-new-tokens. With a 2048-tok
+# completion, input+verdict can exceed 4096 → vLLM 400s and (pre-fix) killed the run.
+# 8192 matches the policy-gen server and covers the worst realistic case.
+VERIFIER_MAX_LEN="${VERIFIER_MAX_LEN:-8192}"
 # POLICY generation backend:
 #   USE_VLLM_GEN=1 -> policy-gen vLLM server (trl vllm-serve). FAST (~2-3x). Needs
 #     trl>=1.2.0 (the Alliance wheelhouse pair with vllm 0.22): 1.2.0 routes the
@@ -153,7 +158,7 @@ fi
 # a partly-occupied GPU than 0.85 (which demands 67 GiB).
 echo "Launching verifier vLLM server on GPU $VERIFIER_GPU (model=$VERIFIER, port=$VPORT)..."
 CUDA_VISIBLE_DEVICES=$VERIFIER_GPU vllm serve "$VERIFIER" \
-    --port "$VPORT" --gpu-memory-utilization 0.50 --max-model-len 4096 \
+    --port "$VPORT" --gpu-memory-utilization 0.50 --max-model-len "$VERIFIER_MAX_LEN" \
     > "vllm-verifier-${SLURM_JOB_ID}.log" 2>&1 &
 VSERVER_PID=$!
 GENSERVER_PID=""

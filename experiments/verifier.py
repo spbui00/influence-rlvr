@@ -193,7 +193,20 @@ class VLLMServerVerifier:
             },
             timeout=self.timeout,
         )
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError:
+            # A 400 here is almost always the verifier's context-length cap: a long
+            # completion + question + the max_new_tokens verdict budget exceeding the
+            # server's --max-model-len. One oversized batch must NOT kill a multi-hour
+            # run, so log it and score the batch neutral (0.0). Root fix = a large
+            # enough verifier --max-model-len; this is the backstop. Others still raise.
+            if resp.status_code == 400:
+                print(f"[verifier] 400 from {self.base_url}/completions "
+                      f"(likely context-length); scoring {len(prompts)} as 0.0. "
+                      f"detail: {resp.text[:200]}")
+                return [0.0] * len(prompts)
+            raise
         return self._decisions_from_choices(resp.json()["choices"], len(prompts))
 
 
