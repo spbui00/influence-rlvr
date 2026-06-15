@@ -1,30 +1,33 @@
 #!/bin/bash
 # ============================================================================
-# TIER-1 BOOTSTRAP — does GR-SCALE training make Qwen3-4B-Base actually learn?
+# GRPO trainer — runs BOTH the Tier-1 baseline and the Tier-2 IF-selection arms,
+# so every arm is byte-identical to the baseline except --regime/--selection/
+# --if-method (the only thing the comparison is allowed to vary).
 #
-# The 1-2 GPU signal check stayed flat because our batch was ~128x smaller than
-# General-Reasoner's (Table 9: train_batch_size 1024). This run closes most of
-# that gap with multi-GPU DATA-PARALLEL training on ONE Nibi H100 node, and is
-# the GO/NO-GO gate for the whole scale-up.
+#   REGIME=baseline  (default) → train on the full pool in random order. The Tier-1
+#                     gate: does training move the held-out target at all?
+#   REGIME=if_prune  → dynamic influence pruning: warm up to PRUNE_STEP, then every
+#                     IF_RECOMPUTE_EVERY steps re-score the pool's influence on the IF
+#                     target and train most-influential-first (SELECTION=if-guided),
+#                     least-first (anti-if), or shuffled (random), under IF_METHOD
+#                     (tracin-adam | dot | cg). Influence is scored on the train GPUs.
 #
-# Layout (1 node, 8x H100 80GB):
-#   GPU 0..6 : 7 data-parallel TRL workers (LoRA, each with a COLOCATE vLLM engine
-#              -> generation parallelized across all 7). baseline => no influence
-#              windows => colocate is fine (one engine per process).
-#   GPU 7    : verifier vLLM server (fixed model, no weight sync).
+# Multi-GPU DATA-PARALLEL (accelerate DDP). GPU layout 0..N_TRAIN_GPU-1 = training,
+# then the policy-gen vLLM server (USE_VLLM_GEN=1) and the verifier server. Every
+# knob has a default (see below); resources come from the sbatch CLI.
 #
-# Batch: N_TRAIN_GPU x grad_accum x (per_device_batch/g_train) = 7 x 32 x (4/8)
-#        = 112 prompts/step  (~1/9 of GR's 1024; ~14x our old 8).
-# GR HPs: temp 0.7, clip-higher 0.3, LoRA r32, lr 1e-5 (LoRA). Response capped at
-#         2048 (not GR's 4096) so the LM-head logits fit in 80 GB — see batch note.
+#   # Tier-1 baseline (finance target carved from the train split, 1.7B):
+#   RUN_NAME=fin USE_VLLM_GEN=1 MODEL=Qwen/Qwen3-1.7B-Base TEST_FROM_TRAIN=1 \
+#     TEST_DOMAINS=finance N_IF_TARGET=256 POOL=3000 N_TRAIN_GPU=2 \
+#     sbatch --account=def-zhijing --gres=gpu:h100:4 experiments/cluster/train.slurm
+#   # Tier-2 arm — same config + the arm:
+#   RUN_NAME=fin_ifg_tadam REGIME=if_prune SELECTION=if-guided IF_METHOD=tracin-adam \
+#     ... sbatch ... experiments/cluster/train.slurm
 #
-#   sbatch experiments/cluster/nibi_tier1.slurm
-#   STEPS=400 GRAD_ACCUM=22 sbatch experiments/cluster/nibi_tier1.slurm   # bigger
-#
-# GATE (printed at the end): box_rate & acc climb in the [reward] log AND the
-# held-out eval moves >=15 pts. If NO here, the testbed is wrong (not the infra).
-#
-#SBATCH --job-name=nibi_t1
+# GATE: box_rate & acc climb in the [reward] log AND the held-out eval
+# (outputs/<run>/live_eval.csv) moves. If NO, the testbed is wrong (not the infra).
+# ============================================================================
+#SBATCH --job-name=ifrlvr
 #SBATCH --account=def-rgrosse
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:h100:8
@@ -78,6 +81,26 @@ TEST_EVAL="${TEST_EVAL:-1000}"
 TEST_FROM_TRAIN_ARG=""
 [ "$TEST_FROM_TRAIN" = "1" ] && TEST_FROM_TRAIN_ARG="--test-from-train --test-from-train-eval $TEST_EVAL"
 N_IF_TARGET="${N_IF_TARGET:-64}"   # IF-target size; bump to ~256 for a single domain
+# ── Regime: baseline (Tier-1 gate) vs if_prune (Tier-2 IF-selection arms) ───────
+# baseline = full pool, random order (REGIME default). if_prune = warm up to
+# PRUNE_STEP, then re-rank the pool by influence on the IF target every
+# IF_RECOMPUTE_EVERY steps and train it in ranked order. PRUNE_STEP and
+# IF_RECOMPUTE_EVERY must be multiples of SAVE_STEPS. Everything else is shared with
+# the baseline, so the ONLY thing that differs across arms is SELECTION/IF_METHOD.
+REGIME="${REGIME:-baseline}"               # baseline | if_prune
+SELECTION="${SELECTION:-if-guided}"        # if-guided | anti-if | random
+IF_METHOD="${IF_METHOD:-tracin-adam}"      # tracin-adam | dot | cg  (tracin-adam cheapest)
+PRUNE_STEP="${PRUNE_STEP:-$SAVE_STEPS}"          # warm up to here, then rank (multiple of SAVE_STEPS)
+IF_RECOMPUTE_EVERY="${IF_RECOMPUTE_EVERY:-$SAVE_STEPS}"   # re-score + re-rank cadence (0 = one-shot)
+IF_ARGS=""
+if [ "$REGIME" = "if_prune" ]; then
+    # CG-only flags are ignored by dot/tracin-adam. Influence is scored on the train
+    # GPUs (CG uses HF), so this works under both generation backends.
+    IF_ARGS="--selection $SELECTION --if-method $IF_METHOD \
+        --prune-step $PRUNE_STEP --if-recompute-every $IF_RECOMPUTE_EVERY \
+        --if-g-train 8 --if-max-new-tokens 1024 --if-score-batch 4 --if-logps-micro-batch 1 \
+        --cg-fisher-examples 8 --cg-fisher-g 2 --cg-fisher-max-tokens 128 --cg-iters 50 --lambda-damp 0.5"
+fi
 # RESUME=1 continues from the latest checkpoint under outputs/$RUN_NAME (same
 # RUN_NAME) — use it to recover a time-limit kill, or to extend max-steps later.
 RESUME_ARG=""; [ "${RESUME:-0}" = "1" ] && RESUME_ARG="--resume"
@@ -204,15 +227,17 @@ PY
 
 # ── Data-parallel training on GPUs 0..N-1 (generation via the policy-gen server) ─
 TRAIN_GPUS=$(seq -s, 0 $((N_TRAIN_GPU - 1)))   # e.g. 0,1,2,3,4,5
-echo "================ TIER-1 DP TRAIN ($RUN_NAME) — GPUs $TRAIN_GPUS, grad_accum=$GRAD_ACCUM ================"
+echo "================ DP TRAIN ($RUN_NAME, regime=$REGIME) — GPUs $TRAIN_GPUS, grad_accum=$GRAD_ACCUM ================"
+[ "$REGIME" = "if_prune" ] && echo "  arm: selection=$SELECTION if_method=$IF_METHOD prune_step=$PRUNE_STEP recompute_every=$IF_RECOMPUTE_EVERY"
 CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     --config_file experiments/cluster/accelerate_ddp.yaml \
     --num_processes "$N_TRAIN_GPU" \
     -m experiments.train \
-    --run-name "$RUN_NAME" --seed "$SEED" --regime baseline $RESUME_ARG \
+    --run-name "$RUN_NAME" --seed "$SEED" --regime "$REGIME" $RESUME_ARG \
     --model-id "$MODEL" --lora-r 32 \
     --if-target-source "$IF_TARGET" --eval-benchmarks "$EVAL_BENCH" $TEST_DOMAINS_ARG $TEST_FROM_TRAIN_ARG \
     --live-eval-benchmark "$LIVE_EVAL_BENCH" --n-train-pool "$POOL" --n-if-target "$N_IF_TARGET" \
+    $IF_ARGS \
     --max-steps "$STEPS" --save-steps "$SAVE_STEPS" \
     --g-train "$G_TRAIN" --per-device-batch "$PER_DEVICE_BATCH" --grad-accum "$GRAD_ACCUM" \
     --max-completion-length "$MAX_COMPLETION" --grpo-temperature 0.7 --grpo-epsilon-high 0.3 \
@@ -240,7 +265,7 @@ if le.exists():
         acc.append((int(row["step"]), float(row["accuracy"])))
 fe = sorted((root / "eval").glob("eval_step*.json"))
 final = json.load(open(fe[-1]))["accuracy"] if fe else {}
-print(f"held-out eval trajectory (MMLU-Pro-CS): {[f'{s}:{a:.3f}' for s,a in acc]}")
+print(f"held-out eval trajectory: {[f'{s}:{a:.3f}' for s,a in acc]}")
 print(f"final eval (n=200): {final}")
 if len(acc) >= 2:
     rise = acc[-1][1] - acc[0][1]

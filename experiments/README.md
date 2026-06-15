@@ -100,8 +100,8 @@ experiments/
   influence.py  per-train influence at a checkpoint (reuses collect_checkpoint_infos)
   train.py      driver: `baseline` and `if_prune` regimes
   evaluate.py   score a checkpoint on benchmark suites (verifier-judged)
-  cluster/      setup.sh · prefetch.py · nibi_tier1.slurm (train) · eval.slurm
-                bench.slurm / bench_shard.slurm (CG-scoring throughput) · arm.slurm (Tier-2 arms, WIP)
+  cluster/      setup.sh · prefetch.py · train.slurm (baseline + if_prune arms) · eval.slurm
+                bench.slurm / bench_shard.slurm (CG-scoring throughput benchmarks)
 ```
 
 ## Local smoke (tiny, CPU/1-GPU)
@@ -142,10 +142,10 @@ HF_HOME=$HOME/scratch/hf_cache python experiments/cluster/prefetch.py
 Caches Qwen3-4B, general-verifier, WebInstruct-verified, GSM8K, MATH-500.
 
 **3. Set your Slurm account.** Pass `--account=` on the `sbatch` line — it overrides
-the `#SBATCH` default in `nibi_tier1.slurm`: `def-zhijing` / `def-rgrosse` on **Nibi**
+the `#SBATCH` default in `train.slurm`: `def-zhijing` / `def-rgrosse` on **Nibi**
 (H100), `aip-rgrosse` on **Killarney** (L40S). Confirm with `sshare -U $USER`.
 
-**4. Submit (from a login node).** Training goes through **`nibi_tier1.slurm`**,
+**4. Submit (from a login node).** Training goes through **`train.slurm`**,
 driven by env vars (every knob has a default; see the head of the file). The Tier-1
 baseline — *does training on the balanced pool move the held-out target?*:
 ```bash
@@ -153,17 +153,22 @@ RUN_NAME=q1p7b_fin USE_VLLM_GEN=1 MODEL=Qwen/Qwen3-1.7B-Base \
 TEST_FROM_TRAIN=1 TEST_DOMAINS=finance N_IF_TARGET=256 POOL=3000 \
 N_TRAIN_GPU=2 PER_DEVICE_BATCH=4 GRAD_ACCUM=96 SAVE_STEPS=5 STEPS=100 \
   sbatch --account=def-zhijing --gres=gpu:h100:4 --time=12:00:00 \
-         --cpus-per-task=24 --mem=240G experiments/cluster/nibi_tier1.slurm
+         --cpus-per-task=24 --mem=240G experiments/cluster/train.slurm
 ```
 GPU layout (vLLM server mode): GPUs `0..N_TRAIN_GPU-1` = DP training, then one for the
 policy-gen vLLM server, then one for the verifier server — so 4 GPUs ⇒ `N_TRAIN_GPU=2`
 (2 train + gen + verifier). The script **fails fast** if the layout doesn't fit the
 allocation. On Killarney swap `--account=aip-rgrosse --gres=gpu:l40s:4`.
 
-The **if_prune arms** (random / if-guided / anti-if × cg / dot / tracin-adam) use the
-same `train.py` regimes; the Tier-2 grid that sweeps them is being wired into
-`nibi_tier1.slurm` (`arm.slurm` holds the validated influence flags meanwhile). Run
-several **seeds** per arm for significance.
+The **if_prune arms** run through the *same* `train.slurm` — only the arm differs, so
+they're directly comparable to the baseline:
+```bash
+RUN_NAME=fin_ifg_tadam REGIME=if_prune SELECTION=if-guided IF_METHOD=tracin-adam ... sbatch ... train.slurm
+RUN_NAME=fin_random    REGIME=if_prune SELECTION=random                          ... sbatch ... train.slurm
+RUN_NAME=fin_anti      REGIME=if_prune SELECTION=anti-if   IF_METHOD=tracin-adam ... sbatch ... train.slurm
+```
+`SELECTION` ∈ {if-guided, anti-if, random}, `IF_METHOD` ∈ {tracin-adam, dot, cg}
+(tracin-adam cheapest). Run several **seeds** per arm for significance.
 
 **5. Evaluate**
 ```bash
