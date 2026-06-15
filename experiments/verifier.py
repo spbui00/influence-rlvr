@@ -146,9 +146,14 @@ class VLLMServerVerifier:
     which the GR reward uses for the length penalty)."""
 
     def __init__(self, model_id: str, *, host: str = "127.0.0.1", port: int = 8100,
-                 max_new_tokens: int = 1024, timeout: float = 600.0):
+                 max_new_tokens: int = 1024, timeout: float = 600.0,
+                 max_model_len: int = 4096):
         self.model_id = model_id
         self.max_new_tokens = max_new_tokens
+        # The general-verifier is hard-capped here by its config (Qwen2-1.5B,
+        # max_position_embeddings=4096): input + max_new_tokens must stay under this
+        # or vLLM 400s the request. Used to truncate over-long student answers below.
+        self.max_model_len = max_model_len
         self.base_url = f"http://{host}:{port}/v1"
         self.timeout = timeout
         # tokenizer for chat-templating the prompts + token counting in the reward
@@ -164,6 +169,30 @@ class VLLMServerVerifier:
             [{"role": "user", "content": body}],
             tokenize=False, add_generation_prompt=True,
         )
+
+    def _fit_student(self, question: str, ground_truth: str, student_answer: str) -> str:
+        """Render the grading prompt, truncating the student answer to fit the
+        verifier's hard context window. A long reasoning completion (up to the
+        policy's 2048-tok cap) + question + the max_new_tokens verdict budget can
+        exceed max_model_len (4096) → vLLM 400s the whole batched request. We drop
+        tokens from the FRONT of the student answer (keep the tail — the final
+        \\boxed{} answer lives there) until the rendered prompt fits. The HF verifier
+        path already truncates at tokenization; this gives the server path parity."""
+        prompt = self._render(question, ground_truth, student_answer)
+        budget = self.max_model_len - self.max_new_tokens - 64   # margin for slack
+        n = len(self.tokenizer(prompt, add_special_tokens=False)["input_ids"])
+        if n <= budget:
+            return prompt
+        s_ids = self.tokenizer(student_answer, add_special_tokens=False)["input_ids"]
+        cut = min(len(s_ids), n - budget + 8)
+        prompt = self._render(question, ground_truth,
+                              self.tokenizer.decode(s_ids[cut:]))
+        # Guarantee fit even after the decode/encode roundtrip (so one prompt can't
+        # 400 the whole batch): hard-trim the rendered prompt's tail as a last resort.
+        ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        if len(ids) > budget:
+            prompt = self.tokenizer.decode(ids[-budget:])
+        return prompt
 
     @staticmethod
     def _decisions_from_choices(choices: list, n: int) -> list[float]:
@@ -182,7 +211,7 @@ class VLLMServerVerifier:
         if not questions:
             return []
         prompts = [
-            self._render(q, g, s)
+            self._fit_student(q, g, s)
             for q, g, s in zip(questions, ground_truths, student_answers)
         ]
         resp = requests.post(
@@ -220,8 +249,9 @@ def get_verifier(model_id: str, device: str | None, max_new_tokens: int,
 
 @lru_cache(maxsize=2)
 def get_vllm_verifier(model_id: str, host: str, port: int,
-                      max_new_tokens: int) -> VLLMServerVerifier:
-    return VLLMServerVerifier(model_id, host=host, port=port, max_new_tokens=max_new_tokens)
+                      max_new_tokens: int, max_model_len: int = 4096) -> VLLMServerVerifier:
+    return VLLMServerVerifier(model_id, host=host, port=port,
+                              max_new_tokens=max_new_tokens, max_model_len=max_model_len)
 
 
 def get_verifier_from_config(cfg: ExperimentConfig):
@@ -230,6 +260,7 @@ def get_verifier_from_config(cfg: ExperimentConfig):
         return get_vllm_verifier(
             cfg.verifier_model_id, cfg.verifier_server_host,
             cfg.verifier_server_port, cfg.verifier_max_new_tokens,
+            cfg.verifier_max_model_len,
         )
     return get_verifier(
         cfg.verifier_model_id, cfg.verifier_device,

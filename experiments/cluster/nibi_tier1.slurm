@@ -80,11 +80,12 @@ RESUME_ARG=""; [ "${RESUME:-0}" = "1" ] && RESUME_ARG="--resume"
 MODEL="${MODEL:-Qwen/Qwen3-4B-Base}"
 VERIFIER="${VERIFIER:-TIGER-Lab/general-verifier}"
 VPORT="${VPORT:-8100}"
-# Verifier context window. It grades (question + gold + the FULL student completion,
-# up to MAX_COMPLETION) and generates up to --verifier-max-new-tokens. With a 2048-tok
-# completion, input+verdict can exceed 4096 → vLLM 400s and (pre-fix) killed the run.
-# 8192 matches the policy-gen server and covers the worst realistic case.
-VERIFIER_MAX_LEN="${VERIFIER_MAX_LEN:-8192}"
+# Verifier context window. The general-verifier (Qwen2-1.5B) is HARD-capped at 4096
+# by its config (max_position_embeddings) — asking for more makes vLLM refuse to
+# start. The client (verifier.py:_fit_student) truncates each grading prompt
+# (question + gold + completion + verdict budget) below this, so a 2048-tok
+# completion can't 400 the request. Passed to BOTH the server and the trainer.
+VERIFIER_MAX_LEN="${VERIFIER_MAX_LEN:-4096}"
 # POLICY generation backend:
 #   USE_VLLM_GEN=1 -> policy-gen vLLM server (trl vllm-serve). FAST (~2-3x). Needs
 #     trl>=1.2.0 (the Alliance wheelhouse pair with vllm 0.22): 1.2.0 routes the
@@ -214,13 +215,15 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     --learning-rate "$LR" \
     $VLLM_ARGS \
     --verifier-backend vllm --verifier-server-port "$VPORT" --verifier-max-new-tokens 1024 \
+    --verifier-max-model-len "$VERIFIER_MAX_LEN" \
     --live-eval-examples 64 --eval-max-examples 200
 
 # ── Final held-out eval on GPU 0 (grades via the still-running verifier server) ─
 echo "================ EVAL ($RUN_NAME) ================"
 CUDA_VISIBLE_DEVICES=0 python -m experiments.evaluate --run-name "$RUN_NAME" \
     --checkpoint-step latest --benchmarks "$EVAL_BENCH" --eval-max-examples "$FINAL_EVAL_MAX" --vllm \
-    --verifier-backend vllm --verifier-server-port "$VPORT" --verifier-max-new-tokens 1024
+    --verifier-backend vllm --verifier-server-port "$VPORT" --verifier-max-new-tokens 1024 \
+    --verifier-max-model-len "$VERIFIER_MAX_LEN"
 
 echo "================ GATE VERDICT ($RUN_NAME) ================"
 python - "$RUN_NAME" << 'PY'

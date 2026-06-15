@@ -473,6 +473,12 @@ def train_model_with_history(
             optimizer = torch.optim.SGD(model.parameters(), lr=lr)
 
     checkpoints = {}
+    # Per-step Adam diagonal preconditioner P_c = 1/(√v̂+ε), read live right after
+    # each optimizer.step(). Keyed by `step` (the update θ_{step-1}→θ_step), which
+    # is the P that trajectory tracin-adam multiplies into g_test at checkpoints[step-1].
+    # Only populated for Adam steps; SGD/natural-gradient leave it empty → tracin-adam
+    # degenerates to plain `dot`.
+    precond_checkpoints: dict[int, torch.Tensor] = {}
     if save_checkpoints:
         checkpoints[0] = copy.deepcopy(model.state_dict())
 
@@ -535,11 +541,16 @@ def train_model_with_history(
 
         if save_checkpoints:
             checkpoints[step] = copy.deepcopy(model.state_dict())
+            if optimizer is not None and use_adam:
+                precond_checkpoints[step] = (
+                    _toy_adam_preconditioner(optimizer, model).detach().clone()
+                )
 
     return {
         "model": model,
         "history": history,
-        "checkpoints": checkpoints
+        "checkpoints": checkpoints,
+        "precond_checkpoints": precond_checkpoints,
     }
 
 
@@ -833,6 +844,100 @@ def compute_toy_cg_influence_historical(
     return total_scores, info
 
 
+def compute_toy_firstorder_influence_historical(
+    model_template: nn.Module,
+    *,
+    checkpoints: dict[int, dict],
+    train_history: Sequence[dict],
+    train_examples: Sequence[ToyGRPOExample],
+    test_example: ToyGRPOExample,
+    learning_rate: float,
+    precond_checkpoints: dict[int, torch.Tensor] | None = None,
+    beta: float = 0.0,
+    ref_model: nn.Module | None = None,
+    historical_weight_mode: ToyHistoricalWeightMode | str = ToyHistoricalWeightMode.ALL_SAMPLES,
+    progress_every: int = 100,
+) -> tuple[torch.Tensor, dict]:
+    """
+    Trajectory-summed first-order (TracIn) influence — NO Fisher inverse.
+
+    Mirrors `compute_toy_cg_influence_historical` step-for-step, but replaces the
+    per-step CG solve (F+λI)h = g_test with a diagonal preconditioner:
+
+        IF_i = Σ_c lr · w_i^(c) · g_train_i^(c)^T (P_c ⊙ g_test^(c))
+
+    `precond_checkpoints`:
+      - None  → P_c = I, i.e. plain TracIn dot-product (`dot`): the SGD-step
+        first-order effect, λ→∞ limit of CG.
+      - dict  → P_c = 1/(√v̂_c+ε), the Adam diagonal actually applied at step c
+        (`tracin-adam`): the faithful first-order effect of one AdamW step.
+
+    `historical_weight_mode` matches the CG historical scorer: ACTIVE_ONLY scores
+    only the example used at each step; ALL_SAMPLES scores every train example.
+    """
+    historical_weight_mode = ToyHistoricalWeightMode.parse(historical_weight_mode)
+    n_train = len(train_examples)
+    name_to_idx = {ex.name: i for i, ex in enumerate(train_examples)}
+
+    total_scores = torch.zeros(n_train, dtype=torch.float32)
+    n_precond = 0
+
+    for step_idx, row in enumerate(train_history):
+        step = int(row["step"])
+        pre_step = step - 1
+        if pre_step not in checkpoints:
+            raise ValueError(
+                f"Trajectory first-order needs checkpoint {pre_step}, but it was not saved."
+            )
+
+        checkpoint_model = clone_toy_model(model_template)
+        checkpoint_model.load_state_dict(checkpoints[pre_step])
+
+        if historical_weight_mode == ToyHistoricalWeightMode.ACTIVE_ONLY:
+            active_name = str(row["example_name"])
+            active_idx = name_to_idx[active_name]
+            sub_examples = [train_examples[active_idx]]
+        else:
+            sub_examples = list(train_examples)
+
+        g_test, _grad_cache, _prob_cache, train_infos = build_toy_policy_fisher_inputs(
+            checkpoint_model, sub_examples, test_example, beta=beta, ref_model=ref_model,
+        )
+        gt = g_test.detach().to(dtype=torch.float32)
+        # P_c is keyed by `step` (the update θ_{step-1}→θ_step); g_test is at θ_{step-1}.
+        P = precond_checkpoints.get(step) if precond_checkpoints is not None else None
+        if P is not None:
+            P = P.detach().to(dtype=torch.float32, device=gt.device)
+            if P.numel() != gt.numel():
+                raise ValueError(
+                    f"Adam preconditioner at step {step} ({P.numel()}) != grad dim ({gt.numel()})"
+                )
+            h = P * gt
+            n_precond += 1
+        else:
+            h = gt
+        step_scores = torch.stack([
+            torch.dot(ti["grad"].detach().to(dtype=torch.float32, device=gt.device), h)
+            for ti in train_infos
+        ])
+
+        if historical_weight_mode == ToyHistoricalWeightMode.ACTIVE_ONLY:
+            total_scores[active_idx] = total_scores[active_idx] + learning_rate * step_scores[0]
+        else:
+            total_scores = total_scores + learning_rate * step_scores
+
+        if progress_every and step_idx > 0 and step_idx % progress_every == 0:
+            print(f"      TracIn trajectory step {step_idx}/{len(train_history)}")
+
+    info = {
+        "method": "tracin-adam" if precond_checkpoints is not None else "dot",
+        "n_steps": len(train_history),
+        "n_steps_preconditioned": n_precond,
+        "historical_weight_mode": historical_weight_mode.value,
+    }
+    return total_scores, info
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--n-train", type=int, default=200) 
@@ -1043,10 +1148,16 @@ def main():
     )
     parser.add_argument(
         "--if-calculation",
-        choices=["historical", "historical-last", "preference-styled", "surrogate", "cg", "cg-last", "true-fisher-last"],
+        choices=["historical", "historical-last", "preference-styled", "surrogate", "cg", "cg-last", "true-fisher-last", "tracin-adam", "dot"],
         default="historical",
         help=(
             "Method to use for influence calculation. "
+            "`tracin-adam` sums the first-order TracIn IF over the full trajectory "
+            "using the Adam diagonal P_c=1/(√v̂+ε) actually applied at each step "
+            "(no Fisher inverse) — the faithful first-order effect of each AdamW "
+            "step, directly comparable to `historical`; "
+            "`dot` is the same trajectory sum with P=I (plain SGD-step TracIn, the "
+            "λ→∞ limit of `cg`); "
             "`historical` sums per-step IF over the full trajectory; "
             "`historical-last` uses the historical gradient (GRPO loss) "
             "evaluated only at the final checkpoint — apples-to-apples comparison "
@@ -1266,6 +1377,38 @@ def main():
             n_steps = cg_info.get("n_steps", 0)
             n_conv = cg_info.get("n_converged", 0)
             print(f"    CG trajectory done: {n_conv}/{n_steps} per-step solves converged within tol.")
+        elif args.if_calculation in ("tracin-adam", "dot"):
+            precond = (
+                train_result.get("precond_checkpoints")
+                if args.if_calculation == "tracin-adam" else None
+            )
+            if args.if_calculation == "tracin-adam" and not precond:
+                print(
+                    "    WARNING: tracin-adam requested but no Adam preconditioner was "
+                    "saved (--no-adam?). Falling back to plain `dot` (P=I)."
+                )
+                precond = None
+            print(
+                f"    {args.if_calculation} trajectory over {len(train_result['history'])} "
+                f"steps (mode={hist_weight_mode.value})..."
+            )
+            fo_scores, fo_info = compute_toy_firstorder_influence_historical(
+                full_model,
+                checkpoints=train_result["checkpoints"],
+                train_history=train_result["history"],
+                train_examples=train_examples,
+                test_example=test_ex,
+                learning_rate=args.lr,
+                precond_checkpoints=precond,
+                beta=args.beta,
+                ref_model=ref_model,
+                historical_weight_mode=hist_weight_mode,
+            )
+            scores = fo_scores.numpy()
+            print(
+                f"    {fo_info['method']} done: {fo_info['n_steps_preconditioned']}/"
+                f"{fo_info['n_steps']} steps Adam-preconditioned."
+            )
         else:
             hist_inf = compute_toy_historical_fisher_influence(
                 full_model,

@@ -172,6 +172,11 @@ class ExperimentConfig:
     verifier_model_id: str = "TIGER-Lab/general-verifier"
     verifier_max_new_tokens: int = 512
     verifier_batch_size: int = 16
+    # The general-verifier's hard context cap (Qwen2-1.5B, max_position_embeddings
+    # =4096). The vLLM server is launched with this, and the client truncates each
+    # grading prompt (input + verifier_max_new_tokens) below it so a long completion
+    # can't 400 the request. Must match the server's --max-model-len.
+    verifier_max_model_len: int = 4096
     # Run the verifier on a separate device if available (e.g. "cuda:1"); else
     # it shares the policy GPU. None -> auto.
     verifier_device: str | None = None
