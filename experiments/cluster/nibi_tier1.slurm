@@ -46,6 +46,10 @@ STEPS="${STEPS:-300}"
 # job hits its time limit. Smaller = finer gate trajectory + cheaper resume, but
 # each eval pauses training briefly.
 SAVE_STEPS="${SAVE_STEPS:-50}"
+# Held-out examples per live-eval point. 64 gives ±4% noise (1/sqrt(64)) — too coarse
+# to resolve a real single-domain move; 256 → ±2%. Sharded across the train GPUs, so
+# the per-GPU cost is LIVE_EVAL_EXAMPLES/N_TRAIN_GPU HF generations each eval.
+LIVE_EVAL_EXAMPLES="${LIVE_EVAL_EXAMPLES:-64}"
 # LoRA learning rate. GR's 5e-7 is for FULL-param; LoRA (66M params, B inits at 0)
 # needs a much larger lr or it crawls — at 1e-5 the per-step update was ~lr*grad_norm
 # ~1e-6, so the adapter barely moved in the first steps. 5e-5 gets it actually
@@ -216,7 +220,7 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     $VLLM_ARGS \
     --verifier-backend vllm --verifier-server-port "$VPORT" --verifier-max-new-tokens 1024 \
     --verifier-max-model-len "$VERIFIER_MAX_LEN" \
-    --live-eval-examples 64 --eval-max-examples 200
+    --live-eval-examples "$LIVE_EVAL_EXAMPLES" --eval-max-examples 200
 
 # ── Final held-out eval on GPU 0 (grades via the still-running verifier server) ─
 echo "================ EVAL ($RUN_NAME) ================"
