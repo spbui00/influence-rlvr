@@ -14,7 +14,12 @@
 # NOTE: do NOT `module purge`/`module reset` on Alliance clusters — it strips the
 # scheduler modulefiles (e.g. Killarney's /cm/local Bright Cluster Manager) that
 # provide salloc/sbatch. Just layer our modules on top of the default environment.
-module load StdEnv/2023 gcc/12.3 python/3.11 cuda/12.2 arrow/21.0.0 opencv/4.13.0
+# Alliance clusters (Nibi/Killarney) load these modules. CSCS Clariden (GH200, ARM)
+# has NO Lmod modules and runs inside an NGC container instead — so make the load
+# NON-FATAL (|| true) so the same env.sh works in both. On Clariden, set VENV_DIR to
+# the container venv (e.g. $SCRATCH/envs/ifrlvr) and HF_HOME to a $SCRATCH path.
+module load StdEnv/2023 gcc/12.3 python/3.11 cuda/12.2 arrow/21.0.0 opencv/4.13.0 2>/dev/null \
+  || echo "env.sh: no Lmod modules loaded (container/CSCS env) — using the active runtime."
 
 source "${VENV_DIR:-$HOME/envs/influence-rlvr}/bin/activate"
 
