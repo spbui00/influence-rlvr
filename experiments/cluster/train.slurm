@@ -97,18 +97,20 @@ SELECTION="${SELECTION:-if-guided}"        # if-guided | anti-if | random
 IF_METHOD="${IF_METHOD:-tracin-adam}"      # tracin-adam | dot | cg  (tracin-adam cheapest)
 PRUNE_STEP="${PRUNE_STEP:-$SAVE_STEPS}"          # warm up to here, then rank (multiple of SAVE_STEPS)
 IF_RECOMPUTE_EVERY="${IF_RECOMPUTE_EVERY:-$SAVE_STEPS}"   # re-score + re-rank cadence (0 = one-shot)
-# IF_VLLM_GEN=1: offload the influence-scoring ROLLOUT sampling to vLLM (server mode
-# only) — the big speedup for the generation-bound IF cost; the gradient stays exact
-# on HF. The scoring engine shares the train GPU with the HF model, so keep
-# IF_VLLM_GPU_UTIL small. NEW/experimental — validate on a smoke before a full grid.
+# IF_VLLM_GEN=1: offload influence-scoring ROLLOUT sampling to the RUNNING trl
+# vllm-serve server over HTTP (server mode only) — gradient stays exact on HF (~4×).
 IF_VLLM_GEN="${IF_VLLM_GEN:-0}"
-IF_VLLM_GPU_UTIL="${IF_VLLM_GPU_UTIL:-0.3}"
+IF_VLLM_GPU_UTIL="${IF_VLLM_GPU_UTIL:-0.3}"   # legacy (unused by the server-reuse path)
+# Scoring minibatch: prompts whose rollouts are generated in ONE /generate/ call. With
+# the server offload, bigger = better server saturation (256+ rollouts fill it); the
+# backward is micro-batched (if-logps-micro-batch) so GPU memory stays bounded → push 32.
+IF_SCORE_BATCH="${IF_SCORE_BATCH:-4}"
 IF_ARGS=""
 if [ "$REGIME" = "if_prune" ]; then
     # CG-only flags are ignored by dot/tracin-adam.
     IF_ARGS="--selection $SELECTION --if-method $IF_METHOD \
         --prune-step $PRUNE_STEP --if-recompute-every $IF_RECOMPUTE_EVERY \
-        --if-g-train 8 --if-max-new-tokens 1024 --if-score-batch 4 --if-logps-micro-batch 1 \
+        --if-g-train 8 --if-max-new-tokens 1024 --if-score-batch $IF_SCORE_BATCH --if-logps-micro-batch 1 \
         --cg-fisher-examples 8 --cg-fisher-g 2 --cg-fisher-max-tokens 128 --cg-iters 50 --lambda-damp 0.5"
     [ "$IF_VLLM_GEN" = "1" ] && IF_ARGS="$IF_ARGS --if-vllm-gen --if-vllm-gpu-util $IF_VLLM_GPU_UTIL"
 fi
