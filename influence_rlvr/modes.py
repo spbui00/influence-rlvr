@@ -33,6 +33,7 @@ class ExperimentMode(StringEnum):
 class GenerationBackend(StringEnum):
     HF = "hf"
     VLLM = "vllm"
+    VLLM_SERVER = "vllm_server"   # reuse a running trl vllm-serve over HTTP /generate/
 
 
 class GradientObjective(StringEnum):
@@ -112,6 +113,10 @@ class VLLMConfig:
     max_lora_rank: int = 16
     enforce_eager: bool = False
     training_use_vllm: bool = False
+    # VLLM_SERVER backend: reuse a running trl vllm-serve over HTTP (no in-process
+    # engine). Host/port of that server (the training gen server).
+    server_host: str | None = None
+    server_port: int | None = None
 
     def to_runtime_kwargs(self) -> dict[str, object]:
         return {

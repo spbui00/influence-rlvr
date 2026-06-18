@@ -502,6 +502,70 @@ def _vllm_generate_rollout_batch(
     return rollout
 
 
+def _vllm_server_generate_rollout_batch(
+    sampling_model,
+    tokenizer,
+    prompt_ids: torch.Tensor,
+    prompt_attention_mask: torch.Tensor,
+    *,
+    num_samples: int,
+    max_new_tokens: int,
+    do_sample: bool,
+    temperature: float,
+    top_p: float,
+    seed: int | None,
+    vllm_config: VLLMConfig,
+    adapter_path: str | Path | None,
+    model_id: str | None,
+) -> RolloutBatch:
+    """Generate via a RUNNING `trl vllm-serve` server over HTTP (no in-process engine).
+
+    Reuses the training gen server — which already holds the current, weight-synced
+    policy — so influence scoring gets vLLM-fast rollouts WITHOUT spinning a 2nd engine
+    inside the DDP process (that deadlocks on vLLM's own TCPStore). The gradient is still
+    computed on HF from the returned token IDs, so the estimator is byte-identical.
+    """
+    import requests
+
+    device = prompt_ids.device
+    host = vllm_config.server_host or "127.0.0.1"
+    port = vllm_config.server_port
+    if not port:
+        raise RuntimeError(
+            "VLLM_SERVER backend needs vllm_config.server_port (the trl vllm-serve HTTP "
+            "port). It is only set for influence scoring in vLLM *server* mode.")
+    batch_size = int(prompt_ids.shape[0])
+    # Send tokenized prompts (gather attended tokens — correct for left/right padding);
+    # the trl /generate/ endpoint accepts list[list[int]] directly.
+    prompts_ids = [
+        prompt_ids[b][prompt_attention_mask[b].bool()].detach().cpu().tolist()
+        for b in range(batch_size)
+    ]
+    payload = {
+        "prompts": prompts_ids, "images": None, "n": num_samples,
+        "repetition_penalty": 1.0,
+        "temperature": temperature if do_sample else 0.0,
+        "top_p": top_p if do_sample else 1.0,
+        "top_k": 0, "min_p": 0.0, "max_tokens": max_new_tokens,
+        "logprobs": 0, "structured_outputs_regex": None,
+        "generation_kwargs": ({"seed": int(seed)} if seed is not None else {}),
+    }
+    resp = requests.post(f"http://{host}:{port}/generate/", json=payload, timeout=1800)
+    resp.raise_for_status()
+    completion_ids = resp.json()["completion_ids"]   # list[list[int]], prompt-major, len batch*n
+    if len(completion_ids) != batch_size * num_samples:
+        raise RuntimeError(
+            f"vLLM server returned {len(completion_ids)} completions, expected "
+            f"{batch_size * num_samples} (batch={batch_size} × n={num_samples}).")
+    token_sequences = [torch.tensor(ids, dtype=torch.long) for ids in completion_ids]
+    rollout = rollout_batch_from_token_sequences(
+        tokenizer, token_sequences, device=device,
+        num_prompts=batch_size, num_samples=num_samples,
+    )
+    rollout.texts = [tokenizer.decode(ids, skip_special_tokens=True) for ids in completion_ids]
+    return rollout
+
+
 def generate_rollout_batch(
     sampling_model,
     tokenizer,
@@ -535,6 +599,14 @@ def generate_rollout_batch(
             seed=seed,
         )
 
+    if backend == GenerationBackend.VLLM_SERVER:
+        return _vllm_server_generate_rollout_batch(
+            sampling_model, tokenizer, prompt_ids, prompt_attention_mask,
+            num_samples=num_samples, max_new_tokens=max_new_tokens, do_sample=do_sample,
+            temperature=temperature, top_p=top_p, seed=seed,
+            vllm_config=VLLMConfig() if vllm_config is None else vllm_config,
+            adapter_path=adapter_path, model_id=model_id,
+        )
     return _vllm_generate_rollout_batch(
         sampling_model,
         tokenizer,

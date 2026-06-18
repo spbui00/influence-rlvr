@@ -27,13 +27,16 @@ from .influence import _make_verifier_reward_builder
 
 
 def _vllm_config(cfg: ExperimentConfig, *, scoring: bool = False) -> VLLMConfig:
-    # scoring=True: the influence engine COEXISTS with the HF model (gradient backward)
-    # on the same GPU, so use the smaller if_vllm_gpu_util — not the training share.
+    # scoring=True: reuse the running trl vllm-serve over HTTP (VLLM_SERVER backend) —
+    # no in-process engine. Carry the gen server's host/port; gpu_memory_utilization is
+    # unused on that path (the engine lives in the separate gen-server process).
     return VLLMConfig(
         gpu_memory_utilization=(cfg.if_vllm_gpu_util if scoring
                                 else cfg.vllm_gpu_memory_utilization),
         max_model_len=cfg.vllm_max_model_len,
         max_lora_rank=cfg.lora_r,
+        server_host=(cfg.vllm_server_host if scoring else None),
+        server_port=(cfg.vllm_server_port if scoring else None),
     )
 
 
@@ -171,12 +174,12 @@ def _build_empirical_fvp(cfg, model, tokenizer, train_pool, device, backend, vll
 def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
             tag, checkpoint_step, save_dir):
     # The GRADIENT is always HF (backward), but the per-example ROLLOUT SAMPLING — the
-    # slow half — can be offloaded to vLLM. Gated by `if_vllm_gen` AND vLLM *server*
-    # mode only: there the training process has no in-process engine, so a scoring
-    # engine here won't hit the colocate CuMem-singleton clash. The scoring engine
-    # shares the GPU with the HF model, so it uses the smaller if_vllm_gpu_util.
+    # slow half — is offloaded to the RUNNING trl vllm-serve server over HTTP (the
+    # VLLM_SERVER backend), reusing the training gen engine. NOT an in-process engine:
+    # spinning one inside the DDP scoring process deadlocks on vLLM's own TCPStore.
+    # Gated by `if_vllm_gen` AND server mode (the only mode with a gen server to reuse).
     offload = cfg.if_vllm_gen and cfg.use_vllm and cfg.vllm_mode == "server"
-    backend = GenerationBackend.VLLM if offload else GenerationBackend.HF
+    backend = GenerationBackend.VLLM_SERVER if offload else GenerationBackend.HF
     vllm_cfg = _vllm_config(cfg, scoring=offload)
     builder = _make_verifier_reward_builder(cfg)
 
