@@ -212,6 +212,15 @@ class ExperimentConfig:
     #                  of one *AdamW* step (what training actually does), not SGD.
     #                  No λ/CG → nothing to converge; skips the Fisher entirely.
     if_method: str = "cg"
+    # ── Influence gradient SOURCE (orthogonal to the if_method operator above) ──
+    # What g_train/g_test ARE — the same operator (dot/tracin-adam/cg) applies to either:
+    #   "rollout" (default) — on-policy GRPO gradient: sample if_g_train rollouts,
+    #              advantage-weighted ∇logπ. Faithful, but needs generation (expensive).
+    #   "gold"    — SFT gold-answer gradient ∇[−logπ(\boxed{y_gold}|x)]: ONE teacher-
+    #              forced forward+backward, NO rollouts (~30 ms/ex). Cheap surrogate; e.g.
+    #              if_method=tracin-adam + if_grad=gold = tracin-adam on the gold gradient.
+    #              Reads `solution` (the verifier ground truth).
+    if_grad: str = "rollout"
     # tracin-adam only: override Adam's optimization ε (≈1e-8) with a larger floor
     # on the preconditioner denominator 1/(√v̂+ε). 0 = use the optimizer's own ε
     # (faithful). Raise it (e.g. 1e-4) if dormant-coordinate P-spikes make the
@@ -321,6 +330,8 @@ class ExperimentConfig:
                 f"if_method must be cg|cg-empirical|fisher|dot|tracin-adam, "
                 f"got {self.if_method!r}"
             )
+        if self.if_grad not in ("rollout", "gold"):
+            raise ValueError(f"if_grad must be rollout|gold, got {self.if_grad!r}")
 
     # ── Derived paths ───────────────────────────────────────────────────────
     @property

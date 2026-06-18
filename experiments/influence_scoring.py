@@ -17,6 +17,7 @@ from influence_rlvr.gradients import (
     _grad_vector_from_scalar,
     compute_policy_gradient_bundle,
     compute_policy_gradient_bundle_batch,
+    compute_sft_gradient_batch,
 )
 from influence_rlvr.modes import GenerationBackend, GradientObjective, VLLMConfig
 from influence_rlvr.utils import tokenize_prompt
@@ -93,6 +94,16 @@ def _example_grads_batch(model, tokenizer, samples, builder, *, objective_mode, 
         logps_micro_batch_size=cfg.if_logps_micro_batch,
     )
     return [g.detach().to(dtype=torch.float32) for g in res["grad"]]
+
+
+def _example_sft_grads_batch(model, tokenizer, samples, *, cfg, device):
+    """`if_grad="gold"` minibatch: the SFT gold-answer gradient (no rollouts)."""
+    return compute_sft_gradient_batch(
+        model, tokenizer,
+        [s["prompt"] for s in samples],
+        [s.get("solution", "") for s in samples],
+        device=device, logps_micro_batch_size=cfg.if_logps_micro_batch,
+    )
 
 
 # ── Option 2: matrix-free true-Fisher FVP ───────────────────────────────────
@@ -208,6 +219,10 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
     # once per target and stream g_train one batch at a time to bound memory.
     use_fisher = cfg.if_method not in ("dot", "tracin-adam")
     use_adam = cfg.if_method == "tracin-adam"
+    # if_grad="gold": swap the on-policy rollout gradient for the SFT gold-answer
+    # gradient (no rollouts). The OPERATOR above (Fisher/Adam/dot) is unchanged — it's
+    # applied to whichever gradients. So tracin-adam + gold = tracin-adam on g_gold.
+    is_gold = cfg.if_grad == "gold"
     if use_fisher:
         fvp = make_fvp()
         cg = CGInfluence(fvp_fn=fvp, lambda_damp=cfg.lambda_damp,
@@ -245,10 +260,14 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
     for c in range(0, len(my_targets), B):
         tids = my_targets[c : c + B]
         chunk = [target_set[j] for j in tids]
-        grads = _example_grads_batch(
-            model, tokenizer, chunk, builder,
-            objective_mode=GradientObjective.EXPECTED_REWARD_PG, cfg=cfg,
-            device=device, backend=backend, vllm_cfg=vllm_cfg, seed=cfg.seed + 10_000 + tids[0],
+        grads = (
+            _example_sft_grads_batch(model, tokenizer, chunk, cfg=cfg, device=device)
+            if is_gold else _example_grads_batch(
+                model, tokenizer, chunk, builder,
+                objective_mode=GradientObjective.EXPECTED_REWARD_PG, cfg=cfg,
+                device=device, backend=backend, vllm_cfg=vllm_cfg,
+                seed=cfg.seed + 10_000 + tids[0],
+            )
         )
         for j, g_test in zip(tids, grads):
             if use_fisher:
@@ -281,18 +300,23 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
     n_train = len(train_pool)
     my_pool = list(range(rank, n_train, world))
     if main:
-        print(f"  [{cfg.if_method}] scoring {n_train} train prompts "
-              f"({len(my_pool)}/rank × {world} ranks, batch={B}, gen={backend.name})...")
+        gen_label = "none/gold-SFT" if is_gold else backend.name
+        print(f"  [{cfg.if_method}/{cfg.if_grad}] scoring {n_train} train prompts "
+              f"({len(my_pool)}/rank × {world} ranks, batch={B}, gen={gen_label})...")
     matrix = np.zeros((n_target, n_train), dtype=np.float64)
     t0 = time.time()
     next_log = 50
     for c in range(0, len(my_pool), B):
         pids = my_pool[c : c + B]
         chunk = [train_pool[i] for i in pids]
-        grads = _example_grads_batch(
-            model, tokenizer, chunk, builder,
-            objective_mode=GradientObjective.GRPO_TRAIN, cfg=cfg,
-            device=device, backend=backend, vllm_cfg=vllm_cfg, seed=cfg.seed + 20_000 + pids[0],
+        grads = (
+            _example_sft_grads_batch(model, tokenizer, chunk, cfg=cfg, device=device)
+            if is_gold else _example_grads_batch(
+                model, tokenizer, chunk, builder,
+                objective_mode=GradientObjective.GRPO_TRAIN, cfg=cfg,
+                device=device, backend=backend, vllm_cfg=vllm_cfg,
+                seed=cfg.seed + 20_000 + pids[0],
+            )
         )
         for i, g_train in zip(pids, grads):
             matrix[:, i] = (H @ g_train.to(H.device)).detach().cpu().numpy()

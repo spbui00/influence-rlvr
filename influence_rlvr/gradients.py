@@ -747,6 +747,57 @@ def compute_policy_gradient_bundle_batch(
     }
 
 
+def compute_sft_gradient_batch(
+    peft_model,
+    tokenizer,
+    prompts: list,
+    golds: list,
+    *,
+    device,
+    logps_micro_batch_size: int = 4,
+    box: bool = True,
+):
+    """Gold-answer (SFT) gradient — ∇θ[−log πθ(y_gold | x)], NO rollouts.
+
+    The rollout-free `if_grad="gold"` source: teacher-force the GOLD answer (wrapped in
+    \\boxed{} by default) instead of sampling G rollouts, so it costs one forward+backward
+    per example. The if_method OPERATOR (dot / tracin-adam / cg) is applied to these
+    gradients exactly as for the on-policy ones. Returns one fp32 grad vector per prompt,
+    in input order.
+    """
+    if len(prompts) != len(golds):
+        raise ValueError("prompts and golds must have the same length.")
+    peft_model.eval()
+    peft_model.zero_grad()
+    dev = torch.device(device) if isinstance(device, str) else device
+    _, prompt_ids, prompt_attention_mask = tokenize_prompts_batch(tokenizer, prompts, dev)
+    eos = tokenizer.eos_token_id
+    grads = []
+    for bi in range(len(prompts)):
+        gold = str(golds[bi]) if golds[bi] is not None else ""
+        target = f"\\boxed{{{gold}}}" if box else gold
+        comp_ids = tokenizer(target, add_special_tokens=False,
+                             return_tensors="pt")["input_ids"].to(dev)
+        if eos is not None:  # teach it to stop after the answer
+            comp_ids = torch.cat(
+                [comp_ids, torch.full((1, 1), int(eos), device=dev, dtype=comp_ids.dtype)],
+                dim=1)
+        comp_mask = torch.ones_like(comp_ids)
+        per_token_logps = _compute_per_token_logps(
+            peft_model,
+            prompt_ids[bi : bi + 1],
+            prompt_attention_mask[bi : bi + 1],
+            comp_ids,
+            comp_mask,
+            micro_batch_size=logps_micro_batch_size,
+        )
+        nll = -(per_token_logps * comp_mask).sum() / comp_mask.sum().clamp(min=1)
+        peft_model.zero_grad()
+        g = _grad_vector_from_scalar(peft_model, nll, retain_graph=False)
+        grads.append(g.detach().to(dtype=torch.float32))
+    return grads
+
+
 def compute_policy_gradient_bundle(
     peft_model,
     tokenizer,

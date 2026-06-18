@@ -94,7 +94,8 @@ N_IF_TARGET="${N_IF_TARGET:-64}"   # IF-target size; bump to ~256 for a single d
 # the baseline, so the ONLY thing that differs across arms is SELECTION/IF_METHOD.
 REGIME="${REGIME:-baseline}"               # baseline | if_prune
 SELECTION="${SELECTION:-if-guided}"        # if-guided | anti-if | random
-IF_METHOD="${IF_METHOD:-tracin-adam}"      # tracin-adam | dot | cg  (tracin-adam cheapest)
+IF_METHOD="${IF_METHOD:-tracin-adam}"      # the OPERATOR: tracin-adam | dot | cg
+IF_GRAD="${IF_GRAD:-rollout}"              # the GRADIENT: rollout (on-policy, needs gen) | gold (SFT, no rollouts ~30ms/ex)
 PRUNE_STEP="${PRUNE_STEP:-$SAVE_STEPS}"          # warm up to here, then rank (multiple of SAVE_STEPS)
 IF_RECOMPUTE_EVERY="${IF_RECOMPUTE_EVERY:-$SAVE_STEPS}"   # re-score + re-rank cadence (0 = one-shot)
 # IF_VLLM_GEN=1: offload influence-scoring ROLLOUT sampling to the RUNNING trl
@@ -108,7 +109,7 @@ IF_SCORE_BATCH="${IF_SCORE_BATCH:-4}"
 IF_ARGS=""
 if [ "$REGIME" = "if_prune" ]; then
     # CG-only flags are ignored by dot/tracin-adam.
-    IF_ARGS="--selection $SELECTION --if-method $IF_METHOD \
+    IF_ARGS="--selection $SELECTION --if-method $IF_METHOD --if-grad $IF_GRAD \
         --prune-step $PRUNE_STEP --if-recompute-every $IF_RECOMPUTE_EVERY \
         --if-g-train 8 --if-max-new-tokens 1024 --if-score-batch $IF_SCORE_BATCH --if-logps-micro-batch 1 \
         --cg-fisher-examples 8 --cg-fisher-g 2 --cg-fisher-max-tokens 128 --cg-iters 50 --lambda-damp 0.5"
