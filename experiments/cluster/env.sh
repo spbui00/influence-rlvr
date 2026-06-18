@@ -18,8 +18,7 @@
 # has NO Lmod modules and runs inside an NGC container instead — so make the load
 # NON-FATAL (|| true) so the same env.sh works in both. On Clariden, set VENV_DIR to
 # the container venv (e.g. $SCRATCH/envs/ifrlvr) and HF_HOME to a $SCRATCH path.
-module load StdEnv/2023 gcc/12.3 python/3.11 cuda/12.2 arrow/21.0.0 opencv/4.13.0 2>/dev/null \
-  || echo "env.sh: no Lmod modules loaded (container/CSCS env) — using the active runtime."
+module load StdEnv/2023 gcc/12.3 python/3.11 cuda/12.2 arrow/21.0.0 opencv/4.13.0 2>/dev/null || true
 
 source "${VENV_DIR:-$HOME/envs/influence-rlvr}/bin/activate"
 
