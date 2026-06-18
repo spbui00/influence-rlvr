@@ -71,6 +71,11 @@ EVAL_BENCH="${EVAL_BENCH:-webinstruct_test}"   # used by BOTH live + final eval
 FINAL_EVAL_MAX="${FINAL_EVAL_MAX:-500}"        # final eval size (train-heldout = 1000 avail)
 TEST_DOMAINS="${TEST_DOMAINS:-}"
 TEST_DOMAINS_ARG=""; [ -n "$TEST_DOMAINS" ] && TEST_DOMAINS_ARG="--webinstruct-test-domains $TEST_DOMAINS"
+# DOMAINS = the POOL domains (comma-sep; default = config's math,cs,finance). The pool
+# is balanced across these. For the cross-domain IF study set e.g. "math,physics,finance"
+# (quant pool, finance target) — see DOMAIN_TO_CATEGORIES for the full set.
+DOMAINS="${DOMAINS:-}"
+DOMAINS_ARG=""; [ -n "$DOMAINS" ] && DOMAINS_ARG="--domains $DOMAINS"
 # TEST_FROM_TRAIN=1: carve the IF target + held-out eval from the TRAIN split, not
 # the tiny math-skewed 1000-row test slice. REQUIRED for a single-domain target —
 # finance test = 62 rows but train = 13k. Carved AFTER the pool's per-domain share
@@ -237,6 +242,7 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     --model-id "$MODEL" --lora-r 32 \
     --if-target-source "$IF_TARGET" --eval-benchmarks "$EVAL_BENCH" $TEST_DOMAINS_ARG $TEST_FROM_TRAIN_ARG \
     --live-eval-benchmark "$LIVE_EVAL_BENCH" --n-train-pool "$POOL" --n-if-target "$N_IF_TARGET" \
+    $DOMAINS_ARG \
     $IF_ARGS \
     --max-steps "$STEPS" --save-steps "$SAVE_STEPS" \
     --g-train "$G_TRAIN" --per-device-batch "$PER_DEVICE_BATCH" --grad-accum "$GRAD_ACCUM" \

@@ -19,9 +19,15 @@ from pathlib import Path
 # title-cased names (see the dataset card: 16 categories). We map the user-facing
 # domain {math, cs, finance} to the dataset's category labels.
 DOMAIN_TO_CATEGORIES: dict[str, tuple[str, ...]] = {
-    "math": ("Mathematics",),
-    "cs": ("Computer Science",),
-    "finance": ("Finance",),
+    "math": ("Mathematics",),       # 78k train — quant (Expression/Float)
+    "cs": ("Computer Science",),    # 1.2k train — too small to target
+    "finance": ("Finance",),        # 13k train — quant (Float/Percentage)
+    "physics": ("Physics",),        # 55k train — quant (Float/Integer)
+    "chemistry": ("Chemistry",),    # 24k train — quant
+    "business": ("Business",),      # 23k train — mixed
+    "economics": ("Economics",),    # 11k train — quant-ish
+    "biology": ("Biology",),        # 5.7k train — verbal/knowledge (distractor)
+    "history": ("History",),        # 5.9k train — verbal/knowledge (distractor)
 }
 
 
