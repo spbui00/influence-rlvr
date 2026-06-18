@@ -26,9 +26,12 @@ from .dist_utils import all_reduce_sum_, dist_info
 from .influence import _make_verifier_reward_builder
 
 
-def _vllm_config(cfg: ExperimentConfig) -> VLLMConfig:
+def _vllm_config(cfg: ExperimentConfig, *, scoring: bool = False) -> VLLMConfig:
+    # scoring=True: the influence engine COEXISTS with the HF model (gradient backward)
+    # on the same GPU, so use the smaller if_vllm_gpu_util — not the training share.
     return VLLMConfig(
-        gpu_memory_utilization=cfg.vllm_gpu_memory_utilization,
+        gpu_memory_utilization=(cfg.if_vllm_gpu_util if scoring
+                                else cfg.vllm_gpu_memory_utilization),
         max_model_len=cfg.vllm_max_model_len,
         max_lora_rank=cfg.lora_r,
     )
@@ -52,7 +55,7 @@ def _example_grad(model, tokenizer, sample, reward_funcs, *, objective_mode, cfg
     res = compute_policy_gradient_bundle(
         model, tokenizer, sample["prompt"], reward_funcs,
         G=cfg.if_g_train, device=device,
-        enable_vllm=False, generation_backend=backend,
+        enable_vllm=(backend == GenerationBackend.VLLM), generation_backend=backend,
         max_new_tokens=cfg.if_max_new_tokens, temperature=0.7, top_p=0.9,
         seed=seed, epsilon=cfg.grpo_epsilon, beta=cfg.grpo_beta,
         objective_mode=objective_mode, vllm_config=vllm_cfg, model_id=cfg.model_id,
@@ -80,7 +83,7 @@ def _example_grads_batch(model, tokenizer, samples, builder, *, objective_mode, 
     res = compute_policy_gradient_bundle_batch(
         model, tokenizer, prompts, reward_funcs_batch,
         G=cfg.if_g_train, device=device,
-        enable_vllm=False, generation_backend=backend,
+        enable_vllm=(backend == GenerationBackend.VLLM), generation_backend=backend,
         max_new_tokens=cfg.if_max_new_tokens, temperature=0.7, top_p=0.9,
         seed=seed, epsilon=cfg.grpo_epsilon, beta=cfg.grpo_beta,
         objective_mode=objective_mode, vllm_config=vllm_cfg, model_id=cfg.model_id,
@@ -167,11 +170,14 @@ def _build_empirical_fvp(cfg, model, tokenizer, train_pool, device, backend, vll
 # ── Shared CG solve + streamed scoring ──────────────────────────────────────
 def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
             tag, checkpoint_step, save_dir):
-    # Influence ALWAYS uses HF generation, never vLLM: CG needs gradients
-    # (backward), which vLLM can't do, and spinning a 2nd vLLM engine collides
-    # with TRL's colocate engine on the same GPU. Training still uses vLLM.
-    backend = GenerationBackend.HF
-    vllm_cfg = _vllm_config(cfg)
+    # The GRADIENT is always HF (backward), but the per-example ROLLOUT SAMPLING — the
+    # slow half — can be offloaded to vLLM. Gated by `if_vllm_gen` AND vLLM *server*
+    # mode only: there the training process has no in-process engine, so a scoring
+    # engine here won't hit the colocate CuMem-singleton clash. The scoring engine
+    # shares the GPU with the HF model, so it uses the smaller if_vllm_gpu_util.
+    offload = cfg.if_vllm_gen and cfg.use_vllm and cfg.vllm_mode == "server"
+    backend = GenerationBackend.VLLM if offload else GenerationBackend.HF
+    vllm_cfg = _vllm_config(cfg, scoring=offload)
     builder = _make_verifier_reward_builder(cfg)
 
     # Scoring minibatch: B prompts share one batched generation forward (the slow
@@ -229,7 +235,7 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
             what = "h = P_adam ⊙ g_test (Adam-preconditioned dot)"
         else:
             what = "h = g_test (dot-product)"
-        print(f"  CG: {what} for {n_target} targets (batch={B}, world={world})...")
+        print(f"  [{cfg.if_method}] {what} for {n_target} targets (batch={B}, world={world})...")
     H = torch.zeros(n_target, D, device=device, dtype=torch.float32)
     info: dict = {"status": "?", "n_iters": 0, "final_residual": float("nan")}
     my_targets = list(range(rank, n_target, world))
@@ -272,8 +278,8 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
     n_train = len(train_pool)
     my_pool = list(range(rank, n_train, world))
     if main:
-        print(f"  CG: scoring {n_train} train prompts "
-              f"({len(my_pool)}/rank × {world} ranks, batch={B})...")
+        print(f"  [{cfg.if_method}] scoring {n_train} train prompts "
+              f"({len(my_pool)}/rank × {world} ranks, batch={B}, gen={backend.name})...")
     matrix = np.zeros((n_target, n_train), dtype=np.float64)
     t0 = time.time()
     next_log = 50

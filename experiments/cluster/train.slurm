@@ -97,14 +97,20 @@ SELECTION="${SELECTION:-if-guided}"        # if-guided | anti-if | random
 IF_METHOD="${IF_METHOD:-tracin-adam}"      # tracin-adam | dot | cg  (tracin-adam cheapest)
 PRUNE_STEP="${PRUNE_STEP:-$SAVE_STEPS}"          # warm up to here, then rank (multiple of SAVE_STEPS)
 IF_RECOMPUTE_EVERY="${IF_RECOMPUTE_EVERY:-$SAVE_STEPS}"   # re-score + re-rank cadence (0 = one-shot)
+# IF_VLLM_GEN=1: offload the influence-scoring ROLLOUT sampling to vLLM (server mode
+# only) — the big speedup for the generation-bound IF cost; the gradient stays exact
+# on HF. The scoring engine shares the train GPU with the HF model, so keep
+# IF_VLLM_GPU_UTIL small. NEW/experimental — validate on a smoke before a full grid.
+IF_VLLM_GEN="${IF_VLLM_GEN:-0}"
+IF_VLLM_GPU_UTIL="${IF_VLLM_GPU_UTIL:-0.3}"
 IF_ARGS=""
 if [ "$REGIME" = "if_prune" ]; then
-    # CG-only flags are ignored by dot/tracin-adam. Influence is scored on the train
-    # GPUs (CG uses HF), so this works under both generation backends.
+    # CG-only flags are ignored by dot/tracin-adam.
     IF_ARGS="--selection $SELECTION --if-method $IF_METHOD \
         --prune-step $PRUNE_STEP --if-recompute-every $IF_RECOMPUTE_EVERY \
         --if-g-train 8 --if-max-new-tokens 1024 --if-score-batch 4 --if-logps-micro-batch 1 \
         --cg-fisher-examples 8 --cg-fisher-g 2 --cg-fisher-max-tokens 128 --cg-iters 50 --lambda-damp 0.5"
+    [ "$IF_VLLM_GEN" = "1" ] && IF_ARGS="$IF_ARGS --if-vllm-gen --if-vllm-gpu-util $IF_VLLM_GPU_UTIL"
 fi
 # RESUME=1 continues from the latest checkpoint under outputs/$RUN_NAME (same
 # RUN_NAME) — use it to recover a time-limit kill, or to extend max-steps later.

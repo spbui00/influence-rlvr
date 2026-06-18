@@ -237,6 +237,13 @@ class ExperimentConfig:
     # memory scales with generation (B × if_g_train × if_max_new_tokens), not B×D.
     # 1 == the old one-at-a-time loop. Raise until generation saturates the GPU.
     if_score_batch: int = 1
+    # Offload the per-example ROLLOUT SAMPLING (not the gradient) in influence scoring
+    # to vLLM — the slow half. Only active in vLLM *server* mode (no colocate engine to
+    # clash with); the scoring engine coexists with the HF model on the train GPU, so
+    # keep if_vllm_gpu_util small. The gradient stays exact (HF backward on the same
+    # tokens), so this is a pure speedup, no quality change.
+    if_vllm_gen: bool = False
+    if_vllm_gpu_util: float = 0.3
     # Logits microbatch for the per-token-logp forward during scoring. The lm_head
     # materializes (micro_batch × seq × vocab≈152k) logits — the dominant memory
     # spike in the scoring backward. 1 = one sequence's logits at a time (minimum

@@ -25,7 +25,7 @@ import numpy as np
 import torch
 
 from experiments.config import ExperimentConfig
-from experiments.cg_influence import (
+from experiments.influence_scoring import (
     _build_empirical_fvp,
     _build_true_fisher_fvp,
     _run_cg,

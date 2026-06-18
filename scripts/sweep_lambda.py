@@ -30,7 +30,7 @@ from influence_rlvr import CGInfluence
 from influence_rlvr.modes import GenerationBackend, GradientObjective
 
 from experiments.config import ExperimentConfig
-from experiments.cg_influence import _build_true_fisher_fvp, _example_grads_batch, _vllm_config
+from experiments.influence_scoring import _build_true_fisher_fvp, _example_grads_batch, _vllm_config
 from experiments.data import load_if_target_set, load_train_pool
 from experiments.dist_utils import all_reduce_sum_, cleanup, dist_info, init_distributed, is_main
 from experiments.train import build_model
