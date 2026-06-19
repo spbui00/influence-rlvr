@@ -404,6 +404,17 @@ def run_if_prune(cfg, model, tokenizer, train_pool, device):
             trainer.save_model(str(ckpt_end))
         prev_ckpt = str(ckpt_end)
 
+        # if_prune rebuilds a GRPOTrainer per window; in vLLM SERVER mode each new
+        # trainer re-runs init_communicator for the weight-sync NCCL group, which
+        # collides with the prior window's still-open group on the gen server ("remote
+        # process exited"). Close it here so the next window re-inits cleanly.
+        if cfg.use_vllm and getattr(cfg, "vllm_mode", "") == "server":
+            try:
+                trainer.vllm_generation.vllm_client.close_communicator()
+                print(f"[window {w}] closed vLLM weight-sync communicator for re-init")
+            except Exception as e:
+                print(f"[window {w}] vLLM communicator teardown skipped "
+                      f"({type(e).__name__}: {e})")
         del trainer
         clear_cache(device)
         clear_vllm_engine_cache()
