@@ -394,9 +394,14 @@ def run_if_prune(cfg, model, tokenizer, train_pool, device):
             # worth of prompts (demotion too slow to diversify). A wide kept set +
             # shuffle lets the demotion-driven turnover operate on a diverse base.
             keep = max(1, int(round(cfg.keep_fraction * pool)))
-            kept = sorted(int(i) for i in order[:keep])   # order is selection-ranked
+            kept = [int(i) for i in order[:keep]]         # influence-ranked, best first
             np.save(if_dir / f"kept_step{start}.npy", np.array(kept))
-            dataset = train_pool.select(kept)
+            if cfg.if_shuffle_kept:
+                dataset = train_pool.select(sorted(kept))  # order irrelevant; trainer reshuffles
+                shuffle = True
+            else:
+                dataset = train_pool.select(kept)          # best->worst curriculum sweep
+                shuffle = False
             # Which DOMAINS did the influence keep? (the cross-domain observable:
             # e.g. did a CS target pull in Math/Finance examples?)
             if "category" in train_pool.column_names:
@@ -408,10 +413,10 @@ def run_if_prune(cfg, model, tokenizer, train_pool, device):
             else:
                 cat_str = ""
             epochs = (window_steps * pps) / max(1, len(kept))
+            order_note = "shuffled" if cfg.if_shuffle_kept else "ranked best->worst"
             print(f"[window {w}] kept top {len(kept)} of {pool} by influence "
-                  f"({len(kept) / pool:.0%}); train {start}->{end} shuffled "
+                  f"({len(kept) / pool:.0%}); train {start}->{end} {order_note} "
                   f"(~{epochs:.1f} epochs over kept){cat_str}")
-            shuffle = True
             # Influence (CG) disables grad checkpointing; restore for training.
             if hasattr(model, "gradient_checkpointing_enable"):
                 model.gradient_checkpointing_enable()

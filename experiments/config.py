@@ -52,10 +52,15 @@ class ExperimentConfig:
     # one-shot prune at `prune_step`. Boundaries must be multiples of save_steps
     # (resume across windows needs a full checkpoint there).
     if_recompute_every: int = 50
-    # Each re-rank keeps the top `keep_fraction` of the pool BY INFLUENCE and trains
-    # it SHUFFLED (run_if_prune). Breadth is set here, decoupled from window length —
-    # smaller = stronger IF-vs-random contrast but more epochs over fewer prompts.
+    # Each re-rank keeps the top `keep_fraction` of the pool BY INFLUENCE. Breadth is
+    # set here, decoupled from window length — smaller = stronger IF-vs-random contrast
+    # but more epochs over fewer prompts.
     keep_fraction: float = 0.5
+    # Order the kept set is trained in. True = shuffle (covers the whole kept set even
+    # when a window is shorter than it; decorrelates batches). False = consume in
+    # influence order, best->worst (a curriculum sweep — but if a window is shorter
+    # than the kept set it only ever reaches the top, so size window ~= kept set).
+    if_shuffle_kept: bool = True
     # "if-guided" keeps highest-influence; "anti-if" keeps lowest (ablation);
     # "random" keeps a random subset of the same size (control).
     selection: str = "if-guided"

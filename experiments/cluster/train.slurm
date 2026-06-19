@@ -98,10 +98,14 @@ IF_METHOD="${IF_METHOD:-tracin-adam}"      # the OPERATOR: tracin-adam | dot | c
 IF_GRAD="${IF_GRAD:-rollout}"              # the GRADIENT: rollout (on-policy, needs gen) | gold (SFT, no rollouts ~30ms/ex)
 PRUNE_STEP="${PRUNE_STEP:-$SAVE_STEPS}"          # warm up to here, then rank (multiple of SAVE_STEPS)
 IF_RECOMPUTE_EVERY="${IF_RECOMPUTE_EVERY:-$SAVE_STEPS}"   # re-score + re-rank cadence (0 = one-shot)
-# Fraction of the pool KEPT by influence each re-rank, then trained SHUFFLED. Breadth
-# is set here, NOT by window length. Smaller = stronger IF-vs-random contrast but more
-# epochs over fewer prompts (0.2 of 24k = 4800 kept, ~3 epochs over 300 steps).
+# Fraction of the pool KEPT by influence each re-rank. Breadth is set here, NOT by
+# window length. Smaller = stronger IF-vs-random contrast but more epochs over fewer
+# prompts (0.2 of 24k = 4800 kept, ~3 epochs over 300 steps).
 KEEP_FRACTION="${KEEP_FRACTION:-0.2}"
+# Order the kept set is trained in. 1 = shuffle (covers all of kept even when a window
+# is shorter than it). 0 = ranked best->worst sweep (then size window ~= kept set, i.e.
+# IF_RECOMPUTE_EVERY*pps ~= KEEP_FRACTION*POOL, or the bottom of kept never trains).
+SHUFFLE_KEPT="${SHUFFLE_KEPT:-1}"
 # IF_VLLM_GEN=1: offload influence-scoring ROLLOUT sampling to the RUNNING trl
 # vllm-serve server over HTTP (server mode only) — gradient stays exact on HF (~4×).
 IF_VLLM_GEN="${IF_VLLM_GEN:-0}"
@@ -118,6 +122,7 @@ if [ "$REGIME" = "if_prune" ]; then
         --if-g-train 8 --if-max-new-tokens 1024 --if-score-batch $IF_SCORE_BATCH --if-logps-micro-batch 1 \
         --cg-fisher-examples 8 --cg-fisher-g 2 --cg-fisher-max-tokens 128 --cg-iters 50 --lambda-damp 0.5"
     [ "$IF_VLLM_GEN" = "1" ] && IF_ARGS="$IF_ARGS --if-vllm-gen --if-vllm-gpu-util $IF_VLLM_GPU_UTIL"
+    [ "$SHUFFLE_KEPT" = "0" ] && IF_ARGS="$IF_ARGS --no-if-shuffle-kept"
 fi
 # RESUME=1 continues from the latest checkpoint under outputs/$RUN_NAME (same
 # RUN_NAME) — use it to recover a time-limit kill, or to extend max-steps later.
