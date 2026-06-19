@@ -346,12 +346,24 @@ def run_if_prune(cfg, model, tokenizer, train_pool, device):
 
     live_eval = make_live_eval_callback(cfg, tokenizer, device)
     prev_ckpt: str | None = None
+    model_step = 0  # in-memory model's training step; lags `start` when --resume skips windows
     for w in range(len(boundaries) - 1):
         start, end = boundaries[w], boundaries[w + 1]
         if end <= start:
             continue
         window_steps = end - start
         shuffle = True
+
+        # --resume: if this window already trained to completion (its end-checkpoint
+        # exists), skip it and just advance the anchor. The in-memory model stays
+        # stale (model_step < start) but that's harmless as long as the next
+        # non-skipped window reuses a saved ranking instead of live-scoring — the
+        # else-branch below guards that case explicitly.
+        done_ckpt = cfg.grpo_output_dir / f"checkpoint-{end}"
+        if cfg.resume and done_ckpt.is_dir():
+            print(f"[window {w}] resume: checkpoint-{end} exists — skip training {start}->{end}")
+            prev_ckpt = str(done_ckpt)
+            continue
 
         if w == 0:
             # Warm-up window: full pool, shuffled, before any influence exists.
@@ -363,16 +375,30 @@ def run_if_prune(cfg, model, tokenizer, train_pool, device):
             # and build an in-order consumption schedule: pop the top n_picks
             # ranked prompts (the toy's build_schedule). shuffle off so TRL
             # consumes them in that order; the long tail is simply never reached.
-            print(f"\n[window {w}] scoring pool influence at step {start} "
-                  f"({cfg.if_method})...")
-            scores = compute_pool_influence(
-                cfg, model, tokenizer, train_pool, target_set, device,
-                checkpoint_step=start, save_dir=if_dir / f"step{start}",
-            )
-            order = _ranked_order(scores, selection=cfg.selection, seed=cfg.seed + start)
+            order_path = if_dir / f"ranked_order_step{start}.npy"
+            if cfg.resume and order_path.exists():
+                # Crash recovered between windows: the step-`start` ranking is on
+                # disk, so skip the (expensive) 24k rescore. Training below loads
+                # prev_ckpt, so the stale in-memory model never feeds selection here.
+                order = np.load(order_path)
+                print(f"\n[window {w}] resume: reusing saved ranking {order_path.name} "
+                      f"({len(order)} prompts) — skip rescoring")
+            else:
+                if cfg.resume and model_step != start:
+                    raise SystemExit(
+                        f"[window {w}] resume can't recover: need to score the step-{start} "
+                        f"model but the in-memory model is at step {model_step} and no saved "
+                        f"ranking exists at {order_path}. Rerun without --resume (start fresh).")
+                print(f"\n[window {w}] scoring pool influence at step {start} "
+                      f"({cfg.if_method})...")
+                scores = compute_pool_influence(
+                    cfg, model, tokenizer, train_pool, target_set, device,
+                    checkpoint_step=start, save_dir=if_dir / f"step{start}",
+                )
+                order = _ranked_order(scores, selection=cfg.selection, seed=cfg.seed + start)
+                np.save(order_path, order)
             n_picks = window_steps * pps
             schedule = _repeat_to_length(order, n_picks)
-            np.save(if_dir / f"ranked_order_step{start}.npy", order)
             np.save(if_dir / f"schedule_step{start}.npy", np.array(schedule))
             dataset = train_pool.select(schedule)   # ranked order, length n_picks
             uniq = sorted(set(schedule))
@@ -404,6 +430,7 @@ def run_if_prune(cfg, model, tokenizer, train_pool, device):
         else:
             trainer.train(resume_from_checkpoint=prev_ckpt)
         print(f"[window {w}] trained to {end} in {time.time() - t0:.1f}s")
+        model_step = end  # in-memory model is now trained to `end`
 
         ckpt_end = cfg.grpo_output_dir / f"checkpoint-{end}"
         if not ckpt_end.is_dir():
