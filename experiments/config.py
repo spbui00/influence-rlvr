@@ -52,10 +52,9 @@ class ExperimentConfig:
     # one-shot prune at `prune_step`. Boundaries must be multiples of save_steps
     # (resume across windows needs a full checkpoint there).
     if_recompute_every: int = 50
-    # NOTE: in the dynamic ranked-pop regime the fraction of the pool actually
-    # trained on is set by the window length (W × prompts_per_step prompts are
-    # popped from the ranking per window), NOT by a hard cut. keep_fraction is
-    # retained only for the legacy one-shot `select_keep_indices` helper.
+    # Each re-rank keeps the top `keep_fraction` of the pool BY INFLUENCE and trains
+    # it SHUFFLED (run_if_prune). Breadth is set here, decoupled from window length —
+    # smaller = stronger IF-vs-random contrast but more epochs over fewer prompts.
     keep_fraction: float = 0.5
     # "if-guided" keeps highest-influence; "anti-if" keeps lowest (ablation);
     # "random" keeps a random subset of the same size (control).

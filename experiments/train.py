@@ -203,17 +203,8 @@ def build_trainer(cfg, model, tokenizer, train_dataset, *, max_steps, shuffle=Tr
     return trainer
 
 
-def _repeat_to_length(order: np.ndarray, n_picks: int) -> list[int]:
-    """Tile a ranked ordering until it has n_picks indices (toy build_schedule)."""
-    n = order.shape[0]
-    if n_picks <= n:
-        return [int(i) for i in order[:n_picks]]
-    reps = (n_picks + n - 1) // n
-    return [int(i) for i in np.tile(order, reps)[:n_picks]]
-
-
 def _ranked_order(scores: np.ndarray, *, selection: str, seed: int) -> np.ndarray:
-    """Full-length consumption order over the pool (most-trained-first)."""
+    """Full-length selection order over the pool (kept set = first keep_fraction·pool)."""
     if selection == "if-guided":
         return np.argsort(-scores)            # most influential first
     if selection == "anti-if":
@@ -334,13 +325,12 @@ def run_if_prune(cfg, model, tokenizer, train_pool, device):
 
     pps = prompts_per_step(cfg)
     pool = len(train_pool)
-    full_cov_steps = -(-pool // pps)  # ceil(pool / pps)
+    keep = max(1, int(round(cfg.keep_fraction * pool)))
     print("\n" + "=" * 80)
-    print(f"IF-PRUNE (dynamic, ranked-pop) — windows {boundaries}, recompute@{triggers}")
-    print(f"  {pps} prompts/step | pool={pool} | a window of W steps pops the top "
-          f"W×{pps} ranked prompts in order")
-    print(f"  full coverage of the pool would need ~{full_cov_steps} steps/window "
-          f"(selection={cfg.selection}, method={cfg.if_method})")
+    print(f"IF-PRUNE (dynamic keep-fraction) — windows {boundaries}, recompute@{triggers}")
+    print(f"  {pps} prompts/step | pool={pool} | keep top {cfg.keep_fraction:.0%} "
+          f"(~{keep}) by influence each re-rank, train SHUFFLED")
+    print(f"  selection={cfg.selection}, method={cfg.if_method}, grad={cfg.if_grad}")
     print(f"  IF target set: {len(target_set)} held-out prompts")
     print("=" * 80)
 
@@ -371,10 +361,10 @@ def run_if_prune(cfg, model, tokenizer, train_pool, device):
             print(f"\n[window {w}] warm-up {start}->{end} on full pool "
                   f"({len(dataset)} prompts, shuffled)")
         else:
-            # Score the live model (exactly at step `start`), rank the WHOLE pool,
-            # and build an in-order consumption schedule: pop the top n_picks
-            # ranked prompts (the toy's build_schedule). shuffle off so TRL
-            # consumes them in that order; the long tail is simply never reached.
+            # Score the live model (exactly at step `start`), rank the WHOLE pool by
+            # influence on the target, keep the top keep_fraction, and train it
+            # shuffled (built below). Re-ranking each window lets a learned prompt's
+            # gradient shrink and drop out, rotating in under-learned ones.
             order_path = if_dir / f"ranked_order_step{start}.npy"
             if cfg.resume and order_path.exists():
                 # Crash recovered between windows: the step-`start` ranking is on
@@ -397,26 +387,31 @@ def run_if_prune(cfg, model, tokenizer, train_pool, device):
                 )
                 order = _ranked_order(scores, selection=cfg.selection, seed=cfg.seed + start)
                 np.save(order_path, order)
-            n_picks = window_steps * pps
-            schedule = _repeat_to_length(order, n_picks)
-            np.save(if_dir / f"schedule_step{start}.npy", np.array(schedule))
-            dataset = train_pool.select(schedule)   # ranked order, length n_picks
-            uniq = sorted(set(schedule))
-            n_unique = len(uniq)
-            # Which DOMAINS did the influence pick? (the cross-domain observable:
+            # Keep the top `keep_fraction` of the pool BY INFLUENCE and train it
+            # SHUFFLED. Breadth is set by keep_fraction, NOT window length — the old
+            # n_picks = window_steps·pps pinned each 20-step window to the razor-top
+            # ~960, which the rotation analysis showed concentrates onto ~1.3 windows'
+            # worth of prompts (demotion too slow to diversify). A wide kept set +
+            # shuffle lets the demotion-driven turnover operate on a diverse base.
+            keep = max(1, int(round(cfg.keep_fraction * pool)))
+            kept = sorted(int(i) for i in order[:keep])   # order is selection-ranked
+            np.save(if_dir / f"kept_step{start}.npy", np.array(kept))
+            dataset = train_pool.select(kept)
+            # Which DOMAINS did the influence keep? (the cross-domain observable:
             # e.g. did a CS target pull in Math/Finance examples?)
             if "category" in train_pool.column_names:
-                cats = [train_pool[i]["category"] for i in uniq]
+                cats = [train_pool[i]["category"] for i in kept]
                 sel = dict(Counter(cats))
                 with (if_dir / f"selected_categories_step{start}.json").open("w") as f:
                     json.dump(sel, f, indent=2)
-                cat_str = f" | selected-by-IF categories: {sel}"
+                cat_str = f" | kept-by-IF categories: {sel}"
             else:
                 cat_str = ""
-            print(f"[window {w}] popping top {n_picks} of {pool} ranked prompts "
-                  f"({n_unique} unique, {n_unique / pool:.0%} of pool); train {start}->{end}"
-                  f"{cat_str}")
-            shuffle = False
+            epochs = (window_steps * pps) / max(1, len(kept))
+            print(f"[window {w}] kept top {len(kept)} of {pool} by influence "
+                  f"({len(kept) / pool:.0%}); train {start}->{end} shuffled "
+                  f"(~{epochs:.1f} epochs over kept){cat_str}")
+            shuffle = True
             # Influence (CG) disables grad checkpointing; restore for training.
             if hasattr(model, "gradient_checkpointing_enable"):
                 model.gradient_checkpointing_enable()
