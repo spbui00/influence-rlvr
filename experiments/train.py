@@ -263,8 +263,14 @@ def _assert_resume_compatible(cfg) -> None:
         "live_eval_max_new_tokens", "live_eval_benchmark",
         "verifier_backend", "verifier_server_host", "verifier_server_port",
         "verifier_device", "verifier_batch_size", "verifier_max_new_tokens",
+        "verifier_max_model_len",
         "use_vllm", "vllm_mode", "vllm_gpu_memory_utilization", "vllm_max_model_len",
         "vllm_enable_sleep_mode", "vllm_server_host", "vllm_server_port",
+        # IF-scoring throughput / infra — these change how FAST scoring runs, never
+        # which examples get selected or the training trajectory, so they may differ
+        # on resume. (if_method/if_grad/if_recompute_every DO affect selection — kept.)
+        "if_score_batch", "if_logps_micro_batch", "if_vllm_gen", "if_vllm_gpu_util",
+        "ddp_timeout",
     }
     diffs = {k: (saved[k], current[k]) for k in current
              if k in saved and k not in may_differ and saved[k] != current[k]}
