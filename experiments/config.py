@@ -137,6 +137,12 @@ class ExperimentConfig:
     grpo_epsilon: float = 0.2
     grpo_epsilon_high: float = 0.3    # asymmetric upper clip ("clip-higher", GR-4B/DAPO)
     grpo_temperature: float = 0.7     # rollout sampling temperature (GR-4B Table 9)
+    # "group" divides advantage by group std (vanilla GRPO — over-weights easy/hard
+    # questions, the Dr.GRPO critique); "none" removes it (Dr.GRPO). "batch" = batch std.
+    grpo_scale_rewards: str = "group"
+    # "grpo" = per-response length norm (length-bias); "dr_grpo" = constant norm (no
+    # length bias); "bnpo" = token-level (DAPO-ish).
+    grpo_loss_type: str = "grpo"
     max_completion_length: int = 2048
     # NCCL collective timeout (s), applied via GRPOConfig/TrainingArguments (NOT the
     # accelerate YAML — the Alliance build rejects a ddp_timeout key there). Default

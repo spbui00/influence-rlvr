@@ -167,6 +167,10 @@ G_TRAIN="${G_TRAIN:-8}"                   # GRPO group size (completions/prompt;
 #   are pure MEMORY knobs — prompts/step (what Tier-1 tests) is held at 112.
 PER_DEVICE_BATCH="${PER_DEVICE_BATCH:-4}"
 MAX_COMPLETION="${MAX_COMPLETION:-2048}"
+# GRPO bias knobs. SCALE_REWARDS=none removes the std-norm bias (Dr.GRPO); LOSS_TYPE
+# dr_grpo removes the length-norm bias. Defaults keep vanilla GRPO behaviour.
+SCALE_REWARDS="${SCALE_REWARDS:-group}"   # group | batch | none
+LOSS_TYPE="${LOSS_TYPE:-grpo}"            # grpo | bnpo | dr_grpo
 GRAD_ACCUM="${GRAD_ACCUM:-32}"           # prompts/step = N_TRAIN_GPU x GRAD_ACCUM x (PDB/g_train)
 GENPORT="${GENPORT:-51216}"              # policy-gen HTTP server port (NOT 8000 — vLLM uses 8000 internally)
 GROUPPORT="${GROUPPORT:-$((GENPORT + 1))}"  # weight-sync NCCL group port; MUST differ from GENPORT
@@ -265,6 +269,7 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     --max-steps "$STEPS" --save-steps "$SAVE_STEPS" \
     --g-train "$G_TRAIN" --per-device-batch "$PER_DEVICE_BATCH" --grad-accum "$GRAD_ACCUM" \
     --max-completion-length "$MAX_COMPLETION" --grpo-temperature 0.7 --grpo-epsilon-high 0.3 \
+    --grpo-scale-rewards "$SCALE_REWARDS" --grpo-loss-type "$LOSS_TYPE" \
     --learning-rate "$LR" \
     $VLLM_ARGS \
     --verifier-backend vllm --verifier-server-port "$VPORT" --verifier-max-new-tokens 1024 \

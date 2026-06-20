@@ -129,8 +129,8 @@ def make_grpo_config(cfg: ExperimentConfig, *, max_steps: int, shuffle: bool = T
         "epsilon_high": cfg.grpo_epsilon_high,   # clip-higher (GR-4B); filtered if unsupported
         "temperature": cfg.grpo_temperature,     # rollout temperature (GR-4B = 0.7)
         "importance_sampling_level": "token",
-        "scale_rewards": "group",
-        "loss_type": "grpo",
+        "scale_rewards": cfg.grpo_scale_rewards,
+        "loss_type": cfg.grpo_loss_type,
         "max_completion_length": cfg.max_completion_length,
         # NOTE: max_prompt_length is not a GRPOConfig field in current TRL; prompt
         # truncation (if needed for very long WebInstruct questions) is handled at
