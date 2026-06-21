@@ -94,7 +94,7 @@ print("ERROR: servers did not come up in 900s", file=sys.stderr); sys.exit(1)
 PY
 
 # ── 3) compare on GPU 0: gold (no gen) + rollout (gen offloaded to server, grads HF) ─
-CUDA_VISIBLE_DEVICES=0 python -m experiments.compare_influence \
+CUDA_VISIBLE_DEVICES=0 python -u -m experiments.compare_influence \
     --checkpoint-step "$CKPT" \
     --run-name "$RUN_NAME" --model-id "$MODEL" --seed "$SEED" --lora-r 32 \
     --domains "$DOMAINS" --n-train-pool "$COMPARE_POOL" \
