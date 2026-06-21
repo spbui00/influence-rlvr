@@ -25,6 +25,7 @@ per prompt (HF in-process) and grades them via the verifier server, so launch on
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 
 import numpy as np
 import torch
@@ -107,6 +108,24 @@ def main(argv: list[str] | None = None) -> None:
     print("=" * 60)
     print("[compare] read: overlap >~0.7 -> gold ~= rollout, SKIP the rollout run; "
           "<~0.4 -> they differ, rollout may matter.")
+
+    # Domain composition of each method's selection — does gold/rollout concentrate on
+    # the target domain? (cell: count (share, enrichment vs pool); enrichment 1.0 = random)
+    if "category" in pool.column_names:
+        cats = np.array(pool["category"], dtype=object)
+        base_c = Counter(cats.tolist())
+        tdoms = ",".join(cfg.webinstruct_test_domains) or "all"
+        print(f"\n[compare] selection by DOMAIN (target={tdoms}, baseline " +
+              "  ".join(f"{d} {base_c[d] / n:.0%}" for d in sorted(base_c)) + "):")
+        for label, sc in (("GOLD", gold), ("ROLLOUT", roll)):
+            print(f"  {label}:")
+            for frac in (0.1, 0.2, 0.3):
+                k = max(1, int(round(frac * n)))
+                c = Counter(cats[np.argsort(-sc)[:k]].tolist())
+                parts = "   ".join(
+                    f"{d}={c.get(d, 0):>3} ({c.get(d, 0) / k:4.0%}, "
+                    f"{(c.get(d, 0) / k) / (base_c[d] / n):.2f}x)" for d in sorted(base_c))
+                print(f"    top-{frac:.0%} (k={k:>4}): {parts}")
 
 
 if __name__ == "__main__":
