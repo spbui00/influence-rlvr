@@ -1,18 +1,21 @@
-"""Domain breakdown of gold vs rollout influence selection (from saved compare scores).
+"""What would gold-IF select for a given target, at one checkpoint? (no training run)
 
-compare_influence.py saved gold_scores.npy + rollout_scores.npy for the pool it scored,
-but not the domain labels. load_train_pool is seed-deterministic, so we reload that exact
-pool to recover each prompt's category and report the domain composition of each method's
-top-keep_fraction — the cross-domain observable: for a MATH target, does rollout-IF
-concentrate on math the way gold does, or pick a different mix?
+Gold influence is the NLL-on-gold gradient — NO rollouts, so NO generation / verifier /
+gen server. Load a checkpoint, score the pool against a <domain> target, print the domain
+composition of the top-keep_fraction. Run it for math / physics / finance against the SAME
+checkpoint to see how IF's selection shifts with target domain (model held fixed):
 
-Pass the SAME data args the compare used (run-name, domains, n-train-pool, test-from-train,
-test-from-train-eval, webinstruct-test-domains, n-if-target, seed) so the pool matches.
+  isolated-knowledge target (finance) -> IF concentrates on that domain;
+  cross-cutting target (math)         -> IF stays ~uniform (math helps all domains).
 
-  python -m experiments.analyze_compare --checkpoint-step 10 \
-      --run-name math_if_v2 --domains math,physics,finance --n-train-pool 1000 \
-      --test-from-train --test-from-train-eval 1000 --webinstruct-test-domains math \
-      --n-if-target 256 --seed 42
+Single GPU, no servers (~10-25 min for a ~2k pool). Pass the same data args so the pool
+matches across targets (only --webinstruct-test-domains changes).
+
+  python -m experiments.analyze_compare --checkpoint-step 10 --run-name math_if_v2 \
+      --model-id Qwen/Qwen3-1.7B-Base --lora-r 32 \
+      --domains math,physics,finance --n-train-pool 2000 \
+      --test-from-train --test-from-train-eval 1000 --webinstruct-test-domains physics \
+      --n-if-target 256 --if-method tracin-adam --seed 42
 """
 from __future__ import annotations
 
@@ -20,23 +23,16 @@ import argparse
 from collections import Counter
 
 import numpy as np
+import torch
+from peft import PeftModel
+from transformers import AutoModelForCausalLM
+
+from influence_rlvr import detect_device
 
 from .config import ExperimentConfig
-from .data import load_train_pool
-
-
-def _topk_breakdown(scores: np.ndarray, cats: np.ndarray, base: Counter, fracs=(0.1, 0.2, 0.3)):
-    n = len(scores)
-    for frac in fracs:
-        k = max(1, int(round(frac * n)))
-        idx = np.argsort(-scores)[:k]
-        c = Counter(cats[idx].tolist())
-        # enrichment = kept-share / pool-share (1.0 = same as random; >1 = concentrated)
-        parts = "   ".join(
-            f"{d}={c.get(d, 0):>3} ({c.get(d, 0) / k:4.0%}, {(c.get(d, 0) / k) / (base[d] / n):.2f}x)"
-            for d in sorted(base)
-        )
-        print(f"  top-{frac:.0%} (k={k:>3}): {parts}")
+from .data import load_if_target_set, load_train_pool
+from .evaluate import _load_tokenizer
+from .influence import compute_pool_influence
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -44,39 +40,52 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--checkpoint-step", type=int, required=True)
     probe, rest = ap.parse_known_args(argv)
     cfg = ExperimentConfig.from_cli(rest)
+    cfg.if_grad = "gold"          # this probe is gold-only (no rollouts/servers)
+    cfg.use_vllm = False
+    device = detect_device()
+    tokenizer = _load_tokenizer(cfg)
 
-    cdir = cfg.run_dir / "influence" / f"compare_step{probe.checkpoint_step}"
-    gold = np.asarray(np.load(cdir / "gold_scores.npy"), dtype=np.float64)
-    roll = np.asarray(np.load(cdir / "rollout_scores.npy"), dtype=np.float64)
+    ckpt = cfg.grpo_output_dir / f"checkpoint-{probe.checkpoint_step}"
+    if not ckpt.is_dir():
+        raise SystemExit(f"[select] no checkpoint at {ckpt}")
+    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    base = AutoModelForCausalLM.from_pretrained(cfg.model_id, dtype=dtype).to(device)
+    base.config.use_cache = False
+    model = PeftModel.from_pretrained(base, str(ckpt), is_trainable=True).to(device)
+    model.config.use_cache = False
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
 
     pool = load_train_pool(cfg)
+    target = load_if_target_set(cfg)
+    tdoms = ",".join(cfg.webinstruct_test_domains) or "all"
+    print(f"[select] checkpoint-{probe.checkpoint_step} | target={tdoms}({len(target)}) "
+          f"pool={len(pool)} | method={cfg.if_method}/gold")
+
+    save_dir = cfg.run_dir / "influence" / f"select_{tdoms}_step{probe.checkpoint_step}"
+    save_dir.mkdir(parents=True, exist_ok=True)
+    scores = np.asarray(
+        compute_pool_influence(cfg, model, tokenizer, pool, target, device,
+                               checkpoint_step=probe.checkpoint_step, save_dir=save_dir),
+        dtype=np.float64)
+    np.save(save_dir / "gold_scores.npy", scores)
+
     if "category" not in pool.column_names:
         raise SystemExit("pool has no 'category' column")
     cats = np.array(pool["category"], dtype=object)
-    if len(cats) != len(gold):
-        raise SystemExit(
-            f"pool len {len(cats)} != scores len {len(gold)} — cfg/seed mismatch; "
-            f"pass the SAME data args the compare used so the pool reconstructs identically.")
-
-    base = Counter(cats.tolist())
+    base_c = Counter(cats.tolist())
     n = len(cats)
     print(f"\npool baseline (n={n}): " +
-          "  ".join(f"{d}={base[d]} ({base[d] / n:.0%})" for d in sorted(base)))
-    print("(each cell: count (share, enrichment vs pool); enrichment 1.0 = same as random)")
-    print("\n=== GOLD top-k domain composition ===")
-    _topk_breakdown(gold, cats, base)
-    print("\n=== ROLLOUT top-k domain composition ===")
-    _topk_breakdown(roll, cats, base)
-
-    # Where they diverge: domains of the prompts each keeps that the other doesn't (top-20%).
-    k = max(1, int(round(0.2 * n)))
-    g_top = set(np.argsort(-gold)[:k].tolist())
-    r_top = set(np.argsort(-roll)[:k].tolist())
-    g_only = [i for i in g_top if i not in r_top]
-    r_only = [i for i in r_top if i not in g_top]
-    print(f"\n=== divergence at top-20% (k={k}, overlap={len(g_top & r_top)}) ===")
-    print(f"  gold-only picks   ({len(g_only)}): {dict(Counter(cats[g_only].tolist()))}")
-    print(f"  rollout-only picks ({len(r_only)}): {dict(Counter(cats[r_only].tolist()))}")
+          "  ".join(f"{d}={base_c[d]} ({base_c[d] / n:.0%})" for d in sorted(base_c)))
+    print("(cell: count (share, enrichment vs pool); enrichment 1.0 = random)")
+    print(f"=== gold-IF selection for {tdoms} target ===")
+    for frac in (0.1, 0.2, 0.3):
+        k = max(1, int(round(frac * n)))
+        c = Counter(cats[np.argsort(-scores)[:k]].tolist())
+        parts = "   ".join(
+            f"{d}={c.get(d, 0):>3} ({c.get(d, 0) / k:4.0%}, {(c.get(d, 0) / k) / (base_c[d] / n):.2f}x)"
+            for d in sorted(base_c))
+        print(f"  top-{frac:.0%} (k={k:>3}): {parts}")
 
 
 if __name__ == "__main__":
