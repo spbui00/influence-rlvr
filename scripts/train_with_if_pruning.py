@@ -116,7 +116,7 @@ def grpo_batch_step(
 def compute_train_scores(
     model: nn.Module,
     train_examples: Sequence[ToyGRPOExample],
-    test_examples: Sequence[ToyGRPOExample],
+    target_examples: Sequence[ToyGRPOExample],   # the IF TARGET set (selection is scored vs this)
     *,
     if_method: str = "cg",
     lambda_damp: float,
@@ -125,6 +125,7 @@ def compute_train_scores(
     beta: float,
     ref_model: nn.Module,
     optimizer: torch.optim.Optimizer | None = None,
+    train_rollout_mode: str = "exhaustive",
 ) -> np.ndarray:
     """
     Per-train aggregated IF score: mean of per-test influence across all test
@@ -138,10 +139,10 @@ def compute_train_scores(
     Note: rebuilds the grad/prob caches once per test point — O(n_test) redundant
     builds per recompute. Cheap on toy; optimize at LLM scale by reusing the cache.
     """
-    n_test = len(test_examples)
+    n_test = len(target_examples)
     n_train = len(train_examples)
     matrix = np.zeros((n_test, n_train), dtype=np.float64)
-    for j, te in enumerate(test_examples):
+    for j, te in enumerate(target_examples):
         if if_method == "dot":
             scores, _ = compute_toy_dot_influence(
                 model,
@@ -149,6 +150,7 @@ def compute_train_scores(
                 test_example=te,
                 beta=beta,
                 ref_model=ref_model,
+                train_rollout_mode=train_rollout_mode,
             )
         elif if_method == "tracin-adam":
             if optimizer is None:
@@ -160,6 +162,7 @@ def compute_train_scores(
                 optimizer=optimizer,
                 beta=beta,
                 ref_model=ref_model,
+                train_rollout_mode=train_rollout_mode,
             )
         else:
             scores, _ = compute_toy_cg_influence(
@@ -171,6 +174,7 @@ def compute_train_scores(
                 cg_tol=cg_tol,
                 beta=beta,
                 ref_model=ref_model,
+                train_rollout_mode=train_rollout_mode,
             )
         matrix[j] = scores.detach().cpu().numpy()
     return matrix.mean(axis=0)
@@ -255,10 +259,12 @@ def run_regime(
     *,
     args,
     train_examples: list[ToyGRPOExample],
-    test_examples: list[ToyGRPOExample],
+    target_examples: list[ToyGRPOExample],   # IF target: guides selection (NOT evaluated on)
+    eval_examples: list[ToyGRPOExample],     # held-out eval: measured, DISJOINT from target
     ref_model: nn.Module,
     run_dir: Path,
     if_method: str = "cg",
+    train_rollout_mode: str = "exhaustive",
     label: str | None = None,
     compare_methods: bool = False,
 ) -> dict:
@@ -292,7 +298,7 @@ def run_regime(
             scores = compute_train_scores(
                 model,
                 train_examples,
-                test_examples,
+                target_examples,   # influence is scored against the TARGET set
                 if_method=if_method,
                 lambda_damp=args.lambda_damp,
                 cg_iters=args.cg_iters,
@@ -300,6 +306,7 @@ def run_regime(
                 beta=args.beta,
                 ref_model=ref_model,
                 optimizer=optimizer,
+                train_rollout_mode=train_rollout_mode,
             )
             last_scores = scores
             print(
@@ -313,9 +320,10 @@ def run_regime(
             # doubling cost on every run.
             if compare_methods and if_method == "cg":
                 dot_scores = compute_train_scores(
-                    model, train_examples, test_examples, if_method="dot",
+                    model, train_examples, target_examples, if_method="dot",
                     lambda_damp=args.lambda_damp, cg_iters=args.cg_iters,
                     cg_tol=args.cg_tol, beta=args.beta, ref_model=ref_model,
+                    train_rollout_mode=train_rollout_mode,
                 )
                 rho = _spearman(scores, dot_scores)
                 agreement_log.append({"step": window_start, "spearman_cg_dot": rho})
@@ -358,7 +366,9 @@ def run_regime(
             })
 
             if (step + 1) % max(1, args.eval_every) == 0 or step + 1 == args.steps:
-                per_test = [float(exact_expected_reward(model, te)) for te in test_examples]
+                # Evaluate on the HELD-OUT eval set (disjoint from the IF target) — honest
+                # generalization: did selecting-for-target transfer to unseen eval points?
+                per_test = [float(exact_expected_reward(model, te)) for te in eval_examples]
                 reward_log.append({
                     "step": step + 1,
                     "regime": regime,
@@ -369,7 +379,7 @@ def run_regime(
         if regime == "round-robin":
             cycle_offset = (cycle_offset + window_len * args.batch_size) % n_train
 
-    final_rewards = [float(exact_expected_reward(model, te)) for te in test_examples]
+    final_rewards = [float(exact_expected_reward(model, te)) for te in eval_examples]
     summary = {
         "regime": regime,
         "label": label,
@@ -398,7 +408,7 @@ def run_regime(
 
     with (regime_dir / "rewards_over_time.csv").open("w", newline="") as f:
         writer = csv.writer(f)
-        n_test = len(test_examples)
+        n_test = len(eval_examples)
         writer.writerow(["step", "mean_test_reward"] + [f"r_test_{i}" for i in range(n_test)])
         for row in reward_log:
             writer.writerow([row["step"], f"{row['mean_test_reward']:.6f}"] + row["per_test_reward"])
@@ -422,28 +432,48 @@ def run_regime(
     }
 
 
-def build_datasets(args) -> tuple[list[ToyGRPOExample], list[ToyGRPOExample]]:
+def build_datasets(
+    args,
+) -> tuple[list[ToyGRPOExample], list[ToyGRPOExample], list[ToyGRPOExample]]:
+    """Returns THREE disjoint sets: (train pool, IF target, held-out eval). The target GUIDES
+    selection; the eval — drawn from the SAME distribution but disjoint points — measures
+    honest generalization. target≠eval is the whole point: it tests whether selecting-for-
+    target transfers, instead of letting IF optimize the exact set it's graded on."""
+    n_target = args.n_target
+    n_eval = args.n_test  # --n-test sizes the EVAL set
+
     if args.dataset == "clustered":
-        train_examples, test_examples, _, _, _ = generate_clustered_dataset(
+        train_examples, test_pool, _, _, _ = generate_clustered_dataset(
             n_clusters=args.n_clusters,
             per_cluster=args.per_cluster,
             cluster_signal=args.cluster_signal,
             target_mode=args.cluster_target_mode,
             seed=args.seed,
         )
+        # Split the held-out test points (same clusters) into DISJOINT target / eval.
+        if len(test_pool) < n_target + n_eval:
+            half = len(test_pool) // 2
+            target_examples, eval_examples = test_pool[:half], test_pool[half:]
+        else:
+            target_examples = test_pool[:n_target]
+            eval_examples = test_pool[n_target : n_target + n_eval]
         args.n_train = len(train_examples)
-        args.n_test = len(test_examples)
-        return train_examples, test_examples
+        return train_examples, target_examples, eval_examples
 
-    all_examples = generate_dataset(n=args.n_train + 200, seed=args.seed)
+    # iid: train = first n_train; target + eval = two DISJOINT pools of "hard" (near-boundary)
+    # held-out points — same distribution, different points, so target guides and eval tests.
+    need = n_target + n_eval
+    all_examples = generate_dataset(n=args.n_train + max(200, need * 12), seed=args.seed)
     train_examples = all_examples[: args.n_train]
-    hard_test: list[ToyGRPOExample] = []
-    for ex in all_examples[args.n_train :]:
-        if abs(ex.z[0] + ex.z[1] + ex.z[2]) < 0.3:
-            hard_test.append(ex)
-        if len(hard_test) >= args.n_test:
-            break
-    return train_examples, hard_test
+    hard = [ex for ex in all_examples[args.n_train :]
+            if abs(ex.z[0] + ex.z[1] + ex.z[2]) < 0.3]
+    if len(hard) < need:
+        raise SystemExit(
+            f"only {len(hard)} hard held-out examples; need {need} for target({n_target})+"
+            f"eval({n_eval}). Lower --n-target/--n-test or raise the generation pool.")
+    target_examples = hard[:n_target]
+    eval_examples = hard[n_target : n_target + n_eval]
+    return train_examples, target_examples, eval_examples
 
 
 def build_ref_model(hidden_dim: int, seed: int) -> nn.Module:
@@ -462,7 +492,10 @@ def main():
     parser = argparse.ArgumentParser()
     # Dataset
     parser.add_argument("--n-train", type=int, default=45)
-    parser.add_argument("--n-test", type=int, default=5)
+    parser.add_argument("--n-target", type=int, default=5,
+                        help="IF target set size — guides selection, DISJOINT from eval.")
+    parser.add_argument("--n-test", type=int, default=5,
+                        help="held-out EVAL set size — measured, DISJOINT from target.")
     parser.add_argument("--dataset", choices=["iid", "clustered"], default="iid")
     parser.add_argument("--n-clusters", type=int, default=15)
     parser.add_argument("--per-cluster", type=int, default=3)
@@ -470,13 +503,14 @@ def main():
     parser.add_argument("--cluster-target-mode", choices=["parity", "random"], default="parity")
 
     # Training
-    parser.add_argument("--steps", type=int, default=1000)
+    parser.add_argument("--steps", type=int, default=3000)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--hidden-dim", type=int, default=16)
     parser.add_argument("--beta", type=float, default=0.1)
     parser.add_argument("--no-adam", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--train-rollout-modes", type=str, default="exhaustive,gold", help="Comma separated rollout modes. Choices: exhaustive, gold")
 
     # Selection / recompute
     parser.add_argument("--regimes", type=str, default=",".join(REGIMES),
@@ -515,8 +549,14 @@ def main():
     if "tracin-adam" in if_methods and args.no_adam:
         raise SystemExit("tracin-adam needs the Adam optimizer; drop --no-adam.")
 
-    train_examples, test_examples = build_datasets(args)
-    print(f"Dataset: {args.dataset}, train={len(train_examples)}, test={len(test_examples)}")
+    train_rollout_modes = [m.strip() for m in args.train_rollout_modes.split(",") if m.strip()]
+    for m in train_rollout_modes:
+        if m not in ("exhaustive", "gold"):
+            raise SystemExit(f"Unknown train-rollout-mode: {m!r}. Choices: ('exhaustive', 'gold')")
+
+    train_examples, target_examples, eval_examples = build_datasets(args)
+    print(f"Dataset: {args.dataset}, train={len(train_examples)}, "
+          f"target={len(target_examples)}, eval={len(eval_examples)} (all disjoint)")
 
     if args.if_recompute_every is None:
         args.if_recompute_every = max(1, args.n_train // args.batch_size)
@@ -531,28 +571,38 @@ def main():
     ref_model = build_ref_model(args.hidden_dim, args.seed)
 
     # Build the run list: IF-dependent regimes run once per influence method
-    # (so cg vs dot overlay on the plot); method-free baselines run once.
-    multi = len(if_methods) > 1
+    # and train_rollout_mode combination.
+    multi_if = len(if_methods) > 1
+    multi_rm = len(train_rollout_modes) > 1
     compare_methods = ("cg" in if_methods) and ("dot" in if_methods)
-    jobs: list[tuple[str, str, str]] = []  # (regime, if_method, label)
+    jobs: list[tuple[str, str, str, str]] = []  # (regime, if_method, train_rollout_mode, label)
     for regime in regimes:
         if regime in ("if-guided", "anti-if"):
             for m in if_methods:
-                label = f"{regime}[{m}]" if multi else regime
-                jobs.append((regime, m, label))
+                for rm in train_rollout_modes:
+                    label_parts = []
+                    if multi_if:
+                        label_parts.append(m)
+                    if multi_rm:
+                        label_parts.append(f"rm={rm}")
+                    label_suffix = f"[{','.join(label_parts)}]" if label_parts else ""
+                    label = f"{regime}{label_suffix}"
+                    jobs.append((regime, m, rm, label))
         else:
-            jobs.append((regime, if_methods[0], regime))  # method irrelevant
+            jobs.append((regime, if_methods[0], train_rollout_modes[0], regime))  # method irrelevant
 
     results: dict[str, dict] = {}
-    for regime, if_method, label in jobs:
+    for regime, if_method, train_rollout_mode, label in jobs:
         results[label] = run_regime(
             regime,
             args=args,
             train_examples=train_examples,
-            test_examples=test_examples,
+            target_examples=target_examples,
+            eval_examples=eval_examples,
             ref_model=ref_model,
             run_dir=run_dir,
             if_method=if_method,
+            train_rollout_mode=train_rollout_mode,
             label=label,
             compare_methods=compare_methods,
         )
@@ -573,7 +623,8 @@ def main():
     plt.ylabel("Mean test reward")
     plt.title(
         f"IF-pruning ({args.dataset}, B={args.batch_size}, sel={args.selection_policy}, "
-        f"recompute={args.if_recompute_mode}/{args.if_recompute_every}, methods={','.join(if_methods)})"
+        f"recompute={args.if_recompute_mode}/{args.if_recompute_every},\nmethods={','.join(if_methods)}, "
+        f"rollout_modes={','.join(train_rollout_modes)})"
     )
     plt.legend()
     plt.grid(True, alpha=0.3)
