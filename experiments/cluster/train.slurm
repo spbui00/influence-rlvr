@@ -118,6 +118,7 @@ IF_SCORE_BATCH="${IF_SCORE_BATCH:-4}"
 # prompt against the collapsed tangent H.mean(0), no backward / no D-vector. Loads a fresh
 # fp32 model from the checkpoint (~2× base GPU mem). Same ranking (validated Spearman≈1).
 IF_JVP="${IF_JVP:-0}"
+IF_JVP_BATCH="${IF_JVP_BATCH:-8}"   # prompts/forward-mode pass (sizes the JVP logits tensor)
 IF_ARGS=""
 if [ "$REGIME" = "if_prune" ]; then
     # CG-only flags are ignored by dot/tracin-adam.
@@ -127,7 +128,7 @@ if [ "$REGIME" = "if_prune" ]; then
         --cg-fisher-examples 8 --cg-fisher-g 2 --cg-fisher-max-tokens 128 --cg-iters 50 --lambda-damp 0.5"
     [ "$IF_VLLM_GEN" = "1" ] && IF_ARGS="$IF_ARGS --if-vllm-gen --if-vllm-gpu-util $IF_VLLM_GPU_UTIL"
     [ "$SHUFFLE_KEPT" = "0" ] && IF_ARGS="$IF_ARGS --no-if-shuffle-kept"
-    [ "$IF_JVP" = "1" ] && IF_ARGS="$IF_ARGS --if-jvp"
+    [ "$IF_JVP" = "1" ] && IF_ARGS="$IF_ARGS --if-jvp --if-jvp-batch $IF_JVP_BATCH"
 fi
 # RESUME=1 continues from the latest checkpoint under outputs/$RUN_NAME (same
 # RUN_NAME) — use it to recover a time-limit kill, or to extend max-steps later.

@@ -335,8 +335,12 @@ def gold_nll_per_example_functional(peft_model, state_dict, input_ids, attention
         tie_weights=False,
     )
     logits = out.logits if hasattr(out, "logits") else out[0]      # [B, L, V]
-    log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)           # [B, L-1, V]
-    tok_logp = log_probs.gather(2, input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)  # [B, L-1]
+    shifted = logits[:, :-1, :]                                    # [B, L-1, V] predicts tok t+1
+    # log_softmax(x)[target] = x[target] - logsumexp(x), computed WITHOUT materializing the
+    # full [B,L-1,V] log_probs tensor (logsumexp reduces over V → [B,L-1]). Halves the
+    # forward-mode activation peak vs F.log_softmax; numerically identical (validated gate).
+    tgt_logit = shifted.gather(2, input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)  # [B, L-1]
+    tok_logp = tgt_logit - torch.logsumexp(shifted, dim=-1)        # [B, L-1]
     m = completion_mask[:, 1:].to(tok_logp.dtype)                  # [B, L-1]
     return -(tok_logp * m).sum(dim=1) / m.sum(dim=1).clamp(min=1)  # [B]
 

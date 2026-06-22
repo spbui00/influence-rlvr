@@ -295,9 +295,16 @@ def _run_jvp_pool(cfg, live_model, tokenizer, train_pool, my_pool, H, *,
             return gold_nll_per_example_functional(jmodel, sd, *enc)
         return func_jvp(f, (ptuple,), (h_tan,))[1]  # [B]
 
+    # Batched forward-mode scoring: JB prompts per forward-mode pass (the throughput win the
+    # per-example backward can't get). JB bounds the [JB × L × vocab] logits tensor (fp32,
+    # ~doubled by forward-mode) — its OWN memory knob (if_jvp_batch), NOT if_score_batch
+    # (which sizes rollout generation, a different/lighter profile).
+    JB = max(1, cfg.if_jvp_batch)
+
     # First-call gate (rank0, once/process): BATCHED-JVP vs per-example reverse-mode dot on
     # the SAME fp32 model → validates the JVP recipe AND the batched padding/masking. Raise,
     # never silently fall back: a misalignment yields finite-but-wrong scores with no error.
+    # Score jref in JB-sized chunks so the gate never spikes past the production batch memory.
     if main and not _JVP_ASSERTED:
         grad_of = func_grad(loss_single, argnums=0)
         K = min(16, len(my_pool))
@@ -306,7 +313,10 @@ def _run_jvp_pool(cfg, live_model, tokenizer, train_pool, my_pool, H, *,
         for i in kids:
             g = grad_of(ptuple, *_enc_single(train_pool[i]))
             dref.append(float(sum((gi * hi).sum() for gi, hi in zip(g, h_tan))))
-        jref = [float(x) for x in jvp_scores_batch([train_pool[i] for i in kids])]
+        jref = []
+        for c in range(0, len(kids), JB):
+            jref.extend(float(x) for x in
+                        jvp_scores_batch([train_pool[i] for i in kids[c:c + JB]]))
         rho = _spearman_jvp(dref, jref)
         mrel = max(abs(a - b) / (abs(a) + 1e-12) for a, b in zip(dref, jref)) if dref else 0.0
         if not (rho > 0.999 and mrel < 1e-3):
@@ -314,13 +324,10 @@ def _run_jvp_pool(cfg, live_model, tokenizer, train_pool, my_pool, H, *,
                 f"if_jvp correctness assert FAILED: Spearman={rho:.5f} max_rel={mrel:.2e} "
                 f"(need >0.999 / <1e-3) — batched-JVP scores != reverse-mode dot. "
                 f"dref={dref[:4]} jref={jref[:4]}")
-        print(f"  [if_jvp] correctness gate PASS (K={K}, Spearman={rho:.5f}, max_rel={mrel:.1e})")
+        print(f"  [if_jvp] correctness gate PASS (K={K}, JB={JB}, Spearman={rho:.5f}, "
+              f"max_rel={mrel:.1e})")
     _JVP_ASSERTED = True
 
-    # Batched forward-mode scoring: JB prompts per forward-mode pass (the throughput win the
-    # per-example backward can't get). JB bounded by the [JB × L × vocab] logits tensor
-    # (fp32, doubled by forward-mode) → keep if_score_batch modest (~8) on long completions.
-    JB = max(1, cfg.if_score_batch)
     matrix = np.zeros((1, len(train_pool)), dtype=np.float64)
     next_log = 50
     for c in range(0, len(my_pool), JB):

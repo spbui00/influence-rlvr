@@ -273,6 +273,12 @@ class ExperimentConfig:
     # (~2× base GPU mem per rank) since bf16 forward-mode AD is buggy through Qwen3 norms.
     # Errors unless if_grad=gold (rollout needs generation → no fixed differentiable loss).
     if_jvp: bool = False
+    # Prompts per forward-mode pass in the JVP scorer. Bounds the [batch × seq × vocab≈152k]
+    # logits tensor (fp32, ~doubled by the forward-mode tangent) — a DIFFERENT, much heavier
+    # memory profile than if_score_batch (which sizes rollout GENERATION). Keep modest: 8 ≈
+    # 10 GB logits at seq 1024; raise on an 80 GB H100, lower on a 48 GB L40S. Also caps the
+    # first-call correctness gate's batch so it never OOMs past the production batch.
+    if_jvp_batch: int = 8
     # Logits microbatch for the per-token-logp forward during scoring. The lm_head
     # materializes (micro_batch × seq × vocab≈152k) logits — the dominant memory
     # spike in the scoring backward. 1 = one sequence's logits at a time (minimum
