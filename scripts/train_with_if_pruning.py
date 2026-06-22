@@ -443,20 +443,25 @@ def build_datasets(
     n_eval = args.n_test  # --n-test sizes the EVAL set
 
     if args.dataset == "clustered":
-        train_examples, test_pool, _, _, _ = generate_clustered_dataset(
+        # The generator makes ONE test point per test cluster. To get target and eval that
+        # SHARE clusters (so data influential for the target genuinely guides eval), draw
+        # the test points TWICE in the SAME clusters with different seeds: call-1 → target,
+        # call-2 → eval. train (the cluster training points) is a separate draw, disjoint.
+        train_examples, target_examples, test_cluster_ids, _, _ = generate_clustered_dataset(
             n_clusters=args.n_clusters,
             per_cluster=args.per_cluster,
             cluster_signal=args.cluster_signal,
             target_mode=args.cluster_target_mode,
             seed=args.seed,
         )
-        # Split the held-out test points (same clusters) into DISJOINT target / eval.
-        if len(test_pool) < n_target + n_eval:
-            half = len(test_pool) // 2
-            target_examples, eval_examples = test_pool[:half], test_pool[half:]
-        else:
-            target_examples = test_pool[:n_target]
-            eval_examples = test_pool[n_target : n_target + n_eval]
+        _, eval_examples, _, _, _ = generate_clustered_dataset(
+            n_clusters=args.n_clusters,
+            per_cluster=args.per_cluster,
+            cluster_signal=args.cluster_signal,
+            target_mode=args.cluster_target_mode,
+            test_cluster_ids=test_cluster_ids,   # SAME clusters as the target
+            seed=args.seed + 7777,               # different points (fresh noise)
+        )
         args.n_train = len(train_examples)
         return train_examples, target_examples, eval_examples
 
