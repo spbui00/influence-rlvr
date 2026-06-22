@@ -317,6 +317,30 @@ def _forward_per_token_logps_functional(
     return log_probs.gather(2, r_ids.unsqueeze(-1)).squeeze(-1)
 
 
+def gold_nll_per_example_functional(peft_model, state_dict, input_ids, attention_mask,
+                                    completion_mask):
+    """Per-example mean gold-NLL as a VECTOR [B], from ONE functional_call forward over a
+    right-padded batch of B different (prompt+\\boxed{gold}) sequences. Returns
+    ``[-(Σ logπ(comp tok)) / (#comp tok)]_i`` — the same scalar as compute_sft_gradient_batch,
+    per example. Forward-mode compatible: ``jvp`` of this vector output with a SHARED param
+    tangent h yields the per-example directional derivatives ⟨∇L_i, h⟩ = the B influence
+    scores from a single forward-mode pass (the batching that the per-example backward can't do).
+
+    input_ids/attention_mask/completion_mask are [B, L]; completion_mask is 1 on completion
+    tokens (0 on prompt + right-padding). The loss for predicting token at position t uses
+    logits[t-1], so the target mask aligns to completion_mask[:, 1:]."""
+    out = functional_call(
+        peft_model, state_dict, (),
+        {"input_ids": input_ids, "attention_mask": attention_mask, "use_cache": False},
+        tie_weights=False,
+    )
+    logits = out.logits if hasattr(out, "logits") else out[0]      # [B, L, V]
+    log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)           # [B, L-1, V]
+    tok_logp = log_probs.gather(2, input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)  # [B, L-1]
+    m = completion_mask[:, 1:].to(tok_logp.dtype)                  # [B, L-1]
+    return -(tok_logp * m).sum(dim=1) / m.sum(dim=1).clamp(min=1)  # [B]
+
+
 def _loss_grpo_functional(
     ptuple: tuple[torch.Tensor, ...],
     names: tuple[str, ...],

@@ -20,6 +20,7 @@ from influence_rlvr.gradients import (
     compute_policy_gradient_bundle,
     compute_policy_gradient_bundle_batch,
     compute_sft_gradient_batch,
+    gold_nll_per_example_functional,
 )
 from influence_rlvr.modes import GenerationBackend, GradientObjective, VLLMConfig
 from influence_rlvr.utils import tokenize_prompt, tokenize_prompts_batch
@@ -200,9 +201,11 @@ def _run_jvp_pool(cfg, live_model, tokenizer, train_pool, my_pool, H, *,
     """Forward-mode (JVP) pool scoring for if_grad=gold. Loads a FRESH fp32 model from the
     checkpoint, builds the fixed tangent h_bar = H.mean(0) — which equals P⊙ḡ_target exactly
     for any assembled-H operator (P is target-independent, so it factors out of the target
-    mean) — and scores each pool prompt as score(z)=⟨∇L(z),h_bar⟩ via ONE fp32 forward-mode
-    pass (no backward, no D-vector). Returns a (1, n_train) matrix with THIS rank's columns
-    filled (disjoint), to flow through the shared all_reduce + mean tail unchanged.
+    mean) — and scores prompts as score(z)=⟨∇L(z),h_bar⟩ via BATCHED fp32 forward-mode passes
+    (if_score_batch prompts share one pass; the shared tangent makes per-example scores fall
+    out of a single forward-mode sweep — the batching the per-example backward can't do). No
+    backward, no D-vector. Returns a (1, n_train) matrix with THIS rank's columns filled
+    (disjoint), to flow through the shared all_reduce + mean tail unchanged.
 
     fp32 + eager attention because bf16/fused-kernel forward-mode AD is buggy through Qwen3
     RMSNorm. The live bf16 model is NEVER touched (run_if_prune resumes it next window)."""
@@ -243,8 +246,9 @@ def _run_jvp_pool(cfg, live_model, tokenizer, train_pool, my_pool, H, *,
     h_tan = tuple(h_tan)
 
     eos = tokenizer.eos_token_id
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos
 
-    def encode(sample):
+    def _enc_single(sample):  # for the per-example reverse-mode REFERENCE in the assert
         _, p_ids, p_am = tokenize_prompts_batch(tokenizer, [sample["prompt"]], device)
         gold = str(sample.get("solution", "") or "")
         c = tokenizer(f"\\boxed{{{gold}}}", add_special_tokens=False,
@@ -253,47 +257,86 @@ def _run_jvp_pool(cfg, live_model, tokenizer, train_pool, my_pool, H, *,
             c = torch.cat([c, torch.full((1, 1), int(eos), device=device, dtype=c.dtype)], dim=1)
         return p_ids[0], p_am[0], c, torch.ones_like(c)
 
-    def loss_of(pt, p_ids, p_am, c, cm):  # mean gold-NLL == compute_sft_gradient_batch's loss
+    def loss_single(pt, p_ids, p_am, c, cm):  # == compute_sft_gradient_batch's per-example loss
         sd = _state_dict_for_functional(jmodel, pt, names)
         ptl = _forward_per_token_logps_functional(jmodel, sd, p_ids, p_am, c, cm)
         return -(ptl * cm).sum() / cm.sum().clamp(min=1)
 
-    score_one = lambda enc: float(func_jvp(lambda pt: loss_of(pt, *enc), (ptuple,), (h_tan,))[1])
+    def encode_batch(samples):
+        """Right-pad B (prompt+\\boxed{gold}+eos) sequences → input_ids/attn/comp_mask [B,L].
+        Prompt tokenization matches _enc_single (same tokenize_prompts_batch render)."""
+        rows = []
+        for s in samples:
+            _, p_ids, _ = tokenize_prompts_batch(tokenizer, [s["prompt"]], device)
+            p = p_ids[0].tolist()
+            gold = str(s.get("solution", "") or "")
+            c = tokenizer(f"\\boxed{{{gold}}}", add_special_tokens=False)["input_ids"]
+            if eos is not None:
+                c = c + [int(eos)]
+            rows.append((p, c))
+        L = max(len(p) + len(c) for p, c in rows)
+        B = len(rows)
+        input_ids = torch.full((B, L), int(pad_id), dtype=torch.long, device=device)
+        attn = torch.zeros((B, L), dtype=torch.long, device=device)
+        cmask = torch.zeros((B, L), dtype=torch.long, device=device)
+        for bi, (p, c) in enumerate(rows):
+            seq = p + c
+            input_ids[bi, :len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
+            attn[bi, :len(seq)] = 1
+            cmask[bi, len(p):len(seq)] = 1
+        return input_ids, attn, cmask
 
-    # First-call gate (rank0, once/process): JVP vs reverse-mode dot on the SAME fp32 model
-    # → isolates the JVP recipe (param order / loss scalar / tangent fold). Raise, never
-    # silently fall back: a param-order misalignment yields finite-but-wrong scores.
+    def jvp_scores_batch(samples):
+        """B influence scores from ONE forward-mode pass: jvp of the per-example NLL vector
+        [B] with the shared tangent h_tan → the [B] directional derivatives ⟨∇L_i, h⟩."""
+        enc = encode_batch(samples)
+        def f(pt):
+            sd = _state_dict_for_functional(jmodel, pt, names)
+            return gold_nll_per_example_functional(jmodel, sd, *enc)
+        return func_jvp(f, (ptuple,), (h_tan,))[1]  # [B]
+
+    # First-call gate (rank0, once/process): BATCHED-JVP vs per-example reverse-mode dot on
+    # the SAME fp32 model → validates the JVP recipe AND the batched padding/masking. Raise,
+    # never silently fall back: a misalignment yields finite-but-wrong scores with no error.
     if main and not _JVP_ASSERTED:
-        grad_of = func_grad(loss_of, argnums=0)
+        grad_of = func_grad(loss_single, argnums=0)
         K = min(16, len(my_pool))
-        dref, jref = [], []
-        for i in my_pool[:K]:
-            enc = encode(train_pool[i])
-            g = grad_of(ptuple, *enc)
+        kids = my_pool[:K]
+        dref = []
+        for i in kids:
+            g = grad_of(ptuple, *_enc_single(train_pool[i]))
             dref.append(float(sum((gi * hi).sum() for gi, hi in zip(g, h_tan))))
-            jref.append(score_one(enc))
+        jref = [float(x) for x in jvp_scores_batch([train_pool[i] for i in kids])]
         rho = _spearman_jvp(dref, jref)
         mrel = max(abs(a - b) / (abs(a) + 1e-12) for a, b in zip(dref, jref)) if dref else 0.0
         if not (rho > 0.999 and mrel < 1e-3):
             raise RuntimeError(
                 f"if_jvp correctness assert FAILED: Spearman={rho:.5f} max_rel={mrel:.2e} "
-                f"(need >0.999 / <1e-3) — JVP scores != reverse-mode dot. dref={dref[:4]} "
-                f"jref={jref[:4]}")
+                f"(need >0.999 / <1e-3) — batched-JVP scores != reverse-mode dot. "
+                f"dref={dref[:4]} jref={jref[:4]}")
         print(f"  [if_jvp] correctness gate PASS (K={K}, Spearman={rho:.5f}, max_rel={mrel:.1e})")
     _JVP_ASSERTED = True
 
+    # Batched forward-mode scoring: JB prompts per forward-mode pass (the throughput win the
+    # per-example backward can't get). JB bounded by the [JB × L × vocab] logits tensor
+    # (fp32, doubled by forward-mode) → keep if_score_batch modest (~8) on long completions.
+    JB = max(1, cfg.if_score_batch)
     matrix = np.zeros((1, len(train_pool)), dtype=np.float64)
     next_log = 50
-    for k, i in enumerate(my_pool):
+    for c in range(0, len(my_pool), JB):
+        pids = my_pool[c:c + JB]
         try:
-            matrix[0, i] = score_one(encode(train_pool[i]))
+            jvec = jvp_scores_batch([train_pool[i] for i in pids])
         except Exception as e:
             raise RuntimeError(
-                f"if_jvp forward-mode failed on pool {i}: {type(e).__name__}: {e} — "
-                f"forward-mode AD needs eager attention (set) and fp32 (set).") from e
-        if main and (k + 1 >= next_log or k + 1 == len(my_pool)):
-            print(f"    rank0 jvp-scored {k + 1}/{len(my_pool)} ({time.time() - t0:.1f}s)")
-            next_log = (((k + 1) // 50) + 1) * 50
+                f"if_jvp forward-mode failed on pool chunk @{pids[0]}: {type(e).__name__}: {e} "
+                f"— forward-mode AD needs eager attention (set) and fp32 (set).") from e
+        for k, i in enumerate(pids):
+            matrix[0, i] = float(jvec[k])
+        done = min(c + JB, len(my_pool))
+        if main and (done >= next_log or done == len(my_pool)):
+            print(f"    rank0 jvp-scored {done}/{len(my_pool)} ({time.time() - t0:.1f}s)")
+            next_log = ((done // 50) + 1) * 50
 
     del jmodel, base
     gc.collect()
