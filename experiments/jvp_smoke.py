@@ -49,6 +49,9 @@ def main(argv=None) -> None:
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--checkpoint-step", type=int, required=True)
     ap.add_argument("--n-pool", type=int, default=16, help="pool examples to compare")
+    ap.add_argument("--dtype", choices=["fp32", "bf16"], default="fp32",
+                    help="bf16 = the PRODUCTION dtype (the real robustness check); fp32 = "
+                         "the high-precision reference.")
     probe, rest = ap.parse_known_args(argv)
     cfg = ExperimentConfig.from_cli(rest)
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -57,9 +60,11 @@ def main(argv=None) -> None:
     ckpt = cfg.grpo_output_dir / f"checkpoint-{probe.checkpoint_step}"
     if not ckpt.is_dir():
         raise SystemExit(f"[jvp-smoke] no checkpoint at {ckpt}")
-    # fp32 + eager attention: forward-mode AD is less tested through fused/half kernels.
+    dt = torch.float32 if probe.dtype == "fp32" else torch.bfloat16
+    print(f"[jvp-smoke] dtype={probe.dtype} ckpt={ckpt.name}")
+    # eager attention: forward-mode AD is less tested through fused (flash/sdpa) kernels.
     base = AutoModelForCausalLM.from_pretrained(
-        cfg.model_id, dtype=torch.float32, attn_implementation="eager").to(dev)
+        cfg.model_id, dtype=dt, attn_implementation="eager").to(dev)
     base.config.use_cache = False
     model = PeftModel.from_pretrained(base, str(ckpt), is_trainable=True).to(dev)
     model.eval()
