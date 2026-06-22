@@ -108,7 +108,9 @@ def main(argv=None) -> None:
     for i in range(n_pool):
         enc = encode(pool[i])
         g = grad_of(ptuple, *enc)
-        dot = float(sum((gi * hi).sum() for gi, hi in zip(g, h)))
+        # fp32-accumulated dot = the PRODUCTION reference (it upcasts grads before dotting),
+        # so this compares bf16-JVP against the fp32 dot the real scorer uses.
+        dot = float(sum((gi.float() * hi.float()).sum() for gi, hi in zip(g, h)))
         try:
             _, jval = func_jvp(lambda pt: loss_of(pt, *enc), (ptuple,), (h,))
         except Exception as e:
@@ -124,11 +126,16 @@ def main(argv=None) -> None:
     d, j = np.array(dot_s), np.array(jvp_s)
     rho = _spearman(d, j)
     maxrel = float((np.abs(d - j) / (np.abs(d) + 1e-12)).max())
+    # SELECTION only cares about ranking → Spearman is the real gate. Per-value rel diff is
+    # bf16-inherent (~1-4%, on both sides), so its tolerance is dtype-aware: tight for fp32
+    # (catches genuine math bugs), loose for bf16 (where roundoff is expected and harmless).
+    rel_tol = 5e-2 if probe.dtype == "bf16" else 1e-3
     print("\n" + "=" * 56)
-    print(f"[jvp-smoke] Spearman(dot, jvp) = {rho:+.5f}")
-    print(f"[jvp-smoke] max abs diff = {float(np.abs(d - j).max()):.3e}   max rel = {maxrel:.3e}")
-    ok = rho > 0.999 and maxrel < 1e-2
-    print(f"[jvp-smoke] VERDICT: {'PASS - JVP == dot, wire it in' if ok else 'FAIL - investigate'}")
+    print(f"[jvp-smoke] dtype={probe.dtype}  Spearman(fp32-dot, jvp) = {rho:+.5f}")
+    print(f"[jvp-smoke] max abs diff = {float(np.abs(d - j).max()):.3e}   max rel = {maxrel:.3e} "
+          f"(tol {rel_tol:.0e})")
+    ok = rho > 0.9995 and maxrel < rel_tol
+    print(f"[jvp-smoke] VERDICT: {'PASS - JVP ranking matches dot' if ok else 'FAIL - investigate'}")
     print("=" * 56)
 
 
