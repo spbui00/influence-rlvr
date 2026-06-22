@@ -23,9 +23,12 @@ N_POOL="${N_POOL:-16}"          # pool examples compared (dot vs jvp)
 POOL_TOTAL="${POOL_TOTAL:-60}"  # --n-train-pool; must be >= N_POOL (balanced over 3 domains)
 TARGET="${TARGET:-8}"           # IF target size (h = mean over these)
 DTYPE="${DTYPE:-fp32}"          # fp32 (precision reference) | bf16 (production dtype)
+PRECOND="${PRECOND:-0}"         # 1 = fold real Adam P into h (production tracin-adam operator)
 TEST_DOMAINS="${TEST_DOMAINS:-physics}"
+[ "$PRECOND" = "1" ] && PRECOND_ARG="--precond" || PRECOND_ARG=""
 
 python -u -m experiments.jvp_smoke --checkpoint-step "$CKPT" --n-pool "$N_POOL" --dtype "$DTYPE" \
+    $PRECOND_ARG \
     --run-name "$RUN_NAME" --model-id "$MODEL" --lora-r 32 \
     --domains math,physics,finance --n-train-pool "$POOL_TOTAL" \
     --test-from-train --test-from-train-eval 1000 \

@@ -52,6 +52,10 @@ def main(argv=None) -> None:
     ap.add_argument("--dtype", choices=["fp32", "bf16"], default="fp32",
                     help="bf16 = the PRODUCTION dtype (the real robustness check); fp32 = "
                          "the high-precision reference.")
+    ap.add_argument("--precond", action="store_true",
+                    help="Fold the real Adam preconditioner P (from optimizer.pt) into h — "
+                         "i.e. test the actual tracin-adam operator h=P⊙ḡ. P spans ~1e3-1e8, "
+                         "so this is also a numerical stress test. Default: plain h=ḡ.")
     probe, rest = ap.parse_known_args(argv)
     cfg = ExperimentConfig.from_cli(rest)
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -96,23 +100,40 @@ def main(argv=None) -> None:
     n_pool = min(probe.n_pool, len(pool))
     print(f"[jvp-smoke] pool={n_pool} target={len(target)}")
 
-    # h = mean target gold-gradient. No Adam precond here: P is an elementwise scaling of h,
-    # orthogonal to the JVP-vs-dot correctness this test isolates.
+    # h = mean target gold-gradient, accumulated in fp32 (production builds the H matrix in
+    # fp32). With --precond, fold in the real Adam P → the production tracin-adam operator
+    # h = P⊙ḡ. P is just an elementwise rescaling of the fixed direction, so JVP handles it
+    # identically (it's the directional derivative along whatever h is) — this verifies that.
     h = None
     for i in range(len(target)):
-        g = grad_of(ptuple, *encode(target[i]))
+        g = tuple(gi.float() for gi in grad_of(ptuple, *encode(target[i])))
         h = g if h is None else tuple(a + b for a, b in zip(h, g))
     h = tuple(t / len(target) for t in h)
+    if probe.precond:
+        from influence_rlvr.preconditioner import load_adam_preconditioner_from_checkpoint
+        P = load_adam_preconditioner_from_checkpoint(
+            model, ckpt, device=dev, dtype=torch.float32,
+            eps=getattr(cfg, "tracin_adam_eps", None) or None)
+        if P is None:
+            raise SystemExit(f"[jvp-smoke] --precond set but no optimizer.pt under {ckpt}")
+        pt_unflat, off = [], 0
+        for n in names:  # flat P is in named-trainable order (== `names`); unflatten to tuple
+            num = model.get_parameter(n).numel()
+            pt_unflat.append(P[off:off + num].view_as(model.get_parameter(n))); off += num
+        h = tuple(hi * Pi for hi, Pi in zip(h, pt_unflat))
+        print(f"[jvp-smoke] Adam P folded into h (tracin-adam); P-range "
+              f"[{float(P.min()):.2e}, {float(P.max()):.2e}]")
+    h_tan = tuple(hi.to(dt) for hi in h)  # JVP tangent must match primal dtype
 
     dot_s, jvp_s = [], []
     for i in range(n_pool):
         enc = encode(pool[i])
         g = grad_of(ptuple, *enc)
         # fp32-accumulated dot = the PRODUCTION reference (it upcasts grads before dotting),
-        # so this compares bf16-JVP against the fp32 dot the real scorer uses.
-        dot = float(sum((gi.float() * hi.float()).sum() for gi, hi in zip(g, h)))
+        # so this compares bf16-JVP against the fp32 dot the real scorer uses. h is fp32.
+        dot = float(sum((gi.float() * hi).sum() for gi, hi in zip(g, h)))
         try:
-            _, jval = func_jvp(lambda pt: loss_of(pt, *enc), (ptuple,), (h,))
+            _, jval = func_jvp(lambda pt: loss_of(pt, *enc), (ptuple,), (h_tan,))
         except Exception as e:
             print(f"\n[jvp-smoke] JVP FAILED on z{i}: {type(e).__name__}: {e}")
             print("[jvp-smoke] -> forward-mode AD hit an unsupported op (attention/norm/rotary?).")
