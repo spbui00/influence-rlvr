@@ -373,6 +373,14 @@ def run_if_prune(cfg, model, tokenizer, train_pool, device):
                 order = np.load(order_path)
                 print(f"\n[window {w}] resume: reusing saved ranking {order_path.name} "
                       f"({len(order)} prompts) — skip rescoring")
+            elif cfg.selection not in ("if-guided", "anti-if"):
+                # random / round-robin ignore influence entirely — _ranked_order only
+                # needs the pool size, so skip the (expensive) 24k scoring. This makes
+                # the random/round-robin CONTROL cheap and keeps it a fair size-matched
+                # baseline (same keep_fraction + re-selection cadence, no IF signal).
+                order = _ranked_order(np.zeros(pool), selection=cfg.selection, seed=cfg.seed + start)
+                np.save(order_path, order)
+                print(f"\n[window {w}] selection={cfg.selection}: no scoring (influence ignored)")
             else:
                 if cfg.resume and model_step != start:
                     raise SystemExit(
