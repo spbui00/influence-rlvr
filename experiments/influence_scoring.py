@@ -14,13 +14,15 @@ from influence_rlvr.fisher_fvp import FisherRow, build_policy_fisher_fvp
 from influence_rlvr.generation import generate_rollout_batch
 from influence_rlvr.gradients import (
     _compute_per_token_logps,
+    _forward_per_token_logps_functional,
     _grad_vector_from_scalar,
+    _state_dict_for_functional,
     compute_policy_gradient_bundle,
     compute_policy_gradient_bundle_batch,
     compute_sft_gradient_batch,
 )
 from influence_rlvr.modes import GenerationBackend, GradientObjective, VLLMConfig
-from influence_rlvr.utils import tokenize_prompt
+from influence_rlvr.utils import tokenize_prompt, tokenize_prompts_batch
 
 from .config import ExperimentConfig
 from .dist_utils import all_reduce_sum_, dist_info
@@ -181,6 +183,125 @@ def _build_empirical_fvp(cfg, model, tokenizer, train_pool, device, backend, vll
     return policy_fisher_fvp_from_grad_cache(grad_cache, prob_cache)
 
 
+def _spearman_jvp(a, b) -> float:
+    a = np.asarray(a, dtype=np.float64); b = np.asarray(b, dtype=np.float64)
+    ra = np.argsort(np.argsort(a)).astype(np.float64)
+    rb = np.argsort(np.argsort(b)).astype(np.float64)
+    ra -= ra.mean(); rb -= rb.mean()
+    den = float(np.sqrt((ra * ra).sum() * (rb * rb).sum()))
+    return float((ra * rb).sum() / den) if den > 0 else float("nan")
+
+
+_JVP_ASSERTED = False  # run the JVP-vs-dot correctness gate once per process
+
+
+def _run_jvp_pool(cfg, live_model, tokenizer, train_pool, my_pool, H, *,
+                  checkpoint_step, device, D, main, t0):
+    """Forward-mode (JVP) pool scoring for if_grad=gold. Loads a FRESH fp32 model from the
+    checkpoint, builds the fixed tangent h_bar = H.mean(0) — which equals P⊙ḡ_target exactly
+    for any assembled-H operator (P is target-independent, so it factors out of the target
+    mean) — and scores each pool prompt as score(z)=⟨∇L(z),h_bar⟩ via ONE fp32 forward-mode
+    pass (no backward, no D-vector). Returns a (1, n_train) matrix with THIS rank's columns
+    filled (disjoint), to flow through the shared all_reduce + mean tail unchanged.
+
+    fp32 + eager attention because bf16/fused-kernel forward-mode AD is buggy through Qwen3
+    RMSNorm. The live bf16 model is NEVER touched (run_if_prune resumes it next window)."""
+    global _JVP_ASSERTED
+    from peft import PeftModel
+    from torch.func import grad as func_grad
+    from torch.func import jvp as func_jvp
+    from transformers import AutoModelForCausalLM
+
+    ckpt_dir = cfg.grpo_output_dir / f"checkpoint-{checkpoint_step}"
+    if not (ckpt_dir / "adapter_model.safetensors").is_file() and not (ckpt_dir / "adapter_model.bin").is_file():
+        raise FileNotFoundError(
+            f"if_jvp needs the on-disk LoRA adapter at {ckpt_dir} (the reverse-mode path "
+            f"uses the in-memory model; JVP loads a fresh fp32 copy from disk).")
+    base = AutoModelForCausalLM.from_pretrained(
+        cfg.model_id, dtype=torch.float32, attn_implementation="eager").to(device)
+    base.config.use_cache = False
+    jmodel = PeftModel.from_pretrained(base, str(ckpt_dir), is_trainable=True).to(device)
+    jmodel.eval()  # NOTE: do NOT enable gradient checkpointing (breaks functional_call + JVP)
+
+    names = tuple(n for n, p in jmodel.named_parameters() if p.requires_grad)
+    live_names = tuple(n for n, p in live_model.named_parameters() if p.requires_grad)
+    if names != live_names:
+        raise RuntimeError("if_jvp: fp32 model trainable-param order != live model — "
+                           "H (built on the live model) would misalign with the JVP tangent.")
+    ptuple = tuple(jmodel.get_parameter(n).detach() for n in names)
+    if sum(p.numel() for p in ptuple) != D:
+        raise RuntimeError(f"if_jvp: param count {sum(p.numel() for p in ptuple)} != D={D}.")
+
+    # h_bar = H.mean(0): the collapsed fixed tangent. H[j] already holds the per-target
+    # operator output (dot: g_test; tracin-adam: P⊙g_test; cg: (F+λI)⁻¹g_test), all fp32,
+    # so mean-over-targets == the exact direction the per-target scores average to.
+    h_bar = H.mean(dim=0).to(device=device, dtype=torch.float32)
+    h_tan, off = [], 0
+    for n in names:
+        num = jmodel.get_parameter(n).numel()
+        h_tan.append(h_bar[off:off + num].view_as(jmodel.get_parameter(n))); off += num
+    h_tan = tuple(h_tan)
+
+    eos = tokenizer.eos_token_id
+
+    def encode(sample):
+        _, p_ids, p_am = tokenize_prompts_batch(tokenizer, [sample["prompt"]], device)
+        gold = str(sample.get("solution", "") or "")
+        c = tokenizer(f"\\boxed{{{gold}}}", add_special_tokens=False,
+                      return_tensors="pt")["input_ids"].to(device)
+        if eos is not None:
+            c = torch.cat([c, torch.full((1, 1), int(eos), device=device, dtype=c.dtype)], dim=1)
+        return p_ids[0], p_am[0], c, torch.ones_like(c)
+
+    def loss_of(pt, p_ids, p_am, c, cm):  # mean gold-NLL == compute_sft_gradient_batch's loss
+        sd = _state_dict_for_functional(jmodel, pt, names)
+        ptl = _forward_per_token_logps_functional(jmodel, sd, p_ids, p_am, c, cm)
+        return -(ptl * cm).sum() / cm.sum().clamp(min=1)
+
+    score_one = lambda enc: float(func_jvp(lambda pt: loss_of(pt, *enc), (ptuple,), (h_tan,))[1])
+
+    # First-call gate (rank0, once/process): JVP vs reverse-mode dot on the SAME fp32 model
+    # → isolates the JVP recipe (param order / loss scalar / tangent fold). Raise, never
+    # silently fall back: a param-order misalignment yields finite-but-wrong scores.
+    if main and not _JVP_ASSERTED:
+        grad_of = func_grad(loss_of, argnums=0)
+        K = min(16, len(my_pool))
+        dref, jref = [], []
+        for i in my_pool[:K]:
+            enc = encode(train_pool[i])
+            g = grad_of(ptuple, *enc)
+            dref.append(float(sum((gi * hi).sum() for gi, hi in zip(g, h_tan))))
+            jref.append(score_one(enc))
+        rho = _spearman_jvp(dref, jref)
+        mrel = max(abs(a - b) / (abs(a) + 1e-12) for a, b in zip(dref, jref)) if dref else 0.0
+        if not (rho > 0.999 and mrel < 1e-3):
+            raise RuntimeError(
+                f"if_jvp correctness assert FAILED: Spearman={rho:.5f} max_rel={mrel:.2e} "
+                f"(need >0.999 / <1e-3) — JVP scores != reverse-mode dot. dref={dref[:4]} "
+                f"jref={jref[:4]}")
+        print(f"  [if_jvp] correctness gate PASS (K={K}, Spearman={rho:.5f}, max_rel={mrel:.1e})")
+    _JVP_ASSERTED = True
+
+    matrix = np.zeros((1, len(train_pool)), dtype=np.float64)
+    next_log = 50
+    for k, i in enumerate(my_pool):
+        try:
+            matrix[0, i] = score_one(encode(train_pool[i]))
+        except Exception as e:
+            raise RuntimeError(
+                f"if_jvp forward-mode failed on pool {i}: {type(e).__name__}: {e} — "
+                f"forward-mode AD needs eager attention (set) and fp32 (set).") from e
+        if main and (k + 1 >= next_log or k + 1 == len(my_pool)):
+            print(f"    rank0 jvp-scored {k + 1}/{len(my_pool)} ({time.time() - t0:.1f}s)")
+            next_log = (((k + 1) // 50) + 1) * 50
+
+    del jmodel, base
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return matrix
+
+
 # ── Shared CG solve + streamed scoring ──────────────────────────────────────
 def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
             tag, checkpoint_step, save_dir):
@@ -299,31 +420,43 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
 
     n_train = len(train_pool)
     my_pool = list(range(rank, n_train, world))
-    if main:
-        gen_label = "none/gold-SFT" if is_gold else backend.name
-        print(f"  [{cfg.if_method}/{cfg.if_grad}] scoring {n_train} train prompts "
-              f"({len(my_pool)}/rank × {world} ranks, batch={B}, gen={gen_label})...")
-    matrix = np.zeros((n_target, n_train), dtype=np.float64)
+    # if_jvp (gold only): replace the per-example backward+dot with one fp32 forward-mode
+    # pass per prompt against the collapsed tangent H.mean(0). Produces a (1,n_train) matrix
+    # (matrix.mean(0)==scores still holds) that flows through the same all_reduce + save tail.
+    use_jvp = cfg.if_jvp and is_gold
     t0 = time.time()
-    next_log = 50
-    for c in range(0, len(my_pool), B):
-        pids = my_pool[c : c + B]
-        chunk = [train_pool[i] for i in pids]
-        grads = (
-            _example_sft_grads_batch(model, tokenizer, chunk, cfg=cfg, device=device)
-            if is_gold else _example_grads_batch(
-                model, tokenizer, chunk, builder,
-                objective_mode=GradientObjective.GRPO_TRAIN, cfg=cfg,
-                device=device, backend=backend, vllm_cfg=vllm_cfg,
-                seed=cfg.seed + 20_000 + pids[0],
+    if use_jvp:
+        if main:
+            print(f"  [{cfg.if_method}/{cfg.if_grad}] JVP pool scoring (fp32 forward-mode, "
+                  f"no backward) — {n_train} prompts ({len(my_pool)}/rank × {world} ranks)...")
+        matrix = _run_jvp_pool(cfg, model, tokenizer, train_pool, my_pool, H,
+                               checkpoint_step=checkpoint_step, device=device, D=D,
+                               main=main, t0=t0)
+    else:
+        if main:
+            gen_label = "none/gold-SFT" if is_gold else backend.name
+            print(f"  [{cfg.if_method}/{cfg.if_grad}] scoring {n_train} train prompts "
+                  f"({len(my_pool)}/rank × {world} ranks, batch={B}, gen={gen_label})...")
+        matrix = np.zeros((n_target, n_train), dtype=np.float64)
+        next_log = 50
+        for c in range(0, len(my_pool), B):
+            pids = my_pool[c : c + B]
+            chunk = [train_pool[i] for i in pids]
+            grads = (
+                _example_sft_grads_batch(model, tokenizer, chunk, cfg=cfg, device=device)
+                if is_gold else _example_grads_batch(
+                    model, tokenizer, chunk, builder,
+                    objective_mode=GradientObjective.GRPO_TRAIN, cfg=cfg,
+                    device=device, backend=backend, vllm_cfg=vllm_cfg,
+                    seed=cfg.seed + 20_000 + pids[0],
+                )
             )
-        )
-        for i, g_train in zip(pids, grads):
-            matrix[:, i] = (H @ g_train.to(H.device)).detach().cpu().numpy()
-        done = min(c + B, len(my_pool))
-        if main and (done >= next_log or done == len(my_pool)):
-            print(f"    rank0 scored {done}/{len(my_pool)} ({time.time() - t0:.1f}s)")
-            next_log = ((done // 50) + 1) * 50
+            for i, g_train in zip(pids, grads):
+                matrix[:, i] = (H @ g_train.to(H.device)).detach().cpu().numpy()
+            done = min(c + B, len(my_pool))
+            if main and (done >= next_log or done == len(my_pool)):
+                print(f"    rank0 scored {done}/{len(my_pool)} ({time.time() - t0:.1f}s)")
+                next_log = ((done // 50) + 1) * 50
 
     if world > 1:  # each rank filled disjoint columns → SUM assembles the full matrix
         mt = torch.from_numpy(matrix).to(device)

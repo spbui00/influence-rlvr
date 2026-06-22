@@ -265,6 +265,14 @@ class ExperimentConfig:
     # tokens), so this is a pure speedup, no quality change.
     if_vllm_gen: bool = False
     if_vllm_gpu_util: float = 0.3
+    # Forward-mode (JVP) pool scoring for if_grad=gold ONLY. Replaces the per-example
+    # backward+dot with ONE fp32 eager-attn forward carrying the fixed tangent
+    # h_bar = H.mean(0) (= P⊙ḡ_target), so score(z)=⟨∇L(z),h_bar⟩ comes out directly —
+    # no backward, no 34.8M-D gradient vector. Same ranking (validated Spearman≈1, incl.
+    # the Adam-preconditioned operator). Loads a fresh fp32 model from checkpoint-{step}
+    # (~2× base GPU mem per rank) since bf16 forward-mode AD is buggy through Qwen3 norms.
+    # Errors unless if_grad=gold (rollout needs generation → no fixed differentiable loss).
+    if_jvp: bool = False
     # Logits microbatch for the per-token-logp forward during scoring. The lm_head
     # materializes (micro_batch × seq × vocab≈152k) logits — the dominant memory
     # spike in the scoring backward. 1 = one sequence's logits at a time (minimum
@@ -344,6 +352,12 @@ class ExperimentConfig:
             )
         if self.if_grad not in ("rollout", "gold"):
             raise ValueError(f"if_grad must be rollout|gold, got {self.if_grad!r}")
+        if self.if_jvp and self.if_grad != "gold":
+            raise ValueError(
+                "if_jvp requires if_grad=gold (forward-mode JVP scores the SFT gold "
+                "gradient; rollout gradients need generation, so there is no fixed "
+                "differentiable loss to take the directional derivative of)."
+            )
 
     # ── Derived paths ───────────────────────────────────────────────────────
     @property
