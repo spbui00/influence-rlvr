@@ -197,12 +197,20 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--model-id", default=None,
                    help="Override cfg.model_id (e.g. Qwen/Qwen3-1.7B) — pair with --base "
                         "to headroom-check a different base without a trained run.")
+    p.add_argument("--webinstruct-test-domains", default=None,
+                   help="Override cfg.webinstruct_test_domains (e.g. 'math,physics,finance') to "
+                        "grade ONE checkpoint across multiple held-out domains in a single run — "
+                        "per_category gives the cross-domain breakdown. The carve is per-domain "
+                        "independent, so each domain's held-out slice matches its single-domain run.")
     args = p.parse_args(argv)
 
     run_dir = Path(args.output_root).expanduser().resolve() / args.run_name
     cfg = ExperimentConfig.load(run_dir / "config.json")
     if args.model_id:
         cfg.model_id = args.model_id
+    if args.webinstruct_test_domains is not None:
+        cfg.webinstruct_test_domains = tuple(
+            d.strip() for d in args.webinstruct_test_domains.split(",") if d.strip())
     if args.eval_max_examples is not None:
         cfg.eval_max_examples = args.eval_max_examples
     benchmarks = (
