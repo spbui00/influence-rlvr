@@ -65,9 +65,9 @@ def _spearman(a: np.ndarray, b: np.ndarray) -> float:
     return float((ra * rb).sum() / denom) if denom > 0 else float("nan")
 
 
-def init_model(ref_model: nn.Module, hidden_dim: int, seed: int) -> nn.Module:
+def init_model(ref_model: nn.Module, hidden_dim: int, seed: int, input_dim: int = 20) -> nn.Module:
     torch.manual_seed(seed)
-    model = ToyAutoregressiveMLP(hidden_dim=hidden_dim)
+    model = ToyAutoregressiveMLP(input_dim=input_dim, hidden_dim=hidden_dim)
     model.load_state_dict(ref_model.state_dict())
     return model
 
@@ -270,7 +270,7 @@ def run_regime(
 ) -> dict:
     label = label or regime
     print(f"\n=== Regime: {label} ===")
-    model = init_model(ref_model, args.hidden_dim, args.seed)
+    model = init_model(ref_model, args.hidden_dim, args.seed, input_dim=args.input_dim)
     optimizer = make_optimizer(model, args.lr, use_adam=not args.no_adam)
 
     n_train = len(train_examples)
@@ -452,6 +452,7 @@ def build_datasets(
             per_cluster=args.per_cluster,
             cluster_signal=args.cluster_signal,
             target_mode=args.cluster_target_mode,
+            input_dim=args.input_dim,
             seed=args.seed,
         )
         _, eval_examples, _, _, _ = generate_clustered_dataset(
@@ -459,6 +460,7 @@ def build_datasets(
             per_cluster=args.per_cluster,
             cluster_signal=args.cluster_signal,
             target_mode=args.cluster_target_mode,
+            input_dim=args.input_dim,
             test_cluster_ids=test_cluster_ids,   # SAME clusters as the target
             seed=args.seed + 7777,               # different points (fresh noise)
         )
@@ -468,7 +470,8 @@ def build_datasets(
     # iid: train = first n_train; target + eval = two DISJOINT pools of "hard" (near-boundary)
     # held-out points — same distribution, different points, so target guides and eval tests.
     need = n_target + n_eval
-    all_examples = generate_dataset(n=args.n_train + max(200, need * 12), seed=args.seed)
+    all_examples = generate_dataset(n=args.n_train + max(200, need * 12),
+                                    input_dim=args.input_dim, seed=args.seed)
     train_examples = all_examples[: args.n_train]
     hard = [ex for ex in all_examples[args.n_train :]
             if abs(ex.z[0] + ex.z[1] + ex.z[2]) < 0.3]
@@ -481,9 +484,9 @@ def build_datasets(
     return train_examples, target_examples, eval_examples
 
 
-def build_ref_model(hidden_dim: int, seed: int) -> nn.Module:
+def build_ref_model(hidden_dim: int, seed: int, input_dim: int = 20) -> nn.Module:
     torch.manual_seed(seed)
-    ref_model = ToyAutoregressiveMLP(hidden_dim=hidden_dim)
+    ref_model = ToyAutoregressiveMLP(input_dim=input_dim, hidden_dim=hidden_dim)
     for m in ref_model.modules():
         if isinstance(m, nn.Linear):
             nn.init.orthogonal_(m.weight, gain=1.0)
@@ -502,7 +505,15 @@ def main():
     parser.add_argument("--n-test", type=int, default=5,
                         help="held-out EVAL set size — measured, DISJOINT from target.")
     parser.add_argument("--dataset", choices=["iid", "clustered"], default="iid")
-    parser.add_argument("--n-clusters", type=int, default=15)
+    parser.add_argument("--n-clusters", type=int, default=15,
+                        help="(clustered) total clusters. Only ~5 are test clusters, so "
+                             "helpful-train fraction ≈ 5/n_clusters — RAISE this to make "
+                             "eval-relevant data RARE so random misses it and IF must "
+                             "actively select it (the IF-vs-random test). Needs input_dim "
+                             ">= 3+n_clusters (auto-bumped).")
+    parser.add_argument("--input-dim", type=int, default=20,
+                        help="latent dim of the toy z-vectors / model input. Auto-bumped to "
+                             "3+n_clusters+2 for clustered if too small.")
     parser.add_argument("--per-cluster", type=int, default=3)
     parser.add_argument("--cluster-signal", type=float, default=3.0)
     parser.add_argument("--cluster-target-mode", choices=["parity", "random"], default="parity")
@@ -559,9 +570,17 @@ def main():
         if m not in ("exhaustive", "gold"):
             raise SystemExit(f"Unknown train-rollout-mode: {m!r}. Choices: ('exhaustive', 'gold')")
 
+    # clustered needs input_dim >= 3 + n_clusters (one-hot cluster signature lives in z[3+k]).
+    if args.dataset == "clustered" and args.input_dim < 3 + args.n_clusters:
+        args.input_dim = 3 + args.n_clusters + 2
+        print(f"[auto] input_dim bumped to {args.input_dim} for n_clusters={args.n_clusters}")
+
     train_examples, target_examples, eval_examples = build_datasets(args)
+    helpful_frac = (5.0 / args.n_clusters) if args.dataset == "clustered" else float("nan")
     print(f"Dataset: {args.dataset}, train={len(train_examples)}, "
-          f"target={len(target_examples)}, eval={len(eval_examples)} (all disjoint)")
+          f"target={len(target_examples)}, eval={len(eval_examples)} (all disjoint)"
+          + (f" | ~{helpful_frac:.0%} of train is eval-relevant (5/{args.n_clusters} clusters)"
+             if args.dataset == "clustered" else ""))
 
     if args.if_recompute_every is None:
         args.if_recompute_every = max(1, args.n_train // args.batch_size)
@@ -573,7 +592,7 @@ def main():
         json.dump(vars(args), f, indent=2)
     print(f"Results: {run_dir}")
 
-    ref_model = build_ref_model(args.hidden_dim, args.seed)
+    ref_model = build_ref_model(args.hidden_dim, args.seed, input_dim=args.input_dim)
 
     # Build the run list: IF-dependent regimes run once per influence method
     # and train_rollout_mode combination.
