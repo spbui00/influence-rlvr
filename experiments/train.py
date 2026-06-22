@@ -34,7 +34,7 @@ from influence_rlvr import clear_cache, detect_device
 from influence_rlvr.generation import clear_vllm_engine_cache
 from influence_rlvr.rewards import format_guardrail_reward_func
 
-from .config import ExperimentConfig
+from .config import DOMAIN_TO_CATEGORIES, ExperimentConfig
 from .data import load_eval_benchmark, load_if_target_set, load_train_pool
 from .dist_utils import env_is_main
 from .influence import compute_pool_influence
@@ -373,6 +373,25 @@ def run_if_prune(cfg, model, tokenizer, train_pool, device):
                 order = np.load(order_path)
                 print(f"\n[window {w}] resume: reusing saved ranking {order_path.name} "
                       f"({len(order)} prompts) — skip rescoring")
+            elif cfg.selection == "in-domain":
+                # "just train on the target domain" heuristic baseline: keep only
+                # target-category prompts from the SAME pool (so the carve/eval matches
+                # the IF arm exactly). No influence needed → no scoring. Target-domain
+                # indices first (shuffled), then the rest, so kept[:keep] is in-domain
+                # until exhausted (size-matched to the IF arm via keep_fraction).
+                tgt_cats = set()
+                for d in cfg.webinstruct_test_domains:
+                    tgt_cats.update(DOMAIN_TO_CATEGORIES.get(d, ()))
+                cats_col = train_pool["category"]
+                rng = np.random.default_rng(cfg.seed + start)
+                in_dom = [i for i in range(pool) if cats_col[i] in tgt_cats]
+                rest = [i for i in range(pool) if cats_col[i] not in tgt_cats]
+                rng.shuffle(in_dom)
+                rng.shuffle(rest)
+                order = np.array(in_dom + rest, dtype=np.int64)
+                np.save(order_path, order)
+                print(f"\n[window {w}] selection=in-domain: {len(in_dom)} {sorted(tgt_cats)} "
+                      f"prompts in pool (no scoring)")
             elif cfg.selection not in ("if-guided", "anti-if"):
                 # random / round-robin ignore influence entirely — _ranked_order only
                 # needs the pool size, so skip the (expensive) 24k scoring. This makes

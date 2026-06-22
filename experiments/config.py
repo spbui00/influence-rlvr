@@ -62,7 +62,9 @@ class ExperimentConfig:
     # than the kept set it only ever reaches the top, so size window ~= kept set).
     if_shuffle_kept: bool = True
     # "if-guided" keeps highest-influence; "anti-if" keeps lowest (ablation);
-    # "random" keeps a random subset of the same size (control).
+    # "random" keeps a random subset of the same size (control); "in-domain" keeps only
+    # target-domain prompts (the "just train in-domain" heuristic baseline — needs no
+    # influence, uses the SAME pool so the carve/eval matches the IF arm).
     selection: str = "if-guided"
 
     # ── Model / LoRA ────────────────────────────────────────────────────────
@@ -315,8 +317,8 @@ class ExperimentConfig:
                 )
         if self.regime not in ("baseline", "if_prune"):
             raise ValueError(f"regime must be 'baseline' or 'if_prune', got {self.regime!r}")
-        if self.selection not in ("if-guided", "anti-if", "random"):
-            raise ValueError(f"selection must be if-guided|anti-if|random, got {self.selection!r}")
+        if self.selection not in ("if-guided", "anti-if", "random", "in-domain"):
+            raise ValueError(f"selection must be if-guided|anti-if|random|in-domain, got {self.selection!r}")
         if self.regime == "if_prune":
             # Window boundaries must land on full checkpoints so each window can
             # resume the optimizer/LR state from the previous one.

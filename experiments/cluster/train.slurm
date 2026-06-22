@@ -93,7 +93,7 @@ N_IF_TARGET="${N_IF_TARGET:-64}"   # IF-target size; bump to ~256 for a single d
 # IF_RECOMPUTE_EVERY must be multiples of SAVE_STEPS. Everything else is shared with
 # the baseline, so the ONLY thing that differs across arms is SELECTION/IF_METHOD.
 REGIME="${REGIME:-baseline}"               # baseline | if_prune
-SELECTION="${SELECTION:-if-guided}"        # if-guided | anti-if | random
+SELECTION="${SELECTION:-if-guided}"        # if-guided | anti-if | random | in-domain
 IF_METHOD="${IF_METHOD:-tracin-adam}"      # the OPERATOR: tracin-adam | dot | cg
 IF_GRAD="${IF_GRAD:-rollout}"              # the GRADIENT: rollout (on-policy, needs gen) | gold (SFT, no rollouts ~30ms/ex)
 PRUNE_STEP="${PRUNE_STEP:-$SAVE_STEPS}"          # warm up to here, then rank (multiple of SAVE_STEPS)
