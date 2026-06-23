@@ -279,6 +279,11 @@ class ExperimentConfig:
     # 10 GB logits at seq 1024; raise on an 80 GB H100, lower on a 48 GB L40S. Also caps the
     # first-call correctness gate's batch so it never OOMs past the production batch.
     if_jvp_batch: int = 8
+    # if_cosine: rank pool examples by COSINE alignment to the target instead of the raw dot
+    # (LESS-style). The raw dot scales with |g_train|, so large-gradient examples dominate
+    # regardless of target-direction (a physics target selected mostly Economics). Cosine
+    # strips magnitude → selects by direction. Reverse-mode only (JVP can't get |g_train|).
+    if_cosine: bool = False
     # Logits microbatch for the per-token-logp forward during scoring. The lm_head
     # materializes (micro_batch × seq × vocab≈152k) logits — the dominant memory
     # spike in the scoring backward. 1 = one sequence's logits at a time (minimum
@@ -358,6 +363,12 @@ class ExperimentConfig:
             )
         if self.if_grad not in ("rollout", "gold"):
             raise ValueError(f"if_grad must be rollout|gold, got {self.if_grad!r}")
+        if self.if_cosine and self.if_jvp:
+            raise ValueError(
+                "if_cosine + if_jvp are incompatible: cosine needs each pool example's "
+                "gradient NORM |g_train|, which the forward-mode JVP path never materializes. "
+                "Use reverse-mode (drop --if-jvp) with --if-cosine."
+            )
         if self.if_jvp and self.if_grad != "gold":
             raise ValueError(
                 "if_jvp requires if_grad=gold (forward-mode JVP scores the SFT gold "

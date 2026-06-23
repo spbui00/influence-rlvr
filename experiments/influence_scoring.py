@@ -459,6 +459,18 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
     precond = None  # free the D-vector before the memory-heavy scoring backward
     all_reduce_sum_(H)  # each rank filled disjoint rows → SUM assembles full H
 
+    # if_cosine (LESS-style): rank pool examples by DIRECTIONAL alignment, not raw dot. The
+    # plain dot ⟨H[j], g_train⟩ scales with |g_train|, so a big-gradient example (e.g. a long
+    # answer, or one the model is very wrong about) dominates the ranking REGARDLESS of whether
+    # it points toward the target — exactly why a physics target selected mostly Economics.
+    # Unit-normalizing each target row (here) + each g_train (in the pool loop) → score is the
+    # mean cosine(H[j], g_train), magnitude-free.
+    if cfg.if_cosine:
+        H = H / H.norm(dim=1, keepdim=True).clamp(min=1e-12)
+        if main:
+            print("  [if_cosine] H rows unit-normalized; pool scores = mean cosine "
+                  "(direction, not magnitude)")
+
     # Release the FVP + flush the CG double-backward graphs before the (memory-heavy,
     # full-vocab-logit) scoring backward. Also re-enable gradient checkpointing: the
     # FVP needed it OFF for double-backward, but scoring only needs first-order grads,
@@ -477,7 +489,7 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
     # if_jvp (gold only): replace the per-example backward+dot with one fp32 forward-mode
     # pass per prompt against the collapsed tangent H.mean(0). Produces a (1,n_train) matrix
     # (matrix.mean(0)==scores still holds) that flows through the same all_reduce + save tail.
-    use_jvp = cfg.if_jvp and is_gold
+    use_jvp = cfg.if_jvp and is_gold and not cfg.if_cosine  # cosine needs |g_train| (JVP skips it)
     t0 = time.time()
     if use_jvp:
         if main:
@@ -506,7 +518,10 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
                 )
             )
             for i, g_train in zip(pids, grads):
-                matrix[:, i] = (H @ g_train.to(H.device)).detach().cpu().numpy()
+                gt = g_train.to(H.device)
+                if cfg.if_cosine:  # unit-normalize → ⟨H[j], g_train/|g_train|⟩ = cosine
+                    gt = gt / gt.norm().clamp(min=1e-12)
+                matrix[:, i] = (H @ gt).detach().cpu().numpy()
             done = min(c + B, len(my_pool))
             if main and (done >= next_log or done == len(my_pool)):
                 print(f"    rank0 scored {done}/{len(my_pool)} ({time.time() - t0:.1f}s)")
