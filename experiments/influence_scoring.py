@@ -466,10 +466,13 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
     # Unit-normalizing each target row (here) + each g_train (in the pool loop) → score is the
     # mean cosine(H[j], g_train), magnitude-free.
     if cfg.if_cosine:
-        H = H / H.norm(dim=1, keepdim=True).clamp(min=1e-12)
+        # IN-PLACE: H is [n_target, D] (256 × 66M × 4B = 67.6 GB on a 4B model). The
+        # out-of-place `H / norm` would allocate a SECOND full copy → OOM on 4B (it fit on
+        # 1.7B where H was 35 GB). div_ normalizes each row using only the tiny [256,1] norm.
+        H.div_(H.norm(dim=1, keepdim=True).clamp(min=1e-12))
         if main:
-            print("  [if_cosine] H rows unit-normalized; pool scores = mean cosine "
-                  "(direction, not magnitude)")
+            print("  [if_cosine] H rows unit-normalized (in-place); pool scores = mean "
+                  "cosine (direction, not magnitude)")
 
     # Release the FVP + flush the CG double-backward graphs before the (memory-heavy,
     # full-vocab-logit) scoring backward. Also re-enable gradient checkpointing: the
