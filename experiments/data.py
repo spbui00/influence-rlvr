@@ -207,6 +207,12 @@ def _train_heldout_for_target(cfg: ExperimentConfig) -> tuple[Dataset, Dataset]:
     tgt_q = set(if_raw["question"])
     eval_raw = eval_raw.filter(
         lambda e: e["question"] not in pool_q and e["question"] not in tgt_q)
+    if cfg.target_difficulty and "difficulty" in if_raw.column_names:
+        from collections import Counter as _C
+        print(f"  [data] target_difficulty={cfg.target_difficulty!r}: "
+              f"IF target difficulty={dict(_C(if_raw['difficulty']))}, "
+              f"eval difficulty={dict(_C(eval_raw['difficulty']))} "
+              f"(disjoint from pool, n_if={len(if_raw)} n_eval={len(eval_raw)})")
     return if_raw, eval_raw
 
 

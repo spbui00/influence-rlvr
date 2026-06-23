@@ -34,6 +34,8 @@ POOL="${POOL:-24000}"
 TEST_DOMAINS="${TEST_DOMAINS:-finance}"
 N_IF_TARGET="${N_IF_TARGET:-256}"
 TEST_EVAL="${TEST_EVAL:-1000}"      # held-out eval partition size (matches train.slurm)
+TARGET_DIFFICULTY="${TARGET_DIFFICULTY:-}"   # e.g. University — probe headroom on uni-level target
+DIFF_ARG=""; [ -n "$TARGET_DIFFICULTY" ] && DIFF_ARG="--target-difficulty $TARGET_DIFFICULTY"
 
 VERIFIER="${VERIFIER:-TIGER-Lab/general-verifier}"
 VERIFIER_MAX_LEN="${VERIFIER_MAX_LEN:-4096}"
@@ -70,7 +72,7 @@ CUDA_VISIBLE_DEVICES=0 python -m experiments.headroom \
     --k "$K" --headroom-temperature "$TEMP" --limit "$LIMIT" \
     --run-name "$RUN_NAME" --model-id "$MODEL" --seed "$SEED" \
     --test-from-train --test-from-train-eval "$TEST_EVAL" \
-    --webinstruct-test-domains "$TEST_DOMAINS" --domains "$DOMAINS" \
+    --webinstruct-test-domains "$TEST_DOMAINS" --domains "$DOMAINS" $DIFF_ARG \
     --n-train-pool "$POOL" --n-if-target "$N_IF_TARGET" \
     --verifier-backend vllm --verifier-server-port "$VPORT" \
     --verifier-max-new-tokens 1024 --verifier-max-model-len "$VERIFIER_MAX_LEN"
