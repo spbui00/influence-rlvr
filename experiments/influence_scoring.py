@@ -474,6 +474,14 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
             print("  [if_cosine] H rows unit-normalized (in-place); pool scores = mean "
                   "cosine (direction, not magnitude)")
 
+    # Collapse H to its mean row [1, D]. The pool scores only need ⟨H.mean(0), g_train⟩ (mean
+    # over targets, by linearity — for cosine, the mean of the NORMALIZED rows above). Holding
+    # the full [n_target, D] (256×66M×4B = 67.6 GB on a 4B model) resident through the per-
+    # example scoring backward leaves too little for activations and OOMs mid-scan; the [1, D]
+    # mean (264 MB) is mathematically exact and frees ~67 GB. The saved matrix becomes
+    # (1, n_train) — nothing downstream reads the per-target rows (scores = matrix.mean(0)).
+    H = H.mean(dim=0, keepdim=True)
+
     # Release the FVP + flush the CG double-backward graphs before the (memory-heavy,
     # full-vocab-logit) scoring backward. Also re-enable gradient checkpointing: the
     # FVP needed it OFF for double-backward, but scoring only needs first-order grads,
@@ -506,7 +514,7 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
             gen_label = "none/gold-SFT" if is_gold else backend.name
             print(f"  [{cfg.if_method}/{cfg.if_grad}] scoring {n_train} train prompts "
                   f"({len(my_pool)}/rank × {world} ranks, batch={B}, gen={gen_label})...")
-        matrix = np.zeros((n_target, n_train), dtype=np.float64)
+        matrix = np.zeros((H.shape[0], n_train), dtype=np.float64)  # H collapsed → (1, n_train)
         next_log = 50
         for c in range(0, len(my_pool), B):
             pids = my_pool[c : c + B]
