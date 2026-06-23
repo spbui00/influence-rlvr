@@ -95,6 +95,14 @@ class ExperimentConfig:
     # `domains`. e.g. ("cs",) to steer pruning toward, and test on, Computer
     # Science specifically while still training on all `domains`.
     webinstruct_test_domains: tuple[str, ...] = ()
+    # Difficulty-transfer (train easy → eval hard), using WebInstruct's `difficulty` field
+    # ('University','Senior High School','Junior High School','PhD'). target_difficulty
+    # restricts the IF-target + held-out eval (the TEST domain) to that level; pool_difficulty
+    # restricts the TEST domain's POOL rows to those levels (distractor domains unrestricted).
+    # e.g. target_difficulty="University", pool_difficulty=("Junior High School","Senior High
+    # School") → target/eval = uni physics, pool physics = HS only (disjoint by difficulty).
+    target_difficulty: str = ""
+    pool_difficulty: tuple[str, ...] = ()
     # Use the ENTIRE domain-filtered test slice as the IF target (no eval
     # carve-out). For tiny single-domain slices (e.g. CS has ~5 test rows) so all
     # of them guide the influence. REQUIRES eval on an external dataset — do NOT
@@ -415,7 +423,7 @@ class ExperimentConfig:
             if k not in fields:
                 continue
             # Restore tuple-typed fields.
-            if k in {"lora_target_modules", "domains", "eval_benchmarks", "webinstruct_test_domains"} and isinstance(v, list):
+            if k in {"lora_target_modules", "domains", "eval_benchmarks", "webinstruct_test_domains", "pool_difficulty"} and isinstance(v, list):
                 v = tuple(v)
             kwargs[k] = v
         return cls(**kwargs)
@@ -464,7 +472,7 @@ class ExperimentConfig:
                 parser.add_argument(name, dest=f.name, action="store_true", default=None)
                 parser.add_argument("--no-" + f.name.replace("_", "-"),
                                     dest=f.name, action="store_false")
-            elif f.name in {"lora_target_modules", "domains", "eval_benchmarks", "webinstruct_test_domains"}:
+            elif f.name in {"lora_target_modules", "domains", "eval_benchmarks", "webinstruct_test_domains", "pool_difficulty"}:
                 parser.add_argument(name, type=str, default=None,
                                     help="Comma-separated list.")
             elif base is int or (base is None and isinstance(default, int)):
@@ -488,7 +496,7 @@ class ExperimentConfig:
             val = getattr(args, f.name, None)
             if val is None:
                 continue
-            if f.name in {"lora_target_modules", "domains", "eval_benchmarks", "webinstruct_test_domains"} and isinstance(val, str):
+            if f.name in {"lora_target_modules", "domains", "eval_benchmarks", "webinstruct_test_domains", "pool_difficulty"} and isinstance(val, str):
                 val = tuple(p.strip() for p in val.split(",") if p.strip())
             overrides[f.name] = val
         merged = {**base.to_dict(), **overrides}

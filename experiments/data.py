@@ -53,6 +53,7 @@ def _format_webinstruct_row(example: dict, idx: int) -> dict:
         "solution": str(example.get("answer", "") or ""),
         "answer_type": example.get("answer_type", ""),
         "category": example.get("category", ""),
+        "difficulty": example.get("difficulty", ""),
         "train_index": idx,
     }
 
@@ -66,11 +67,20 @@ def _load_webinstruct_split(cfg: ExperimentConfig, split: str) -> Dataset:
     return raw
 
 
-def _load_train_domain(cfg: ExperimentConfig, domain: str) -> Dataset:
-    """Train split filtered to ONE domain's categories (+ nonempty answer)."""
+def _load_train_domain(cfg: ExperimentConfig, domain: str,
+                       difficulties: tuple[str, ...] | None = None) -> Dataset:
+    """Train split filtered to ONE domain's categories (+ nonempty answer). With
+    `difficulties`, also restrict to those WebInstruct difficulty levels (e.g.
+    ('University',) or ('Junior High School','Senior High School')) — the basis for
+    difficulty-transfer (train easy → eval hard)."""
     cats = set(DOMAIN_TO_CATEGORIES[domain])
     raw = load_dataset(cfg.train_dataset, split="train")
     raw = raw.filter(lambda ex: ex.get("category") in cats)
+    if difficulties:
+        # Accept the underscore form ("Junior_High_School") from the shell-friendly CLI,
+        # matched against the dataset's spaced labels ("Junior High School").
+        diffs = {d.replace("_", " ") for d in difficulties}
+        raw = raw.filter(lambda ex: ex.get("difficulty") in diffs)
     raw = raw.filter(lambda ex: bool(str(ex.get("answer", "") or "").strip()))
     return raw
 
@@ -86,15 +96,21 @@ def load_train_pool(cfg: ExperimentConfig) -> Dataset:
     """
     if cfg.balance_domains and cfg.n_train_pool and cfg.n_train_pool > 0:
         per = cfg.n_train_pool // len(cfg.domains)
+        # Difficulty-transfer: restrict the TEST DOMAIN's pool rows to `pool_difficulty`
+        # (e.g. high-school physics) so the pool never contains the target difficulty
+        # (e.g. university physics). Distractor domains (math/finance) stay unrestricted.
+        test_doms = set(_webinstruct_test_domains(cfg))
         parts = []
         for d in cfg.domains:
-            raw_d = _load_train_domain(cfg, d).shuffle(seed=cfg.seed)
+            diffs = cfg.pool_difficulty if (cfg.pool_difficulty and d in test_doms) else None
+            raw_d = _load_train_domain(cfg, d, difficulties=diffs).shuffle(seed=cfg.seed)
             k = min(per, len(raw_d))
             if k < per:
                 print(f"  [data] domain {d!r}: only {len(raw_d)} rows, using {k} (< {per})")
             parts.append(raw_d.select(range(k)))
         raw = concatenate_datasets(parts).shuffle(seed=cfg.seed + 5)
-        print(f"  [data] balanced pool: {[(d, min(per, len(_load_train_domain(cfg, d)))) for d in cfg.domains]}")
+        print(f"  [data] balanced pool: {[(d, len(p)) for d, p in zip(cfg.domains, parts)]}"
+              + (f" | test-domain pool difficulty={cfg.pool_difficulty}" if cfg.pool_difficulty else ""))
     else:
         raw = _load_webinstruct_split(cfg, "train")
         if cfg.n_train_pool and cfg.n_train_pool > 0 and len(raw) > cfg.n_train_pool:
@@ -152,14 +168,19 @@ def _train_heldout_for_target(cfg: ExperimentConfig) -> tuple[Dataset, Dataset]:
     n_if = cfg.n_if_target if cfg.n_if_target and cfg.n_if_target > 0 else 64
     n_eval = (cfg.test_from_train_eval if cfg.test_from_train_eval
               and cfg.test_from_train_eval > 0 else 1000)
+    tgt_diffs = (cfg.target_difficulty,) if cfg.target_difficulty else None
     if_parts, eval_parts = [], []
     for d in _webinstruct_test_domains(cfg):
-        raw = _load_train_domain(cfg, d).shuffle(seed=cfg.seed)
+        raw = _load_train_domain(cfg, d, difficulties=tgt_diffs).shuffle(seed=cfg.seed)
         n = len(raw)
-        # The pool consumes the first `per` of THIS identical shuffle iff d is one of
-        # the balanced pool domains; otherwise none of d is in the pool.
+        # The pool consumes the first `per` of THIS identical shuffle iff d is a balanced
+        # pool domain AT THE SAME difficulty. With difficulty-transfer (target_difficulty
+        # set), the pool's same-domain rows are a DIFFERENT difficulty (e.g. pool=HS,
+        # target=University) → not in this `raw` at all → per=0. The pool_q guard below
+        # is the airtight backstop for either case.
         per = 0
-        if d in cfg.domains and cfg.balance_domains and cfg.n_train_pool > 0:
+        if (d in cfg.domains and cfg.balance_domains and cfg.n_train_pool > 0
+                and not cfg.target_difficulty):
             per = min(cfg.n_train_pool // len(cfg.domains), n)
         if per + n_if >= n:
             raise ValueError(

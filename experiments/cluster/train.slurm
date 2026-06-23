@@ -85,6 +85,15 @@ TEST_FROM_TRAIN="${TEST_FROM_TRAIN:-0}"
 TEST_EVAL="${TEST_EVAL:-1000}"
 TEST_FROM_TRAIN_ARG=""
 [ "$TEST_FROM_TRAIN" = "1" ] && TEST_FROM_TRAIN_ARG="--test-from-train --test-from-train-eval $TEST_EVAL"
+# Difficulty-transfer (train easy → eval hard) via WebInstruct's `difficulty` field. Use the
+# UNDERSCORE form (no spaces): TARGET_DIFFICULTY=University restricts IF-target+eval (test
+# domain) to that level; POOL_DIFFICULTY=Junior_High_School,Senior_High_School restricts the
+# test domain's POOL to those levels (distractor domains keep all). Disjoint by difficulty.
+TARGET_DIFFICULTY="${TARGET_DIFFICULTY:-}"
+POOL_DIFFICULTY="${POOL_DIFFICULTY:-}"
+DIFF_ARG=""
+[ -n "$TARGET_DIFFICULTY" ] && DIFF_ARG="$DIFF_ARG --target-difficulty $TARGET_DIFFICULTY"
+[ -n "$POOL_DIFFICULTY" ] && DIFF_ARG="$DIFF_ARG --pool-difficulty $POOL_DIFFICULTY"
 N_IF_TARGET="${N_IF_TARGET:-64}"   # IF-target size; bump to ~256 for a single domain
 # ── Regime: baseline (Tier-1 gate) vs if_prune (Tier-2 IF-selection arms) ───────
 # baseline = full pool, random order (REGIME default). if_prune = warm up to
@@ -273,7 +282,7 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     -m experiments.train \
     --run-name "$RUN_NAME" --seed "$SEED" --regime "$REGIME" $RESUME_ARG \
     --model-id "$MODEL" --lora-r 32 \
-    --if-target-source "$IF_TARGET" --eval-benchmarks "$EVAL_BENCH" $TEST_DOMAINS_ARG $TEST_FROM_TRAIN_ARG \
+    --if-target-source "$IF_TARGET" --eval-benchmarks "$EVAL_BENCH" $TEST_DOMAINS_ARG $TEST_FROM_TRAIN_ARG $DIFF_ARG \
     --live-eval-benchmark "$LIVE_EVAL_BENCH" --n-train-pool "$POOL" --n-if-target "$N_IF_TARGET" \
     $DOMAINS_ARG \
     $IF_ARGS \
