@@ -123,6 +123,11 @@ IF_VLLM_GPU_UTIL="${IF_VLLM_GPU_UTIL:-0.3}"   # legacy (unused by the server-reu
 # the server offload, bigger = better server saturation (256+ rollouts fill it); the
 # backward is micro-batched (if-logps-micro-batch) so GPU memory stays bounded → push 32.
 IF_SCORE_BATCH="${IF_SCORE_BATCH:-4}"
+# IF_G_TRAIN: rollouts/prompt when scoring the TRAIN pool (if_grad=rollout). The scan cost is
+# ~linear in this — 8 is accurate but expensive (~6.6s/prompt on 4B); 4 ~halves it, 2 for a
+# cheap probe. IF_MAX_NEW_TOKENS caps generation length (shorter = faster gen + backward).
+IF_G_TRAIN="${IF_G_TRAIN:-8}"
+IF_MAX_NEW_TOKENS="${IF_MAX_NEW_TOKENS:-1024}"
 # IF_JVP=1 (if_grad=gold only): forward-mode (JVP) pool scoring — one fp32 forward per
 # prompt against the collapsed tangent H.mean(0), no backward / no D-vector. Loads a fresh
 # fp32 model from the checkpoint (~2× base GPU mem). Same ranking (validated Spearman≈1).
@@ -137,7 +142,7 @@ if [ "$REGIME" = "if_prune" ]; then
     # CG-only flags are ignored by dot/tracin-adam.
     IF_ARGS="--selection $SELECTION --if-method $IF_METHOD --if-grad $IF_GRAD \
         --prune-step $PRUNE_STEP --if-recompute-every $IF_RECOMPUTE_EVERY --keep-fraction $KEEP_FRACTION \
-        --if-g-train 8 --if-max-new-tokens 1024 --if-score-batch $IF_SCORE_BATCH --if-logps-micro-batch 1 \
+        --if-g-train $IF_G_TRAIN --if-max-new-tokens $IF_MAX_NEW_TOKENS --if-score-batch $IF_SCORE_BATCH --if-logps-micro-batch 1 \
         --cg-fisher-examples 8 --cg-fisher-g 2 --cg-fisher-max-tokens 128 --cg-iters 50 --lambda-damp 0.5"
     [ "$IF_VLLM_GEN" = "1" ] && IF_ARGS="$IF_ARGS --if-vllm-gen --if-vllm-gpu-util $IF_VLLM_GPU_UTIL"
     [ "$SHUFFLE_KEPT" = "0" ] && IF_ARGS="$IF_ARGS --no-if-shuffle-kept"
