@@ -585,6 +585,7 @@ def compute_policy_gradient_bundle_batch(
     adapter_path=None,
     model_id=None,
     logps_micro_batch_size=4,
+    skip_zero_variance_grad: bool = False,
 ):
     objective_mode = GradientObjective.parse(objective_mode)
     geometry_feature_mode = GeometryFeatureMode.parse(geometry_feature_mode)
@@ -666,6 +667,25 @@ def compute_policy_gradient_bundle_batch(
             )
         )
         total_rewards, reward_breakdown = _evaluate_rewards(reward_funcs_batch[bi], slice_trl, dev)
+
+        # Learnable-only short-circuit (GRPO_TRAIN scoring): if all G completions earned the
+        # SAME reward, every advantage is 0 → the policy gradient is EXACTLY the zero vector,
+        # so this prompt's influence dot is exactly 0. Skip the forward+backward and emit None
+        # (the scorer scores it 0). Exact, not heuristic. Gated to GRPO_TRAIN — EXPECTED_REWARD_PG
+        # advantages are uncentered (nonzero for saturated targets), so it must NOT skip there.
+        if (skip_zero_variance_grad
+                and objective_mode == GradientObjective.GRPO_TRAIN
+                and float(total_rewards.std(unbiased=False)) <= advantage_eps):
+            grad_rows.append(None)
+            debug_rows.append({
+                "prompt_text": single_prompt_text,
+                "saturated": True,
+                "reward_breakdown": reward_breakdown,
+                "total_rewards": total_rewards.detach().cpu().tolist(),
+                "objective_mode": objective_mode,
+            })
+            del slice_trl, total_rewards
+            continue
 
         # Forward Pass (G sequences only - extremely safe for memory)
         per_token_logps = _compute_per_token_logps(
@@ -851,6 +871,7 @@ def compute_policy_gradient_bundle(
     adapter_path=None,
     model_id=None,
     logps_micro_batch_size=4,
+    skip_zero_variance_grad: bool = False,
 ):
     objective_mode = GradientObjective.parse(objective_mode)
     geometry_feature_mode = GeometryFeatureMode.parse(geometry_feature_mode)
@@ -893,6 +914,18 @@ def compute_policy_gradient_bundle(
     )
     completions_trl = rollout_to_completions(rollout)
     total_rewards, reward_breakdown = _evaluate_rewards(reward_funcs, completions_trl, device)
+
+    # Learnable-only short-circuit (see compute_policy_gradient_bundle_batch): a GRPO_TRAIN
+    # prompt whose G completions all earned the same reward has zero advantage everywhere →
+    # exactly-zero gradient. Skip the forward+backward and return grad=None (scored 0).
+    if (skip_zero_variance_grad
+            and objective_mode == GradientObjective.GRPO_TRAIN
+            and float(total_rewards.std(unbiased=False)) <= advantage_eps):
+        return {"grad": None, "geometry_feature": None,
+                "debug": {"prompt_text": prompt_text, "saturated": True,
+                          "reward_breakdown": reward_breakdown,
+                          "total_rewards": total_rewards.detach().cpu().tolist(),
+                          "objective_mode": objective_mode}}
 
     response_ids = rollout.token_ids
     response_mask = rollout.response_mask

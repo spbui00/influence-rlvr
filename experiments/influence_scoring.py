@@ -58,7 +58,7 @@ def _generate(model, tokenizer, prompt, *, G, cfg, device, backend, vllm_cfg, se
 
 
 def _example_grad(model, tokenizer, sample, reward_funcs, *, objective_mode, cfg,
-                  device, backend, vllm_cfg, seed):
+                  device, backend, vllm_cfg, seed, skip_zero_variance_grad=False):
     res = compute_policy_gradient_bundle(
         model, tokenizer, sample["prompt"], reward_funcs,
         G=cfg.if_g_train, device=device,
@@ -67,23 +67,27 @@ def _example_grad(model, tokenizer, sample, reward_funcs, *, objective_mode, cfg
         seed=seed, epsilon=cfg.grpo_epsilon, beta=cfg.grpo_beta,
         objective_mode=objective_mode, vllm_config=vllm_cfg, model_id=cfg.model_id,
         logps_micro_batch_size=cfg.if_logps_micro_batch,
+        skip_zero_variance_grad=skip_zero_variance_grad,
     )
-    return res["grad"].detach().to(dtype=torch.float32)
+    g = res["grad"]
+    return None if g is None else g.detach().to(dtype=torch.float32)
 
 
 def _example_grads_batch(model, tokenizer, samples, builder, *, objective_mode, cfg,
-                         device, backend, vllm_cfg, seed):
+                         device, backend, vllm_cfg, seed, skip_zero_variance_grad=False):
     """Per-example gradients for a minibatch of `samples`, vectorized over generation.
 
     Uses the batched bundle so all len(samples)×if_g_train rollouts are generated in
     one forward (the slow half), then the per-prompt backward runs inside. Returns a
-    list of float32 grad vectors, one per sample, in input order.
+    list of float32 grad vectors, one per sample, in input order. With
+    skip_zero_variance_grad, a saturated prompt (zero reward variance, GRPO_TRAIN only)
+    comes back as None — its influence is exactly 0, so the scorer skips it without a backward.
     """
     if len(samples) == 1:  # keep the single-prompt path identical at B=1
         return [_example_grad(
             model, tokenizer, samples[0], builder(samples[0], cfg.if_g_train),
             objective_mode=objective_mode, cfg=cfg, device=device, backend=backend,
-            vllm_cfg=vllm_cfg, seed=seed,
+            vllm_cfg=vllm_cfg, seed=seed, skip_zero_variance_grad=skip_zero_variance_grad,
         )]
     prompts = [s["prompt"] for s in samples]
     reward_funcs_batch = [builder(s, cfg.if_g_train) for s in samples]
@@ -95,8 +99,9 @@ def _example_grads_batch(model, tokenizer, samples, builder, *, objective_mode, 
         seed=seed, epsilon=cfg.grpo_epsilon, beta=cfg.grpo_beta,
         objective_mode=objective_mode, vllm_config=vllm_cfg, model_id=cfg.model_id,
         logps_micro_batch_size=cfg.if_logps_micro_batch,
+        skip_zero_variance_grad=skip_zero_variance_grad,
     )
-    return [g.detach().to(dtype=torch.float32) for g in res["grad"]]
+    return [None if g is None else g.detach().to(dtype=torch.float32) for g in res["grad"]]
 
 
 def _example_sft_grads_batch(model, tokenizer, samples, *, cfg, device):
@@ -516,6 +521,7 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
                   f"({len(my_pool)}/rank × {world} ranks, batch={B}, gen={gen_label})...")
         matrix = np.zeros((H.shape[0], n_train), dtype=np.float64)  # H collapsed → (1, n_train)
         next_log = 50
+        n_skip = 0  # saturated prompts (zero reward variance): rollout grad is exactly 0 → score 0
         for c in range(0, len(my_pool), B):
             pids = my_pool[c : c + B]
             chunk = [train_pool[i] for i in pids]
@@ -525,17 +531,21 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
                     model, tokenizer, chunk, builder,
                     objective_mode=GradientObjective.GRPO_TRAIN, cfg=cfg,
                     device=device, backend=backend, vllm_cfg=vllm_cfg,
-                    seed=cfg.seed + 20_000 + pids[0],
+                    seed=cfg.seed + 20_000 + pids[0], skip_zero_variance_grad=True,
                 )
             )
             for i, g_train in zip(pids, grads):
+                if g_train is None:  # saturated: backward skipped, influence exactly 0 (matrix stays 0)
+                    n_skip += 1
+                    continue
                 gt = g_train.to(H.device)
                 if cfg.if_cosine:  # unit-normalize → ⟨H[j], g_train/|g_train|⟩ = cosine
                     gt = gt / gt.norm().clamp(min=1e-12)
                 matrix[:, i] = (H @ gt).detach().cpu().numpy()
             done = min(c + B, len(my_pool))
             if main and (done >= next_log or done == len(my_pool)):
-                print(f"    rank0 scored {done}/{len(my_pool)} ({time.time() - t0:.1f}s)")
+                print(f"    rank0 scored {done}/{len(my_pool)} ({time.time() - t0:.1f}s, "
+                      f"{n_skip} saturated-skipped)")
                 next_log = ((done // 50) + 1) * 50
 
     if world > 1:  # each rank filled disjoint columns → SUM assembles the full matrix
