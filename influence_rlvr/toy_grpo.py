@@ -21,6 +21,7 @@ from .modes import GeometryFeatureMode, GradientObjective
 class ToyRolloutMode(str, Enum):
     EXHAUSTIVE = "exhaustive"
     SAMPLED = "sampled"
+    GOLD = "gold"
 
     @classmethod
     def parse(cls, value: ToyRolloutMode | str) -> ToyRolloutMode:
@@ -264,6 +265,10 @@ def rollout_token_sequences(
     seed: int | None = None,
 ) -> torch.Tensor:
     rollout_mode = ToyRolloutMode.parse(rollout_mode)
+    
+    if rollout_mode == ToyRolloutMode.GOLD:
+        return example.target_tensor(device=model.device).unsqueeze(0)
+
     if G < 1:
         raise ValueError(f"G must be >= 1, got {G}.")
 
@@ -436,6 +441,7 @@ def build_toy_policy_fisher_inputs(
     *,
     beta: float = 0.0,
     ref_model: nn.Module | None = None,
+    train_rollout_mode: str = "exhaustive",
 ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], list[dict]]:
     """
     Single-checkpoint setup shared by every policy-Fisher influence method on the toy.
@@ -484,16 +490,28 @@ def build_toy_policy_fisher_inputs(
     train_infos: list[dict] = []
     for ex in train_examples:
         old_model = clone_toy_model(model)
-        bundle = compute_toy_gradient_bundle(
-            model,
-            ex,
-            G=4,
-            rollout_mode=ToyRolloutMode.EXHAUSTIVE,
-            beta=beta,
-            old_model=old_model,
-            ref_model=ref_model,
-            objective_mode=GradientObjective.GRPO_TRAIN,
-        )
+        if train_rollout_mode == "gold":
+            bundle = compute_toy_gradient_bundle(
+                model,
+                ex,
+                G=1,
+                rollout_mode=train_rollout_mode,
+                beta=beta,
+                old_model=old_model,
+                ref_model=ref_model,
+                objective_mode=GradientObjective.EXPECTED_REWARD_PG,
+            )
+        else:
+            bundle = compute_toy_gradient_bundle(
+                model,
+                ex,
+                G=4,
+                rollout_mode=train_rollout_mode,
+                beta=beta,
+                old_model=old_model,
+                ref_model=ref_model,
+                objective_mode=GradientObjective.GRPO_TRAIN,
+            )
         train_infos.append({"grad": bundle["grad"].to(dtype=torch.float32).detach()})
 
     return g_test, grad_cache, prob_cache, train_infos

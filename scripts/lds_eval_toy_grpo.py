@@ -630,10 +630,11 @@ def compute_toy_cg_influence(
     cg_tol: float = 1e-6,
     beta: float = 0.0,
     ref_model: nn.Module | None = None,
+    train_rollout_mode: str = "exhaustive",
 ) -> tuple[torch.Tensor, dict]:
     """PBRF-style IF at one checkpoint: CG+FVP solve against the true policy Fisher."""
     g_test, grad_cache, prob_cache, train_infos = build_toy_policy_fisher_inputs(
-        model, train_examples, test_example, beta=beta, ref_model=ref_model,
+        model, train_examples, test_example, beta=beta, ref_model=ref_model, train_rollout_mode=train_rollout_mode
     )
     fvp_fn = policy_fisher_fvp_from_grad_cache(grad_cache, prob_cache)
     cg = CGInfluence(
@@ -654,6 +655,7 @@ def compute_toy_dot_influence(
     test_example: ToyGRPOExample,
     beta: float = 0.0,
     ref_model: nn.Module | None = None,
+    train_rollout_mode: str = "exhaustive",
 ) -> tuple[torch.Tensor, dict]:
     """First-order (dot-product / TracIn-style) influence: IF = g_train · g_test.
 
@@ -663,7 +665,7 @@ def compute_toy_dot_influence(
     alignment.
     """
     g_test, _grad_cache, _prob_cache, train_infos = build_toy_policy_fisher_inputs(
-        model, train_examples, test_example, beta=beta, ref_model=ref_model,
+        model, train_examples, test_example, beta=beta, ref_model=ref_model, train_rollout_mode=train_rollout_mode
     )
     gt = g_test.detach().to(dtype=torch.float32)
     scores = torch.stack([
@@ -705,12 +707,13 @@ def compute_toy_tracin_adam_influence(
     optimizer: torch.optim.Optimizer,
     beta: float = 0.0,
     ref_model: nn.Module | None = None,
+    train_rollout_mode: str = "exhaustive",
 ) -> tuple[torch.Tensor, dict]:
     """Adam-preconditioned first-order influence: IF = g_test · (P ⊙ g_train),
     P = 1/(√v̂+ε) from the LIVE Adam optimizer. The faithful first-order effect of
     one AdamW step (vs `dot`, which assumes an SGD step). Same gradients as `dot`."""
     g_test, _gc, _pc, train_infos = build_toy_policy_fisher_inputs(
-        model, train_examples, test_example, beta=beta, ref_model=ref_model,
+        model, train_examples, test_example, beta=beta, ref_model=ref_model, train_rollout_mode=train_rollout_mode
     )
     gt = g_test.detach().to(dtype=torch.float32)
     P = _toy_adam_preconditioner(optimizer, model).to(gt.device)
