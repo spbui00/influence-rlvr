@@ -110,6 +110,13 @@ def make_grpo_config(cfg: ExperimentConfig, *, max_steps: int, shuffle: bool = T
         "seed": cfg.seed,
         "report_to": "wandb",
         "learning_rate": cfg.learning_rate,
+        # RLVR wants a STEADY step size: data is on-policy and the model keeps improving,
+        # so annealing to 0 (HF's default "linear") stalls the policy. Worse, run_if_prune
+        # builds one trainer PER window (max_steps=window_end), so that decay RESTARTS each
+        # window — cratering the LR to ~0 at every recompute (a sawtooth that gave the IF arm
+        # ~1/3 the single-trainer baseline's effective LR budget). Constant matches verl/GR
+        # practice and puts every arm on the same footing.
+        "lr_scheduler_type": "constant",
         "per_device_train_batch_size": cfg.per_device_batch,
         "gradient_accumulation_steps": cfg.grad_accum,
         "max_steps": max_steps,
