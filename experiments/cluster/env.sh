@@ -23,6 +23,10 @@ module load StdEnv/2023 gcc/12.3 python/3.11 cuda/12.2 arrow/21.0.0 opencv/4.13.
 source "${VENV_DIR:-$HOME/envs/influence-rlvr}/bin/activate"
 
 export HF_HOME="${HF_HOME:-$HOME/scratch/hf_cache}"
+# Secrets (HF_TOKEN etc): keep them in an untracked experiments/cluster/.env
+# (.env is gitignored) — never hardcode a key in a tracked file. set -a exports
+# the bare KEY=value lines to the slurm job + python. Not needed for offline runs.
+[ -f experiments/cluster/.env ] && { set -a; source experiments/cluster/.env; set +a; }
 export TMPDIR="${SLURM_TMPDIR:-$HOME/scratch/tmp}"; mkdir -p "$TMPDIR"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export WANDB_DIR="${WANDB_DIR:-$HOME/scratch/wandb}"; mkdir -p "$WANDB_DIR"
