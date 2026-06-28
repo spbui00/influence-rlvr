@@ -30,7 +30,7 @@ from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 from trl import GRPOConfig, GRPOTrainer
 
-from influence_rlvr import clear_cache, detect_device
+from influence_rlvr import clear_cache, detect_device, load_adapter_checkpoint
 from influence_rlvr.generation import clear_vllm_engine_cache
 from influence_rlvr.rewards import format_guardrail_reward_func
 
@@ -409,10 +409,21 @@ def run_if_prune(cfg, model, tokenizer, train_pool, device):
                 print(f"\n[window {w}] selection={cfg.selection}: no scoring (influence ignored)")
             else:
                 if cfg.resume and model_step != start:
-                    raise SystemExit(
-                        f"[window {w}] resume can't recover: need to score the step-{start} "
-                        f"model but the in-memory model is at step {model_step} and no saved "
-                        f"ranking exists at {order_path}. Rerun without --resume (start fresh).")
+                    # Crash in the gap between the checkpoint-{start} save and this
+                    # window's scoring: the weights are on disk but the ranking wasn't
+                    # written. Load the step-{start} adapter so we score the right model
+                    # (checkpoint-{start} is guaranteed present — tracin-adam reads its
+                    # optimizer.pt below) instead of aborting into a full restart.
+                    ckpt_start = cfg.grpo_output_dir / f"checkpoint-{start}"
+                    if not ckpt_start.is_dir():
+                        raise SystemExit(
+                            f"[window {w}] resume can't recover: need to score step-{start} "
+                            f"but neither a saved ranking ({order_path.name}) nor "
+                            f"{ckpt_start.name} exists. Rerun without --resume (start fresh).")
+                    print(f"[window {w}] resume: loading {ckpt_start.name} to score step "
+                          f"{start} (in-memory model was at step {model_step})")
+                    load_adapter_checkpoint(model, str(ckpt_start))
+                    model_step = start
                 print(f"\n[window {w}] scoring pool influence at step {start} "
                       f"({cfg.if_method})...")
                 scores = compute_pool_influence(
