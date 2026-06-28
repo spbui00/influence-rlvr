@@ -16,9 +16,10 @@ live_eval.csv.bak first.
 Run:
     python -m experiments.patch_live_eval --run-name xdomain_phys_gold_c
     python -m experiments.patch_live_eval --run-name xdomain_phys_baseline_c --dry-run
-"""
-from __future__ import annotations
 
+Kept stdlib-only and annotation-free so it runs under the bare login-node python
+(3.6) without the container venv.
+"""
 import argparse
 import csv
 import io
@@ -27,7 +28,7 @@ import shutil
 from pathlib import Path
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv=None):
     p = argparse.ArgumentParser(description="Splice re-eval JSONs into live_eval.csv.")
     p.add_argument("--run-name", required=True)
     p.add_argument("--output-root", default="./outputs")
@@ -48,7 +49,7 @@ def main(argv: list[str] | None = None) -> None:
         header = next(reader)
         rows = [r for r in reader if r]
 
-    out_rows: list[list[str]] = []
+    out_rows = []
     patched = 0
     for r in rows:
         step = int(r[0])
