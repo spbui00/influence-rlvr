@@ -56,8 +56,9 @@ def _meta_path(cfg) -> Path:
     return _lds_dir(cfg) / "subsets_meta.json"
 
 
-def _measured_path(cfg, variant: str) -> Path:
-    return _lds_dir(cfg) / f"measured_{variant}.jsonl"
+def _measured_path(cfg, variant: str, tag: str = "") -> Path:
+    suffix = f"_{tag}" if tag else ""
+    return _lds_dir(cfg) / f"measured_{variant}{suffix}.jsonl"
 
 
 def _done_ids(path: Path) -> set:
@@ -143,7 +144,7 @@ def _restore(model, snap):
                 p.copy_(snap[n])
 
 
-def run_nll(cfg, ref_step, train_steps, lr, mb, seed, limit=None):
+def run_nll(cfg, ref_step, train_steps, lr, mb, seed, epochs, tag, limit=None):
     import torch
     from influence_rlvr import clear_cache, detect_device, load_adapter_checkpoint
     from .train import build_model
@@ -159,13 +160,15 @@ def run_nll(cfg, ref_step, train_steps, lr, mb, seed, limit=None):
     ref = _snapshot(model)
     pool = load_train_pool(cfg)
     target = list(load_if_target_set(cfg))
-    out = _measured_path(cfg, "nll")
+    out = _measured_path(cfg, "nll", tag)
     done = _done_ids(out)
     todo = [j for j in range(len(subs)) if j not in done]
     if limit:
         todo = todo[:limit]
-    print(f"[nll] {len(done)} done, {len(todo)} to run (ref_step={ref_step}, "
-          f"train_steps={train_steps}, lr={lr}, mb={mb})")
+    # train_steps set -> fixed-step sampled minibatches (cheap diagnostic); else FULL-coverage
+    # epochs (the matched test: g_hat sums influence over the WHOLE subset, so train on all of it).
+    spec = f"train_steps={train_steps}" if train_steps else f"epochs={epochs} (full coverage)"
+    print(f"[nll] {len(done)} done, {len(todo)} to run (ref_step={ref_step}, {spec}, lr={lr}, mb={mb})")
     with out.open("a") as f:
         for j in todo:
             _restore(model, ref)
@@ -173,18 +176,28 @@ def run_nll(cfg, ref_step, train_steps, lr, mb, seed, limit=None):
             idx = subs[j]
             rng = np.random.default_rng(seed * 1_000_003 + j)
             model.train()
-            for _ in range(train_steps):
-                bi = rng.choice(idx, size=min(mb, len(idx)), replace=False)
-                loss = _gold_nll_vec(model, tok, [pool[int(t)] for t in bi], device).mean()
-                opt.zero_grad()
-                loss.backward()
-                opt.step()
+            if train_steps:
+                for _ in range(train_steps):
+                    bi = rng.choice(idx, size=min(mb, len(idx)), replace=False)
+                    loss = _gold_nll_vec(model, tok, [pool[int(t)] for t in bi], device).mean()
+                    opt.zero_grad()
+                    loss.backward()
+                    opt.step()
+            else:
+                for _ in range(epochs):
+                    perm = rng.permutation(idx)
+                    for k in range(0, len(perm), mb):
+                        chunk = perm[k:k + mb]
+                        loss = _gold_nll_vec(model, tok, [pool[int(t)] for t in chunk], device).mean()
+                        opt.zero_grad()
+                        loss.backward()
+                        opt.step()
             model.eval()
             val = _target_nll(model, tok, target, device)
             f.write(json.dumps({"subset_id": int(j), "value": val, "metric": "gold_nll",
                                 "higher_is_better": False, "ref_step": ref_step,
-                                "train_steps": train_steps, "lr": lr,
-                                "subset_size": int(idx.size)}) + "\n")
+                                "train_steps": train_steps, "epochs": (None if train_steps else epochs),
+                                "lr": lr, "mb": mb, "subset_size": int(idx.size)}) + "\n")
             f.flush()
             print(f"[nll] subset {j}: target gold-NLL = {val:.5f}")
             del opt
@@ -192,7 +205,7 @@ def run_nll(cfg, ref_step, train_steps, lr, mb, seed, limit=None):
 
 
 # ── variant B: GRPO + held-out accuracy ──────────────────────────────────────
-def run_reward(cfg, ref_step, train_steps, eval_examples, seed, limit=None):
+def run_reward(cfg, ref_step, train_steps, eval_examples, seed, tag, limit=None):
     from influence_rlvr import clear_cache, detect_device, load_adapter_checkpoint
     from trl import GRPOTrainer
     from .train import build_reward_funcs, build_model, make_grpo_config
@@ -213,7 +226,7 @@ def run_reward(cfg, ref_step, train_steps, eval_examples, seed, limit=None):
     target = list(load_if_target_set(cfg))[:eval_examples]
     scratch = _lds_dir(cfg) / "scratch"
     scratch.mkdir(parents=True, exist_ok=True)
-    out = _measured_path(cfg, "reward")
+    out = _measured_path(cfg, "reward", tag)
     done = _done_ids(out)
     todo = [j for j in range(len(subs)) if j not in done]
     if limit:
@@ -268,9 +281,9 @@ def _spearman(a: np.ndarray, b: np.ndarray) -> float:
     return float((ra * rb).sum() / denom) if denom > 0 else 0.0
 
 
-def score(cfg, variant, scores_paths):
+def score(cfg, variant, scores_paths, tag=""):
     subs = np.load(_subsets_path(cfg))
-    rows = [json.loads(l) for l in _measured_path(cfg, variant).read_text().splitlines() if l.strip()]
+    rows = [json.loads(l) for l in _measured_path(cfg, variant, tag).read_text().splitlines() if l.strip()]
     rows.sort(key=lambda r: r["subset_id"])
     ids = [r["subset_id"] for r in rows]
     hib = bool(rows[0]["higher_is_better"])
@@ -299,17 +312,23 @@ def main(argv=None):
     r = sub.add_parser("run")
     r.add_argument("--variant", choices=["nll", "reward"], required=True)
     r.add_argument("--ref-step", type=int, default=10, help="reference checkpoint step (0=base)")
+    r.add_argument("--epochs", type=int, default=3,
+                   help="nll: full-coverage passes over each subset (the matched test)")
     r.add_argument("--train-steps", type=int, default=None,
-                   help="retrain steps per subset (default: nll=16, reward=60)")
+                   help="override epochs with N sampled-minibatch steps (nll diagnostic) "
+                        "or GRPO steps (reward; default 60)")
     r.add_argument("--lr", type=float, default=None, help="default: cfg.learning_rate")
-    r.add_argument("--mb", type=int, default=8, help="nll minibatch size")
+    r.add_argument("--mb", type=int, default=16, help="nll minibatch size")
     r.add_argument("--eval-examples", type=int, default=256, help="reward: target prompts to grade")
     r.add_argument("--seed", type=int, default=0)
+    r.add_argument("--tag", default="", help="suffix for measured_<variant>_<tag>.jsonl "
+                                             "(keep training specs from colliding)")
     r.add_argument("--limit", type=int, default=None, help="process at most N subsets this run")
 
     s = sub.add_parser("score")
     s.add_argument("--variant", choices=["nll", "reward"], required=True)
     s.add_argument("--scores", nargs="+", required=True, help="per-example score .npy file(s)")
+    s.add_argument("--tag", default="", help="measured_<variant>_<tag>.jsonl to score against")
 
     args = p.parse_args(argv)
     cfg = ExperimentConfig.load(Path(args.output_root).expanduser().resolve()
@@ -318,14 +337,15 @@ def main(argv=None):
     if args.cmd == "make-subsets":
         make_subsets(cfg, args.num_subsets, args.alpha, args.seed)
     elif args.cmd == "score":
-        score(cfg, args.variant, args.scores)
+        score(cfg, args.variant, args.scores, args.tag)
     elif args.cmd == "run":
         lr = args.lr if args.lr is not None else cfg.learning_rate
         if args.variant == "nll":
-            run_nll(cfg, args.ref_step, args.train_steps or 16, lr, args.mb, args.seed, args.limit)
+            run_nll(cfg, args.ref_step, args.train_steps, lr, args.mb, args.seed,
+                    args.epochs, args.tag, args.limit)
         else:
             run_reward(cfg, args.ref_step, args.train_steps or 60, args.eval_examples,
-                       args.seed, args.limit)
+                       args.seed, args.tag, args.limit)
 
 
 if __name__ == "__main__":

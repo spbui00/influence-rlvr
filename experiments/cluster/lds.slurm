@@ -30,7 +30,9 @@ source experiments/cluster/env.sh
 VARIANT="${VARIANT:?set VARIANT=nll|reward}"
 RUN_NAME="${RUN_NAME:?set RUN_NAME}"
 REF_STEP="${REF_STEP:-10}"
-TRAIN_STEPS="${TRAIN_STEPS:-}"           # empty -> lds.py default (nll=16, reward=60)
+EPOCHS="${EPOCHS:-3}"                     # nll: full-coverage passes over each subset (matched test)
+TRAIN_STEPS="${TRAIN_STEPS:-}"           # override: N sampled steps (nll diag) / GRPO steps (reward=60)
+TAG="${TAG:-}"                           # measured_<variant>_<tag>.jsonl (separate training specs)
 LIMIT="${LIMIT:-}"                       # cap subsets processed this submission (optional)
 SEED="${SEED:-0}"
 # make-subsets (run once; skipped if the manifest already exists unless MAKE_SUBSETS=1)
@@ -43,6 +45,7 @@ VPORT="${VPORT:-8100}"; VERIFIER_MAX_LEN="${VERIFIER_MAX_LEN:-4096}"
 GENPORT="${GENPORT:-51216}"; GROUPPORT="${GROUPPORT:-$((GENPORT + 1))}"
 
 STEPS_ARG=""; [ -n "$TRAIN_STEPS" ] && STEPS_ARG="--train-steps $TRAIN_STEPS"
+TAG_ARG="";    [ -n "$TAG" ] && TAG_ARG="--tag $TAG"
 LIMIT_ARG="";  [ -n "$LIMIT" ] && LIMIT_ARG="--limit $LIMIT"
 
 # ── subset manifest (deterministic; shared by all variants + methods) ───────────
@@ -57,7 +60,8 @@ if [ "$VARIANT" = "nll" ]; then
     # ── cheap path: single GPU, no servers ──────────────────────────────────────
     echo "================ LDS sweep nll ($RUN_NAME, ref=$REF_STEP) ================"
     CUDA_VISIBLE_DEVICES=0 python -m experiments.lds --run-name "$RUN_NAME" \
-        run --variant nll --ref-step "$REF_STEP" --seed "$SEED" $STEPS_ARG $LIMIT_ARG
+        run --variant nll --ref-step "$REF_STEP" --epochs "$EPOCHS" --seed "$SEED" \
+        $STEPS_ARG $TAG_ARG $LIMIT_ARG
     echo "================ DONE (nll) ================"
     exit 0
 fi
@@ -106,5 +110,5 @@ PY
 
 echo "================ LDS sweep reward ($RUN_NAME, ref=$REF_STEP) ================"
 CUDA_VISIBLE_DEVICES=0 python -m experiments.lds --run-name "$RUN_NAME" \
-    run --variant reward --ref-step "$REF_STEP" --seed "$SEED" $STEPS_ARG $LIMIT_ARG
+    run --variant reward --ref-step "$REF_STEP" --seed "$SEED" $STEPS_ARG $TAG_ARG $LIMIT_ARG
 echo "================ DONE (reward) ================"
