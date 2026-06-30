@@ -94,14 +94,29 @@ the fair baseline-vs-if_prune comparison. Disable with `--no-live-eval`; tune
 
 ```
 experiments/
-  config.py     ExperimentConfig — every knob; --flag per field; JSON save/load
-  data.py       WebInstruct train pool + IF-target set; eval-benchmark registry
-  verifier.py   GeneralVerifier wrapper + TRL reward function
-  influence.py  per-train influence at a checkpoint (reuses collect_checkpoint_infos)
-  train.py      driver: `baseline` and `if_prune` regimes
-  evaluate.py   score a checkpoint on benchmark suites (verifier-judged)
-  cluster/      setup.sh · prefetch.py · train.slurm (baseline + if_prune arms) · eval.slurm
-                bench.slurm / bench_shard.slurm (CG-scoring throughput benchmarks)
+  # core pipeline
+  config.py             ExperimentConfig — every knob; --flag per field; JSON save/load
+  data.py               WebInstruct train pool + IF-target/eval carve; eval-benchmark registry
+  verifier.py           GeneralVerifier wrapper + TRL reward function
+  train.py              driver: `baseline` and `if_prune` regimes
+  live_eval.py          in-training held-out eval callback → live_eval.csv
+  dist_utils.py         multi-GPU sharding helpers for CG scoring (not DDP training)
+  # influence scoring
+  influence.py          per-train influence at a checkpoint (method dispatch + save)
+  influence_scoring.py  gold / tracin-adam / CG / cosine + common-mode-projection internals
+  # analysis & tools
+  evaluate.py           score a checkpoint on benchmark suites (verifier-judged)
+  lds.py                Linear Datamodeling Score: make-subsets · run sweep · score any method
+  rescore_pool.py       re-score a checkpoint's pool with a method variant (for LDS)
+  residualize_scores.py regress influence on answer-format features, keep the residual ranking
+  compare_influence.py  gold vs rollout rank agreement on one checkpoint
+  headroom.py           base-model pass@1 vs pass@k on the target (is there headroom?)
+  analyze_rotation.py   does dynamic re-ranking rotate the kept set or re-pick the same top?
+  plot_curves.py        eval + training-reward curves (stdlib + matplotlib)
+  merge_checkpoint.py   bake a LoRA adapter into base for standalone vLLM serving
+  cluster/              setup.sh · prefetch.py · env.sh · accelerate_ddp.yaml
+                        train.slurm · eval.slurm · cross_eval.slurm · headroom.slurm
+                        compare_influence.slurm · lds.slurm · rescore.slurm
 ```
 
 ## Local smoke (tiny, CPU/1-GPU)
