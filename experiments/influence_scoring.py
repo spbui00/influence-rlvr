@@ -461,8 +461,9 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
             print(f"    target {min(c + B, len(my_targets))}/{len(my_targets)} (rank0): "
                   f"CG {info['status']} in {info['n_iters']} iters "
                   f"(resid={info['final_residual']})")
-    precond = None  # free the D-vector before the memory-heavy scoring backward
     all_reduce_sum_(H)  # each rank filled disjoint rows → SUM assembles full H
+    # NOTE: precond is freed AFTER the common-mode block below — "pool-mean" needs it to match
+    # H's Adam preconditioning on the pool subsample. It's only the [D] (264 MB) vector.
 
     # if_cosine (LESS-style): rank pool examples by DIRECTIONAL alignment, not raw dot. The
     # plain dot ⟨H[j], g_train⟩ scales with |g_train|, so a big-gradient example (e.g. a long
@@ -485,26 +486,58 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
     # example scoring backward leaves too little for activations and OOMs mid-scan; the [1, D]
     # mean (264 MB) is mathematically exact and frees ~67 GB. The saved matrix becomes
     # (1, n_train) — nothing downstream reads the per-target rows (scores = matrix.mean(0)).
-    if cfg.if_project_common_mode and H.shape[0] > 1:
-        # #2 common-mode projection: strip the dominant SHARED direction across targets (the
-        # answer-format / answer-distribution common mode that makes gold influence a format
-        # filter) from the mean tangent, keeping the content-specific component. f̂ = top right
-        # singular vector of H via the Gram trick — eigh of [n_target,n_target] H Hᵀ, so no
-        # [n_target,D] V is ever materialized (same peak as the .mean below). Done here, before
-        # the collapse, so BOTH the dense and JVP scoring paths consume the projected tangent.
-        Hf = H.float()
-        evals, evecs = torch.linalg.eigh(Hf @ Hf.T)        # ascending; [n_target,n_target]
-        f = Hf.T @ evecs[:, -1]                            # top singular direction [D]
+    def _project_out(h_bar, f, label):
+        """Remove the unit common-mode direction f from the [1,D] mean tangent h_bar, with a
+        cos(f, h_bar) diagnostic — cos≈1 means f ∥ h_bar so the projection guts the tangent
+        (degenerate; prefer a pool-mean f that is NOT parallel to the target mean)."""
         f = f / f.norm().clamp(min=1e-12)
-        h_bar = Hf.mean(dim=0, keepdim=True)
-        h_bar = h_bar - (h_bar @ f).unsqueeze(-1) * f.unsqueeze(0)   # remove ⟨h_bar,f̂⟩f̂
-        H = h_bar.to(H.dtype)
+        n0 = float(h_bar.norm().clamp(min=1e-12))
+        cos = float((h_bar @ f).squeeze() / n0)
+        h_bar = h_bar - (h_bar @ f).unsqueeze(-1) * f.unsqueeze(0)
+        n1 = float(h_bar.norm())
+        if main:
+            print(f"  [common-mode/{label}] cos(f̂,h_bar)={cos:+.3f}  "
+                  f"|h_bar| {n0:.3g}→{n1:.3g} ({100*n1/n0:.0f}% retained — low ⇒ f̂∥h_bar, degenerate)")
+        return h_bar
+
+    if cfg.if_common_mode == "top-pc" and H.shape[0] > 1:
+        # f̂ = top singular vector of H via the Gram trick (eigh of [n_target,n_target] H Hᵀ —
+        # no [n_target,D] V materialized). No backward, so safe while the full H is resident.
+        Hf = H.float()
+        evals, evecs = torch.linalg.eigh(Hf @ Hf.T)        # ascending eigenvalues
+        f = Hf.T @ evecs[:, -1]                             # top singular direction [D]
         if main:
             frac = float(evals[-1] / evals.clamp(min=0).sum().clamp(min=1e-12))
-            print(f"  [project-common-mode] removed top PC of H "
-                  f"({100*frac:.1f}% of target-gradient variance)")
+            print(f"  [common-mode/top-pc] top PC = {100*frac:.1f}% of target-gradient energy")
+        H = _project_out(Hf.mean(dim=0, keepdim=True), f, "top-pc").to(H.dtype)
+    elif cfg.if_common_mode == "pool-mean" and is_gold:
+        # f̂ = mean preconditioned (cosine-matched) gold gradient over a random pool subsample
+        # = the generic format direction, NOT parallel to the physics-target mean. Needs a grad
+        # backward, so collapse H to [1,D] FIRST (frees the 67 GB [n_target,D]); precond is kept
+        # alive past the loop for exactly this. Sharded across ranks + summed, like H.
+        h_bar = H.mean(dim=0, keepdim=True)
+        del H
+        rng = np.random.default_rng(cfg.seed + 777)
+        k = min(cfg.if_common_mode_sample, len(train_pool))
+        sample = [int(i) for i in rng.choice(len(train_pool), size=k, replace=False)]
+        mine = sample[rank::world]
+        acc = torch.zeros(D, device=device, dtype=torch.float32)
+        for c in range(0, len(mine), B):
+            chunk = [train_pool[i] for i in mine[c:c + B]]
+            for g in _example_sft_grads_batch(model, tokenizer, chunk, cfg=cfg, device=device):
+                gp = g.to(device).float()
+                if precond is not None:
+                    gp = gp * precond                       # match H's Adam preconditioning
+                if cfg.if_cosine:
+                    gp = gp / gp.norm().clamp(min=1e-12)     # match H's per-row cosine norm
+                acc += gp
+        all_reduce_sum_(acc)
+        if main:
+            print(f"  [common-mode/pool-mean] format direction from {k} pool examples")
+        H = _project_out(h_bar.float(), acc, "pool-mean").to(h_bar.dtype)
     else:
         H = H.mean(dim=0, keepdim=True)
+    precond = None  # now safe to free the [D] preconditioner before the scoring backward
 
     # Release the FVP + flush the CG double-backward graphs before the (memory-heavy,
     # full-vocab-logit) scoring backward. Also re-enable gradient checkpointing: the

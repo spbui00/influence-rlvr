@@ -10,8 +10,10 @@ tracin-adam is read from the checkpoint's optimizer.pt on disk.
 
   # #2 common-mode projection re-score at the same checkpoint the gold scores used:
   python -m experiments.rescore_pool --run-name xdomain_phys_gold_c \
-      --checkpoint-step 10 --if-project-common-mode --tag proj
-  # -> outputs/xdomain_phys_gold_c/influence/proj_step10/tracin_adam_if_scores_step10.npy
+      --checkpoint-step 10 --if-common-mode top-pc --tag proj_toppc
+  python -m experiments.rescore_pool --run-name xdomain_phys_gold_c \
+      --checkpoint-step 10 --if-common-mode pool-mean --tag proj_poolmean
+  # -> outputs/xdomain_phys_gold_c/influence/<tag>_step10/tracin_adam_if_scores_step10.npy
 """
 import argparse
 from pathlib import Path
@@ -28,8 +30,8 @@ def main(argv=None):
     p.add_argument("--checkpoint-step", type=int, required=True)
     p.add_argument("--tag", default="rescore", help="sub-dir name: influence/<tag>_step<N>/")
     # variant overrides (only these differ from the saved config)
-    p.add_argument("--if-project-common-mode", action="store_true",
-                   help="strip the top-PC (format common mode) of H before collapsing")
+    p.add_argument("--if-common-mode", choices=["top-pc", "pool-mean"], default=None,
+                   help="strip a format common-mode direction before collapsing H")
     p.add_argument("--if-method", default=None, help="override cfg.if_method (e.g. cg)")
     p.add_argument("--if-grad", default=None, choices=["gold", "rollout"],
                    help="override cfg.if_grad (rollout needs a gen server — gold is serverless)")
@@ -42,8 +44,8 @@ def main(argv=None):
 
     cfg = ExperimentConfig.load(Path(args.output_root).expanduser().resolve()
                                 / args.run_name / "config.json")
-    if args.if_project_common_mode:
-        cfg.if_project_common_mode = True
+    if args.if_common_mode:
+        cfg.if_common_mode = args.if_common_mode
     if args.if_method:
         cfg.if_method = args.if_method
     if args.if_grad:
@@ -63,7 +65,7 @@ def main(argv=None):
     save_dir = cfg.run_dir / "influence" / f"{args.tag}_step{args.checkpoint_step}"
     print(f"[rescore] {args.run_name} ckpt-{args.checkpoint_step} | method={cfg.if_method} "
           f"grad={cfg.if_grad} cosine={cfg.if_cosine} "
-          f"project_common_mode={cfg.if_project_common_mode}")
+          f"common_mode={cfg.if_common_mode or 'off'}")
     print(f"[rescore] pool={len(pool)} target={len(target)} -> {save_dir}")
     compute_pool_influence(cfg, model, tok, pool, target, device,
                            checkpoint_step=args.checkpoint_step, save_dir=save_dir)
