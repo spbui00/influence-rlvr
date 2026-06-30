@@ -292,6 +292,13 @@ class ExperimentConfig:
     # regardless of target-direction (a physics target selected mostly Economics). Cosine
     # strips magnitude → selects by direction. Reverse-mode only (JVP can't get |g_train|).
     if_cosine: bool = False
+    # if_project_common_mode: before collapsing the target gradients to their mean tangent,
+    # remove the top principal direction of H (the SHARED "common mode" across targets — for
+    # a short-answer gold target this is the answer-format / answer-distribution direction
+    # that makes the influence a format filter). Scores then rank by the CONTENT-specific
+    # component (alignment with what makes THIS target right beyond generic format). Gram-trick
+    # (eigh of H Hᵀ, [n_target,n_target]) so no [n_target,D] V is materialized. CLUSTER-VALIDATE.
+    if_project_common_mode: bool = False
     # Logits microbatch for the per-token-logp forward during scoring. The lm_head
     # materializes (micro_batch × seq × vocab≈152k) logits — the dominant memory
     # spike in the scoring backward. 1 = one sequence's logits at a time (minimum

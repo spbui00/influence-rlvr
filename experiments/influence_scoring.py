@@ -485,7 +485,26 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
     # example scoring backward leaves too little for activations and OOMs mid-scan; the [1, D]
     # mean (264 MB) is mathematically exact and frees ~67 GB. The saved matrix becomes
     # (1, n_train) — nothing downstream reads the per-target rows (scores = matrix.mean(0)).
-    H = H.mean(dim=0, keepdim=True)
+    if cfg.if_project_common_mode and H.shape[0] > 1:
+        # #2 common-mode projection: strip the dominant SHARED direction across targets (the
+        # answer-format / answer-distribution common mode that makes gold influence a format
+        # filter) from the mean tangent, keeping the content-specific component. f̂ = top right
+        # singular vector of H via the Gram trick — eigh of [n_target,n_target] H Hᵀ, so no
+        # [n_target,D] V is ever materialized (same peak as the .mean below). Done here, before
+        # the collapse, so BOTH the dense and JVP scoring paths consume the projected tangent.
+        Hf = H.float()
+        evals, evecs = torch.linalg.eigh(Hf @ Hf.T)        # ascending; [n_target,n_target]
+        f = Hf.T @ evecs[:, -1]                            # top singular direction [D]
+        f = f / f.norm().clamp(min=1e-12)
+        h_bar = Hf.mean(dim=0, keepdim=True)
+        h_bar = h_bar - (h_bar @ f).unsqueeze(-1) * f.unsqueeze(0)   # remove ⟨h_bar,f̂⟩f̂
+        H = h_bar.to(H.dtype)
+        if main:
+            frac = float(evals[-1] / evals.clamp(min=0).sum().clamp(min=1e-12))
+            print(f"  [project-common-mode] removed top PC of H "
+                  f"({100*frac:.1f}% of target-gradient variance)")
+    else:
+        H = H.mean(dim=0, keepdim=True)
 
     # Release the FVP + flush the CG double-backward graphs before the (memory-heavy,
     # full-vocab-logit) scoring backward. Also re-enable gradient checkpointing: the
