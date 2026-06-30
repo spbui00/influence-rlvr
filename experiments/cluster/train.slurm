@@ -132,6 +132,10 @@ IF_MAX_NEW_TOKENS="${IF_MAX_NEW_TOKENS:-1024}"
 # style) — strips |g_train| magnitude bias so a physics target stops selecting big-gradient
 # Economics.
 IF_COSINE="${IF_COSINE:-0}"
+# IF_COMMON_MODE: strip a format common-mode direction from the target tangent before
+# scoring (""=off | top-pc | pool-mean). pool-mean removes the GENERIC pool format
+# direction (keeps physics structure); top-pc is ≈degenerate when format dominates.
+IF_COMMON_MODE="${IF_COMMON_MODE:-}"
 IF_ARGS=""
 if [ "$REGIME" = "if_prune" ]; then
     # CG-only flags are ignored by dot/tracin-adam.
@@ -142,6 +146,7 @@ if [ "$REGIME" = "if_prune" ]; then
     [ "$IF_VLLM_GEN" = "1" ] && IF_ARGS="$IF_ARGS --if-vllm-gen --if-vllm-gpu-util $IF_VLLM_GPU_UTIL"
     [ "$SHUFFLE_KEPT" = "0" ] && IF_ARGS="$IF_ARGS --no-if-shuffle-kept"
     [ "$IF_COSINE" = "1" ] && IF_ARGS="$IF_ARGS --if-cosine"
+    [ -n "$IF_COMMON_MODE" ] && IF_ARGS="$IF_ARGS --if-common-mode $IF_COMMON_MODE"
 fi
 # RESUME=1 continues from the latest checkpoint under outputs/$RUN_NAME (same
 # RUN_NAME) — use it to recover a time-limit kill, or to extend max-steps later.
