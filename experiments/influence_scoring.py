@@ -334,10 +334,14 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
         Hf = H.float()
         evals, evecs = torch.linalg.eigh(Hf @ Hf.T)        # ascending eigenvalues
         f = Hf.T @ evecs[:, -1]                             # top singular direction [D]
+        h_bar = Hf.mean(dim=0, keepdim=True)
+        del Hf, H                                           # free the [n_target, D] (Hf aliases H
+        #   when fp32) BEFORE the scoring loop — else 67 GB stays resident and the scan OOMs.
         if main:
             frac = float(evals[-1] / evals.clamp(min=0).sum().clamp(min=1e-12))
             print(f"  [common-mode/top-pc] top PC = {100*frac:.1f}% of target-gradient energy")
-        H = _project_out(Hf.mean(dim=0, keepdim=True), f, "top-pc").to(H.dtype)
+        H = _project_out(h_bar, f, "top-pc")
+        del f, h_bar
     elif cfg.if_common_mode == "pool-mean" and is_gold:
         # f̂ = mean preconditioned (cosine-matched) gold gradient over a random pool subsample
         # = the generic format direction, NOT parallel to the physics-target mean. Needs a grad
