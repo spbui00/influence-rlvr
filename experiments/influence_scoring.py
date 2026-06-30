@@ -189,178 +189,6 @@ def _build_empirical_fvp(cfg, model, tokenizer, train_pool, device, backend, vll
     return policy_fisher_fvp_from_grad_cache(grad_cache, prob_cache)
 
 
-def _spearman_jvp(a, b) -> float:
-    a = np.asarray(a, dtype=np.float64); b = np.asarray(b, dtype=np.float64)
-    ra = np.argsort(np.argsort(a)).astype(np.float64)
-    rb = np.argsort(np.argsort(b)).astype(np.float64)
-    ra -= ra.mean(); rb -= rb.mean()
-    den = float(np.sqrt((ra * ra).sum() * (rb * rb).sum()))
-    return float((ra * rb).sum() / den) if den > 0 else float("nan")
-
-
-_JVP_ASSERTED = False  # run the JVP-vs-dot correctness gate once per process
-
-
-def _run_jvp_pool(cfg, live_model, tokenizer, train_pool, my_pool, H, *,
-                  checkpoint_step, device, D, main, t0):
-    """Forward-mode (JVP) pool scoring for if_grad=gold. Loads a FRESH fp32 model from the
-    checkpoint, builds the fixed tangent h_bar = H.mean(0) — which equals P⊙ḡ_target exactly
-    for any assembled-H operator (P is target-independent, so it factors out of the target
-    mean) — and scores prompts as score(z)=⟨∇L(z),h_bar⟩ via BATCHED fp32 forward-mode passes
-    (if_score_batch prompts share one pass; the shared tangent makes per-example scores fall
-    out of a single forward-mode sweep — the batching the per-example backward can't do). No
-    backward, no D-vector. Returns a (1, n_train) matrix with THIS rank's columns filled
-    (disjoint), to flow through the shared all_reduce + mean tail unchanged.
-
-    fp32 + eager attention because bf16/fused-kernel forward-mode AD is buggy through Qwen3
-    RMSNorm. The live bf16 model is NEVER touched (run_if_prune resumes it next window)."""
-    global _JVP_ASSERTED
-    from peft import PeftModel
-    from torch.func import grad as func_grad
-    from torch.func import jvp as func_jvp
-    from transformers import AutoModelForCausalLM
-
-    ckpt_dir = cfg.grpo_output_dir / f"checkpoint-{checkpoint_step}"
-    if not (ckpt_dir / "adapter_model.safetensors").is_file() and not (ckpt_dir / "adapter_model.bin").is_file():
-        raise FileNotFoundError(
-            f"if_jvp needs the on-disk LoRA adapter at {ckpt_dir} (the reverse-mode path "
-            f"uses the in-memory model; JVP loads a fresh fp32 copy from disk).")
-    base = AutoModelForCausalLM.from_pretrained(
-        cfg.model_id, dtype=torch.float32, attn_implementation="eager").to(device)
-    base.config.use_cache = False
-    jmodel = PeftModel.from_pretrained(base, str(ckpt_dir), is_trainable=True).to(device)
-    jmodel.eval()  # NOTE: do NOT enable gradient checkpointing (breaks functional_call + JVP)
-
-    names = tuple(n for n, p in jmodel.named_parameters() if p.requires_grad)
-    live_names = tuple(n for n, p in live_model.named_parameters() if p.requires_grad)
-    if names != live_names:
-        raise RuntimeError("if_jvp: fp32 model trainable-param order != live model — "
-                           "H (built on the live model) would misalign with the JVP tangent.")
-    ptuple = tuple(jmodel.get_parameter(n).detach() for n in names)
-    if sum(p.numel() for p in ptuple) != D:
-        raise RuntimeError(f"if_jvp: param count {sum(p.numel() for p in ptuple)} != D={D}.")
-
-    # h_bar = H.mean(0): the collapsed fixed tangent. H[j] already holds the per-target
-    # operator output (dot: g_test; tracin-adam: P⊙g_test; cg: (F+λI)⁻¹g_test), all fp32,
-    # so mean-over-targets == the exact direction the per-target scores average to.
-    h_bar = H.mean(dim=0).to(device=device, dtype=torch.float32)
-    h_tan, off = [], 0
-    for n in names:
-        num = jmodel.get_parameter(n).numel()
-        h_tan.append(h_bar[off:off + num].view_as(jmodel.get_parameter(n))); off += num
-    h_tan = tuple(h_tan)
-
-    eos = tokenizer.eos_token_id
-    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos
-
-    def _enc_single(sample):  # for the per-example reverse-mode REFERENCE in the assert
-        _, p_ids, p_am = tokenize_prompts_batch(tokenizer, [sample["prompt"]], device)
-        gold = str(sample.get("solution", "") or "")
-        c = tokenizer(f"\\boxed{{{gold}}}", add_special_tokens=False,
-                      return_tensors="pt")["input_ids"].to(device)
-        if eos is not None:
-            c = torch.cat([c, torch.full((1, 1), int(eos), device=device, dtype=c.dtype)], dim=1)
-        return p_ids[0], p_am[0], c, torch.ones_like(c)
-
-    def loss_single(pt, p_ids, p_am, c, cm):  # == compute_sft_gradient_batch's per-example loss
-        sd = _state_dict_for_functional(jmodel, pt, names)
-        ptl = _forward_per_token_logps_functional(jmodel, sd, p_ids, p_am, c, cm)
-        return -(ptl * cm).sum() / cm.sum().clamp(min=1)
-
-    def encode_batch(samples):
-        """Right-pad B (prompt+\\boxed{gold}+eos) sequences → input_ids/attn/comp_mask [B,L].
-        Prompt tokenization matches _enc_single (same tokenize_prompts_batch render)."""
-        rows = []
-        for s in samples:
-            _, p_ids, _ = tokenize_prompts_batch(tokenizer, [s["prompt"]], device)
-            p = p_ids[0].tolist()
-            gold = str(s.get("solution", "") or "")
-            c = tokenizer(f"\\boxed{{{gold}}}", add_special_tokens=False)["input_ids"]
-            if eos is not None:
-                c = c + [int(eos)]
-            rows.append((p, c))
-        L = max(len(p) + len(c) for p, c in rows)
-        B = len(rows)
-        input_ids = torch.full((B, L), int(pad_id), dtype=torch.long, device=device)
-        attn = torch.zeros((B, L), dtype=torch.long, device=device)
-        cmask = torch.zeros((B, L), dtype=torch.long, device=device)
-        for bi, (p, c) in enumerate(rows):
-            seq = p + c
-            input_ids[bi, :len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
-            attn[bi, :len(seq)] = 1
-            cmask[bi, len(p):len(seq)] = 1
-        return input_ids, attn, cmask
-
-    def jvp_scores_batch(samples):
-        """B influence scores from ONE forward-mode pass: jvp of the per-example NLL vector
-        [B] with the shared tangent h_tan → the [B] directional derivatives ⟨∇L_i, h⟩."""
-        enc = encode_batch(samples)
-        def f(pt):
-            sd = _state_dict_for_functional(jmodel, pt, names)
-            return gold_nll_per_example_functional(jmodel, sd, *enc)
-        return func_jvp(f, (ptuple,), (h_tan,))[1]  # [B]
-
-    # Batched forward-mode scoring: JB prompts per forward-mode pass (the throughput win the
-    # per-example backward can't get). JB bounds the [JB × L × vocab] logits tensor (fp32,
-    # ~doubled by forward-mode) — its OWN memory knob (if_jvp_batch), NOT if_score_batch
-    # (which sizes rollout generation, a different/lighter profile).
-    JB = max(1, cfg.if_jvp_batch)
-
-    # First-call gate (rank0, once/process): BATCHED-JVP vs per-example reverse-mode dot on
-    # the SAME fp32 model → validates the JVP recipe AND the batched padding/masking. Raise,
-    # never silently fall back: a misalignment yields finite-but-wrong scores with no error.
-    # Score jref in JB-sized chunks so the gate never spikes past the production batch memory.
-    if main and not _JVP_ASSERTED:
-        grad_of = func_grad(loss_single, argnums=0)
-        K = min(16, len(my_pool))
-        kids = my_pool[:K]
-        dref = []
-        for i in kids:
-            g = grad_of(ptuple, *_enc_single(train_pool[i]))
-            dref.append(float(sum((gi * hi).sum() for gi, hi in zip(g, h_tan))))
-        jref = []
-        for c in range(0, len(kids), JB):
-            jref.extend(float(x) for x in
-                        jvp_scores_batch([train_pool[i] for i in kids[c:c + JB]]))
-        rho = _spearman_jvp(dref, jref)
-        mrel = max(abs(a - b) / (abs(a) + 1e-12) for a, b in zip(dref, jref)) if dref else 0.0
-        # SELECTION only uses the RANKING → Spearman is the real gate (a param-order / loss
-        # bug scrambles it to ≪1). max_rel is a loose sanity bound: the batched logsumexp +
-        # the Adam P's huge dynamic range (~1e3-1e8) push fp32 roundoff to ~1e-3 even when
-        # ranking is perfect, so 1e-2 (10× margin) — NOT 1e-3 — is the right ceiling.
-        if not (rho > 0.999 and mrel < 1e-2):
-            raise RuntimeError(
-                f"if_jvp correctness assert FAILED: Spearman={rho:.5f} max_rel={mrel:.2e} "
-                f"(need >0.999 / <1e-2) — batched-JVP scores != reverse-mode dot. "
-                f"dref={dref[:4]} jref={jref[:4]}")
-        print(f"  [if_jvp] correctness gate PASS (K={K}, JB={JB}, Spearman={rho:.5f}, "
-              f"max_rel={mrel:.1e})")
-    _JVP_ASSERTED = True
-
-    matrix = np.zeros((1, len(train_pool)), dtype=np.float64)
-    next_log = 50
-    for c in range(0, len(my_pool), JB):
-        pids = my_pool[c:c + JB]
-        try:
-            jvec = jvp_scores_batch([train_pool[i] for i in pids])
-        except Exception as e:
-            raise RuntimeError(
-                f"if_jvp forward-mode failed on pool chunk @{pids[0]}: {type(e).__name__}: {e} "
-                f"— forward-mode AD needs eager attention (set) and fp32 (set).") from e
-        for k, i in enumerate(pids):
-            matrix[0, i] = float(jvec[k])
-        done = min(c + JB, len(my_pool))
-        if main and (done >= next_log or done == len(my_pool)):
-            print(f"    rank0 jvp-scored {done}/{len(my_pool)} ({time.time() - t0:.1f}s)")
-            next_log = ((done // 50) + 1) * 50
-
-    del jmodel, base
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    return matrix
-
-
 # ── Shared CG solve + streamed scoring ──────────────────────────────────────
 def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
             tag, checkpoint_step, save_dir):
@@ -554,51 +382,39 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
 
     n_train = len(train_pool)
     my_pool = list(range(rank, n_train, world))
-    # if_jvp (gold only): replace the per-example backward+dot with one fp32 forward-mode
-    # pass per prompt against the collapsed tangent H.mean(0). Produces a (1,n_train) matrix
-    # (matrix.mean(0)==scores still holds) that flows through the same all_reduce + save tail.
-    use_jvp = cfg.if_jvp and is_gold and not cfg.if_cosine  # cosine needs |g_train| (JVP skips it)
     t0 = time.time()
-    if use_jvp:
-        if main:
-            print(f"  [{cfg.if_method}/{cfg.if_grad}] JVP pool scoring (fp32 forward-mode, "
-                  f"no backward) — {n_train} prompts ({len(my_pool)}/rank × {world} ranks)...")
-        matrix = _run_jvp_pool(cfg, model, tokenizer, train_pool, my_pool, H,
-                               checkpoint_step=checkpoint_step, device=device, D=D,
-                               main=main, t0=t0)
-    else:
-        if main:
-            gen_label = "none/gold-SFT" if is_gold else backend.name
-            print(f"  [{cfg.if_method}/{cfg.if_grad}] scoring {n_train} train prompts "
-                  f"({len(my_pool)}/rank × {world} ranks, batch={B}, gen={gen_label})...")
-        matrix = np.zeros((H.shape[0], n_train), dtype=np.float64)  # H collapsed → (1, n_train)
-        next_log = 50
-        n_skip = 0  # saturated prompts (zero reward variance): rollout grad is exactly 0 → score 0
-        for c in range(0, len(my_pool), B):
-            pids = my_pool[c : c + B]
-            chunk = [train_pool[i] for i in pids]
-            grads = (
-                _example_sft_grads_batch(model, tokenizer, chunk, cfg=cfg, device=device)
-                if is_gold else _example_grads_batch(
-                    model, tokenizer, chunk, builder,
-                    objective_mode=GradientObjective.GRPO_TRAIN, cfg=cfg,
-                    device=device, backend=backend, vllm_cfg=vllm_cfg,
-                    seed=cfg.seed + 20_000 + pids[0], skip_zero_variance_grad=True,
-                )
+    if main:
+        gen_label = "none/gold-SFT" if is_gold else backend.name
+        print(f"  [{cfg.if_method}/{cfg.if_grad}] scoring {n_train} train prompts "
+              f"({len(my_pool)}/rank × {world} ranks, batch={B}, gen={gen_label})...")
+    matrix = np.zeros((H.shape[0], n_train), dtype=np.float64)  # H collapsed → (1, n_train)
+    next_log = 50
+    n_skip = 0  # saturated prompts (zero reward variance): rollout grad is exactly 0 → score 0
+    for c in range(0, len(my_pool), B):
+        pids = my_pool[c : c + B]
+        chunk = [train_pool[i] for i in pids]
+        grads = (
+            _example_sft_grads_batch(model, tokenizer, chunk, cfg=cfg, device=device)
+            if is_gold else _example_grads_batch(
+                model, tokenizer, chunk, builder,
+                objective_mode=GradientObjective.GRPO_TRAIN, cfg=cfg,
+                device=device, backend=backend, vllm_cfg=vllm_cfg,
+                seed=cfg.seed + 20_000 + pids[0], skip_zero_variance_grad=True,
             )
-            for i, g_train in zip(pids, grads):
-                if g_train is None:  # saturated: backward skipped, influence exactly 0 (matrix stays 0)
-                    n_skip += 1
-                    continue
-                gt = g_train.to(H.device)
-                if cfg.if_cosine:  # unit-normalize → ⟨H[j], g_train/|g_train|⟩ = cosine
-                    gt = gt / gt.norm().clamp(min=1e-12)
-                matrix[:, i] = (H @ gt).detach().cpu().numpy()
-            done = min(c + B, len(my_pool))
-            if main and (done >= next_log or done == len(my_pool)):
-                print(f"    rank0 scored {done}/{len(my_pool)} ({time.time() - t0:.1f}s, "
-                      f"{n_skip} saturated-skipped)")
-                next_log = ((done // 50) + 1) * 50
+        )
+        for i, g_train in zip(pids, grads):
+            if g_train is None:  # saturated: backward skipped, influence exactly 0 (matrix stays 0)
+                n_skip += 1
+                continue
+            gt = g_train.to(H.device)
+            if cfg.if_cosine:  # unit-normalize → ⟨H[j], g_train/|g_train|⟩ = cosine
+                gt = gt / gt.norm().clamp(min=1e-12)
+            matrix[:, i] = (H @ gt).detach().cpu().numpy()
+        done = min(c + B, len(my_pool))
+        if main and (done >= next_log or done == len(my_pool)):
+            print(f"    rank0 scored {done}/{len(my_pool)} ({time.time() - t0:.1f}s, "
+                  f"{n_skip} saturated-skipped)")
+            next_log = ((done // 50) + 1) * 50
 
     if world > 1:  # each rank filled disjoint columns → SUM assembles the full matrix
         mt = torch.from_numpy(matrix).to(device)

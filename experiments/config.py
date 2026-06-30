@@ -273,24 +273,10 @@ class ExperimentConfig:
     # tokens), so this is a pure speedup, no quality change.
     if_vllm_gen: bool = False
     if_vllm_gpu_util: float = 0.3
-    # Forward-mode (JVP) pool scoring for if_grad=gold ONLY. Replaces the per-example
-    # backward+dot with ONE fp32 eager-attn forward carrying the fixed tangent
-    # h_bar = H.mean(0) (= P⊙ḡ_target), so score(z)=⟨∇L(z),h_bar⟩ comes out directly —
-    # no backward, no 34.8M-D gradient vector. Same ranking (validated Spearman≈1, incl.
-    # the Adam-preconditioned operator). Loads a fresh fp32 model from checkpoint-{step}
-    # (~2× base GPU mem per rank) since bf16 forward-mode AD is buggy through Qwen3 norms.
-    # Errors unless if_grad=gold (rollout needs generation → no fixed differentiable loss).
-    if_jvp: bool = False
-    # Prompts per forward-mode pass in the JVP scorer. Bounds the [batch × seq × vocab≈152k]
-    # logits tensor (fp32, ~doubled by the forward-mode tangent) — a DIFFERENT, much heavier
-    # memory profile than if_score_batch (which sizes rollout GENERATION). Keep modest: 8 ≈
-    # 10 GB logits at seq 1024; raise on an 80 GB H100, lower on a 48 GB L40S. Also caps the
-    # first-call correctness gate's batch so it never OOMs past the production batch.
-    if_jvp_batch: int = 8
     # if_cosine: rank pool examples by COSINE alignment to the target instead of the raw dot
     # (LESS-style). The raw dot scales with |g_train|, so large-gradient examples dominate
     # regardless of target-direction (a physics target selected mostly Economics). Cosine
-    # strips magnitude → selects by direction. Reverse-mode only (JVP can't get |g_train|).
+    # strips magnitude → selects by direction.
     if_cosine: bool = False
     # if_common_mode: before collapsing the target gradients to their mean tangent, remove a
     # "common mode" direction (the answer-format / answer-distribution direction that makes a
@@ -384,18 +370,6 @@ class ExperimentConfig:
             )
         if self.if_grad not in ("rollout", "gold"):
             raise ValueError(f"if_grad must be rollout|gold, got {self.if_grad!r}")
-        if self.if_cosine and self.if_jvp:
-            raise ValueError(
-                "if_cosine + if_jvp are incompatible: cosine needs each pool example's "
-                "gradient NORM |g_train|, which the forward-mode JVP path never materializes. "
-                "Use reverse-mode (drop --if-jvp) with --if-cosine."
-            )
-        if self.if_jvp and self.if_grad != "gold":
-            raise ValueError(
-                "if_jvp requires if_grad=gold (forward-mode JVP scores the SFT gold "
-                "gradient; rollout gradients need generation, so there is no fixed "
-                "differentiable loss to take the directional derivative of)."
-            )
 
     # ── Derived paths ───────────────────────────────────────────────────────
     @property

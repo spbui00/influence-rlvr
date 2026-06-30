@@ -268,7 +268,7 @@ def _assert_resume_compatible(cfg) -> None:
         # which examples get selected or the training trajectory, so they may differ
         # on resume. (if_method/if_grad/if_recompute_every DO affect selection — kept.)
         "if_score_batch", "if_logps_micro_batch", "if_vllm_gen", "if_vllm_gpu_util",
-        "if_jvp", "if_jvp_batch", "ddp_timeout",
+        "ddp_timeout",
     }
     diffs = {k: (saved[k], current[k]) for k in current
              if k in saved and k not in may_differ and saved[k] != current[k]}
