@@ -14,16 +14,13 @@ from influence_rlvr.fisher_fvp import FisherRow, build_policy_fisher_fvp
 from influence_rlvr.generation import generate_rollout_batch
 from influence_rlvr.gradients import (
     _compute_per_token_logps,
-    _forward_per_token_logps_functional,
     _grad_vector_from_scalar,
-    _state_dict_for_functional,
     compute_policy_gradient_bundle,
     compute_policy_gradient_bundle_batch,
     compute_sft_gradient_batch,
-    gold_nll_per_example_functional,
 )
 from influence_rlvr.modes import GenerationBackend, GradientObjective, VLLMConfig
-from influence_rlvr.utils import tokenize_prompt, tokenize_prompts_batch
+from influence_rlvr.utils import tokenize_prompt
 
 from .config import ExperimentConfig
 from .dist_utils import all_reduce_sum_, dist_info
