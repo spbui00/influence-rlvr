@@ -37,6 +37,9 @@ def main(argv=None):
                    help="override cfg.if_grad (rollout needs a gen server — gold is serverless)")
     p.add_argument("--if-cosine", dest="if_cosine", action="store_true", default=None)
     p.add_argument("--no-if-cosine", dest="if_cosine", action="store_false")
+    p.add_argument("--if-target-matrix-rows", type=int, default=None,
+                   help="also save [T, n_train] per-target-example influence rows "
+                        "(TRAK-style per-example LDS); 0/unset = collapsed matrix only")
     args = p.parse_args(argv)
 
     from influence_rlvr import detect_device, load_adapter_checkpoint
@@ -52,6 +55,8 @@ def main(argv=None):
         cfg.if_grad = args.if_grad
     if args.if_cosine is not None:
         cfg.if_cosine = args.if_cosine
+    if args.if_target_matrix_rows is not None:
+        cfg.if_target_matrix_rows = args.if_target_matrix_rows
 
     device = detect_device()
     model, tok = build_model(cfg, device)

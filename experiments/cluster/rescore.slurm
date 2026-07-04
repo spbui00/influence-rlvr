@@ -24,11 +24,13 @@ TAG="${TAG:-rescore}"
 COMMON_MODE="${COMMON_MODE:-}"           # "" | top-pc | pool-mean
 IF_METHOD="${IF_METHOD:-}"               # optional override (else run's saved method)
 IF_GRAD="${IF_GRAD:-}"                   # optional override (gold = serverless)
+TARGET_ROWS="${TARGET_ROWS:-}"           # save [T, n_train] per-target rows (per-example LDS)
 
 ARGS="--run-name $RUN_NAME --checkpoint-step $CKPT --tag $TAG"
 [ -n "$COMMON_MODE" ] && ARGS="$ARGS --if-common-mode $COMMON_MODE"
 [ -n "$IF_METHOD" ] && ARGS="$ARGS --if-method $IF_METHOD"
 [ -n "$IF_GRAD" ] && ARGS="$ARGS --if-grad $IF_GRAD"
+[ -n "$TARGET_ROWS" ] && ARGS="$ARGS --if-target-matrix-rows $TARGET_ROWS"
 
 echo "GPU state at launch:"; nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv,noheader || true
 echo "================ RESCORE ($RUN_NAME ckpt-$CKPT tag=$TAG common_mode=${COMMON_MODE:-off}) ================"

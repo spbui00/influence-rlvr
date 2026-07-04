@@ -291,6 +291,12 @@ class ExperimentConfig:
     #              pass (done AFTER H collapses, to avoid OOM); gold only. CLUSTER-VALIDATE.
     if_common_mode: str = ""
     if_common_mode_sample: int = 256   # pool-mean: #pool examples for the format-direction estimate
+    # if_target_matrix_rows: ALSO save per-target-example influence rows ([T, n_train],
+    # TRAK-style per-example LDS needs them). T evenly-spaced target rows are kept in bf16
+    # through the pool scan (T × D — 64 rows ≈ 8.5 GB on a 4B model; the full fp32
+    # [n_target, D] would be ~67 GB, which is why the default pipeline collapses to the
+    # mean). 0 = off (collapsed (1, n_train) matrix only, exactly as before).
+    if_target_matrix_rows: int = 0
     # Logits microbatch for the per-token-logp forward during scoring. The lm_head
     # materializes (micro_batch × seq × vocab≈152k) logits — the dominant memory
     # spike in the scoring backward. 1 = one sequence's logits at a time (minimum

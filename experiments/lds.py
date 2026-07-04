@@ -159,14 +159,15 @@ def _gold_nll_vec(model, tokenizer, samples, device):
 
 
 def _target_nll(model, tokenizer, target, device, batch=16):
+    """-> (mean, per-example list) gold-NLL over the target set. The per-example
+    vector enables TRAK-style per-example LDS (Spearman per target, then average)."""
     import torch
-    tot, n = 0.0, 0
+    vals: list[float] = []
     with torch.no_grad():
         for i in range(0, len(target), batch):
             v = _gold_nll_vec(model, tokenizer, target[i:i + batch], device)
-            tot += float(v.sum())
-            n += int(v.numel())
-    return tot / max(n, 1)
+            vals.extend(float(x) for x in v)
+    return sum(vals) / max(len(vals), 1), vals
 
 
 def _snapshot(model):
@@ -232,12 +233,13 @@ def run_nll(cfg, ref_step, train_steps, lr, mb, seed, epochs, tag, limit=None, s
                         loss.backward()
                         opt.step()
             model.eval()
-            val = _target_nll(model, tok, target, device)
+            val, per_ex = _target_nll(model, tok, target, device)
             f.write(json.dumps({"subset_id": int(j), "value": val, "metric": "gold_nll",
                                 "higher_is_better": False, "ref_step": ref_step,
                                 "train_steps": train_steps, "epochs": (None if train_steps else epochs),
                                 "lr": lr, "mb": mb, "subset_size": int(idx.size),
-                                "subsets_tag": subsets_tag}) + "\n")
+                                "subsets_tag": subsets_tag,
+                                "per_example": [round(x, 5) for x in per_ex]}) + "\n")
             f.flush()
             print(f"[nll] subset {j}: target gold-NLL = {val:.5f}")
             del opt
@@ -313,12 +315,14 @@ def run_reward(cfg, ref_step, train_steps, eval_examples, seed, tag, limit=None,
         model.config.use_cache = True
         if is_main:
             assert f is not None
-            acc = float(score_examples(target, model, tok, cfg, device, vllm=False)["accuracy"])
+            res = score_examples(target, model, tok, cfg, device, vllm=False)
+            acc = float(res["accuracy"])
             f.write(json.dumps({"subset_id": int(j), "value": acc, "metric": "accuracy",
                                 "higher_is_better": True, "ref_step": ref_step,
                                 "train_steps": train_steps, "eval_examples": len(target),
                                 "subset_size": int(subs.shape[1]),
-                                "subsets_tag": subsets_tag}) + "\n")
+                                "subsets_tag": subsets_tag,
+                                "per_example": [round(float(r), 4) for r in res["rewards"]]}) + "\n")
             f.flush()
             print(f"[reward] subset {j}: target accuracy = {acc:.4f}")
         _barrier()  # non-main ranks wait out the rank-0 eval before the next subset
@@ -364,6 +368,8 @@ def score(cfg, variant, scores_paths, tag="", subsets_tag=""):
               f"higher_is_better={hib}, tag={tag or '-'}):")
         for sp in scores_paths:
             s = np.load(sp)
+            if s.ndim == 2:  # per-target matrix: the aggregate score is the row mean
+                s = s.mean(axis=0)
             print(f"  {Path(sp).name}")
             for r in rows:
                 j = r["subset_id"]
@@ -374,6 +380,31 @@ def score(cfg, variant, scores_paths, tag="", subsets_tag=""):
           f"higher_is_better={hib}):")
     for sp in scores_paths:
         s = np.load(sp)
+        if s.ndim == 2:
+            # TRAK-style per-example LDS from a [T, n_pool] per-target matrix: row r
+            # predicts target example target_rows[r]; measured rows must carry the
+            # per-example vector. One Spearman per target across subsets, then average.
+            rows_p = Path(sp).with_name(Path(sp).name.replace("_target_matrix_", "_target_rows_"))
+            tr = np.load(rows_p).astype(int) if rows_p.exists() else np.arange(s.shape[0])
+            keep = [r for r in rows if "per_example" in r]
+            agg = np.array([s.mean(axis=0)[subs[i]].sum() for i in ids], dtype=np.float64)
+            print(f"  {Path(sp).name:48s} LDS(mean-collapsed) = {_spearman(agg, goodness):+.3f}")
+            if not keep:
+                print("    (no measured rows carry 'per_example' — re-measure with the "
+                      "updated harness for the per-example LDS)")
+                continue
+            pe = np.array([r["per_example"] for r in keep], dtype=np.float64)  # [M, n_target]
+            pe_good = pe if hib else -pe
+            lds_e = []
+            for ridx, t in enumerate(tr):
+                if t >= pe.shape[1]:
+                    continue
+                ghat_e = np.array([s[ridx, subs[r["subset_id"]]].sum() for r in keep])
+                lds_e.append(_spearman(ghat_e, pe_good[:, t]))
+            le = np.asarray(lds_e)
+            print(f"    per-example LDS = {le.mean():+.3f} (std {le.std():.3f} over "
+                  f"{le.size} targets, {len(keep)} subsets with per_example)")
+            continue
         ghat = np.array([s[subs[i]].sum() for i in ids], dtype=np.float64)
         print(f"  {Path(sp).name:48s} LDS = {_spearman(ghat, goodness):+.3f}")
 

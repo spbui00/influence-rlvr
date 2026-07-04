@@ -305,6 +305,26 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
             print("  [if_cosine] H rows unit-normalized (in-place); pool scores = mean "
                   "cosine (direction, not magnitude)")
 
+    # Optional per-target rows for TRAK-style per-example LDS: keep T evenly-spaced rows of
+    # H in bf16 through the pool scan (T × D — 64 rows ≈ 8.5 GB on 4B, vs 67 GB for the full
+    # fp32 H). Copied row-by-row so the peak transient is one fp32 row, not a [T, D] slice.
+    # Common-mode branches below project these rows with the same f̂ as the mean tangent
+    # (projecting rows then averaging == projecting the average, so semantics stay aligned).
+    Hsub = target_rows = None
+    if cfg.if_target_matrix_rows and H.shape[0] > 1:
+        T = min(cfg.if_target_matrix_rows, H.shape[0])
+        target_rows = np.unique(np.linspace(0, H.shape[0] - 1, T).round().astype(int))
+        Hsub = torch.stack([H[int(r)].to(torch.bfloat16) for r in target_rows])
+        if main:
+            print(f"  [target-matrix] keeping {len(target_rows)}/{H.shape[0]} target rows "
+                  f"(bf16, {Hsub.numel() * 2 / 2**30:.1f} GB) for per-example scores")
+
+    def _project_rows_(rows, f):
+        """In-place remove unit direction f from each bf16 row (chunk-free: per-row matvec)."""
+        fb = (f / f.norm().clamp(min=1e-12)).to(rows.dtype)
+        for r in range(rows.shape[0]):
+            rows[r] -= (rows[r] @ fb) * fb
+
     # Collapse H to its mean row [1, D]. The pool scores only need ⟨H.mean(0), g_train⟩ (mean
     # over targets, by linearity — for cosine, the mean of the NORMALIZED rows above). Holding
     # the full [n_target, D] (256×66M×4B = 67.6 GB on a 4B model) resident through the per-
@@ -338,6 +358,8 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
             frac = float(evals[-1] / evals.clamp(min=0).sum().clamp(min=1e-12))
             print(f"  [common-mode/top-pc] top PC = {100*frac:.1f}% of target-gradient energy")
         H = _project_out(h_bar, f, "top-pc")
+        if Hsub is not None:
+            _project_rows_(Hsub, f)
         del f, h_bar
     elif cfg.if_common_mode == "pool-mean" and is_gold:
         # f̂ = mean preconditioned (cosine-matched) gold gradient over a random pool subsample
@@ -364,6 +386,8 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
         if main:
             print(f"  [common-mode/pool-mean] format direction from {k} pool examples")
         H = _project_out(h_bar.float(), acc, "pool-mean").to(h_bar.dtype)
+        if Hsub is not None:
+            _project_rows_(Hsub, acc)
     else:
         H = H.mean(dim=0, keepdim=True)
     precond = None  # now safe to free the [D] preconditioner before the scoring backward
@@ -389,6 +413,8 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
         print(f"  [{cfg.if_method}/{cfg.if_grad}] scoring {n_train} train prompts "
               f"({len(my_pool)}/rank × {world} ranks, batch={B}, gen={gen_label})...")
     matrix = np.zeros((H.shape[0], n_train), dtype=np.float64)  # H collapsed → (1, n_train)
+    tmatrix = (np.zeros((Hsub.shape[0], n_train), dtype=np.float64)
+               if Hsub is not None else None)
     next_log = 50
     n_skip = 0  # saturated prompts (zero reward variance): rollout grad is exactly 0 → score 0
     for c in range(0, len(my_pool), B):
@@ -411,6 +437,8 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
             if cfg.if_cosine:  # unit-normalize → ⟨H[j], g_train/|g_train|⟩ = cosine
                 gt = gt / gt.norm().clamp(min=1e-12)
             matrix[:, i] = (H @ gt).detach().cpu().numpy()
+            if tmatrix is not None and Hsub is not None:  # bf16 matvec, fp32 accum on CUDA
+                tmatrix[:, i] = (Hsub @ gt.to(Hsub.dtype)).float().cpu().numpy()
         done = min(c + B, len(my_pool))
         if main and (done >= next_log or done == len(my_pool)):
             print(f"    rank0 scored {done}/{len(my_pool)} ({time.time() - t0:.1f}s, "
@@ -421,6 +449,10 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
         mt = torch.from_numpy(matrix).to(device)
         all_reduce_sum_(mt)
         matrix = mt.cpu().numpy()
+        if tmatrix is not None:
+            tt = torch.from_numpy(tmatrix).to(device)
+            all_reduce_sum_(tt)
+            tmatrix = tt.cpu().numpy()
     scores = matrix.mean(axis=0)
 
     if save_dir is not None and main:  # only rank 0 writes (all ranks hold the same scores)
@@ -428,6 +460,9 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
         save_dir.mkdir(parents=True, exist_ok=True)
         np.save(save_dir / f"{tag}_if_matrix_step{checkpoint_step}.npy", matrix)
         np.save(save_dir / f"{tag}_if_scores_step{checkpoint_step}.npy", scores)
+        if tmatrix is not None and target_rows is not None:
+            np.save(save_dir / f"{tag}_if_target_matrix_step{checkpoint_step}.npy", tmatrix)
+            np.save(save_dir / f"{tag}_if_target_rows_step{checkpoint_step}.npy", target_rows)
         print(f"  Saved {tag} influence artifacts under {save_dir}/")
     return scores
 
