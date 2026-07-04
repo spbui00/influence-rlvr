@@ -3,7 +3,8 @@
 # influence method's scores can be LDS-scored later (experiments/lds.py score).
 #
 #   nll  variant: 1 GPU, no servers (teacher-forced gold-NLL SFT -> target gold-NLL).
-#   reward variant: train GPU0 + policy-gen vLLM (GPU1) + verifier vLLM (GPU2).
+#   reward variant: GPUs 0..N_TRAIN_GPU-1 DDP train (default 2) + policy-gen vLLM +
+#                   verifier vLLM on the next two GPUs -> --gres=gpu:$((N_TRAIN_GPU+2)).
 #
 # RESUMABLE: each subset appends one line to outputs/<run>/lds/measured_<variant>.jsonl;
 # re-submitting the identical line skips finished subsets. Safe to run across many days.
@@ -15,8 +16,8 @@
 #
 #   VARIANT=reward RUN_NAME=xdomain_phys_gold_c REF_STEP=10 TRAIN_STEPS=60 \
 #   VENV_DIR=$SCRATCH/envs/ifrlvr HF_HOME=$SCRATCH/hf_cache \
-#     sbatch --environment=pt --account=a0133 --partition=normal --gres=gpu:3 \
-#            --mem=200G --time=24:00:00 --cpus-per-task=24 experiments/cluster/lds.slurm
+#     sbatch --environment=pt --account=a0133 --partition=normal --gres=gpu:4 \
+#            --mem=200G --time=12:00:00 --cpus-per-task=24 experiments/cluster/lds.slurm
 #
 # SUBSETS_TAG selects an alternative manifest (subsets_<tag>.npy) so new subset designs
 # don't touch the alpha-0.25 sweep already measured. Small-alpha sweep + extremes probe:
@@ -80,20 +81,24 @@ if [ "$VARIANT" = "nll" ]; then
     exit 0
 fi
 
-# ── reward path: verifier server (GPU2) + policy-gen vLLM server (GPU1) ──────────
+# ── reward path: GPUs 0..N_TRAIN_GPU-1 = DDP train, then policy-gen vLLM, then verifier ──
+N_TRAIN_GPU="${N_TRAIN_GPU:-2}"
+GEN_GPU=$N_TRAIN_GPU
+VERIFIER_GPU=$((N_TRAIN_GPU + 1))
 NGPU_ALLOC=$(nvidia-smi -L 2>/dev/null | wc -l)
-if [ "${NGPU_ALLOC:-0}" -lt 3 ]; then
-    echo "ERROR: reward variant needs 3 GPUs (train+gen+verifier), got $NGPU_ALLOC. Use --gres=gpu:3."
+if [ "${NGPU_ALLOC:-0}" -lt $((N_TRAIN_GPU + 2)) ]; then
+    echo "ERROR: reward variant needs N_TRAIN_GPU+2 GPUs (train+gen+verifier), got $NGPU_ALLOC" \
+         "(N_TRAIN_GPU=$N_TRAIN_GPU). Use --gres=gpu:$((N_TRAIN_GPU + 2))."
     exit 1
 fi
 
-echo "Launching verifier vLLM server on GPU 2 (model=$VERIFIER, port=$VPORT)..."
-CUDA_VISIBLE_DEVICES=2 vllm serve "$VERIFIER" \
+echo "Launching verifier vLLM server on GPU $VERIFIER_GPU (model=$VERIFIER, port=$VPORT)..."
+CUDA_VISIBLE_DEVICES=$VERIFIER_GPU vllm serve "$VERIFIER" \
     --port "$VPORT" --gpu-memory-utilization 0.50 --max-model-len "$VERIFIER_MAX_LEN" \
     > "vllm-verifier-${SLURM_JOB_ID}.log" 2>&1 &
 VSERVER_PID=$!
-echo "Launching policy-gen vLLM server on GPU 1 (trl vllm-serve, port $GENPORT)..."
-CUDA_VISIBLE_DEVICES=1 trl vllm-serve \
+echo "Launching policy-gen vLLM server on GPU $GEN_GPU (trl vllm-serve, port $GENPORT)..."
+CUDA_VISIBLE_DEVICES=$GEN_GPU trl vllm-serve \
     --model "$MODEL" --host 127.0.0.1 --port "$GENPORT" \
     --gpu_memory_utilization 0.85 --max_model_len 8192 \
     > "vllm-gen-${SLURM_JOB_ID}.log" 2>&1 &
@@ -122,7 +127,13 @@ while time.time() < deadline:
 print("ERROR: vLLM server(s) did not come up in 900s", file=sys.stderr); sys.exit(1)
 PY
 
-echo "================ LDS sweep reward ($RUN_NAME, ref=$REF_STEP) ================"
-CUDA_VISIBLE_DEVICES=0 python -m experiments.lds --run-name "$RUN_NAME" \
+TRAIN_DEVS=$(seq 0 $((N_TRAIN_GPU - 1)) | paste -sd, -)
+if [ "$N_TRAIN_GPU" -gt 1 ]; then
+    LAUNCH="accelerate launch --config_file experiments/cluster/accelerate_ddp.yaml --num_processes $N_TRAIN_GPU -m"
+else
+    LAUNCH="python -m"
+fi
+echo "================ LDS sweep reward ($RUN_NAME, ref=$REF_STEP, train_gpus=$N_TRAIN_GPU) ================"
+CUDA_VISIBLE_DEVICES=$TRAIN_DEVS $LAUNCH experiments.lds --run-name "$RUN_NAME" \
     run --variant reward --ref-step "$REF_STEP" --seed "$SEED" $STEPS_ARG $TAG_ARG $SUBTAG_ARG $LIMIT_ARG
 echo "================ DONE (reward) ================"

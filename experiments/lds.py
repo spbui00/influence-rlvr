@@ -246,6 +246,8 @@ def run_nll(cfg, ref_step, train_steps, lr, mb, seed, epochs, tag, limit=None, s
 
 # ── variant B: GRPO + held-out accuracy ──────────────────────────────────────
 def run_reward(cfg, ref_step, train_steps, eval_examples, seed, tag, limit=None, subsets_tag=""):
+    import torch
+    import torch.distributed as dist
     from influence_rlvr import clear_cache, detect_device, load_adapter_checkpoint
     from trl import GRPOTrainer
     from .data import load_if_target_set, load_train_pool
@@ -253,14 +255,26 @@ def run_reward(cfg, ref_step, train_steps, eval_examples, seed, tag, limit=None,
     from .evaluate import score_examples
 
     os.environ.setdefault("WANDB_MODE", "disabled")
+    # Single-GPU (plain python) or DDP (accelerate launch --num_processes N): every
+    # rank trains; only rank 0 evals + writes; a barrier keeps ranks in lockstep.
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    is_main = int(os.environ.get("RANK", "0")) == 0
+    if torch.cuda.is_available():
+        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
+
+    def _barrier():
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+
     device = detect_device()
     subs = np.load(_subsets_path(cfg, subsets_tag))
     model, tok = build_model(cfg, device)
     ref_ckpt = cfg.grpo_output_dir / f"checkpoint-{ref_step}"
     if ref_step and ref_ckpt.is_dir():
         load_adapter_checkpoint(model, str(ref_ckpt))
-        print(f"[reward] reference = {ref_ckpt}")
-    else:
+        if is_main:
+            print(f"[reward] reference = {ref_ckpt}")
+    elif is_main:
         print(f"[reward] reference = base model (ref_step={ref_step})")
     ref = _snapshot(model)
     pool = load_train_pool(cfg)
@@ -272,29 +286,34 @@ def run_reward(cfg, ref_step, train_steps, eval_examples, seed, tag, limit=None,
     todo = [j for j in range(len(subs)) if j not in done]
     if limit:
         todo = todo[:limit]
-    print(f"[reward] {len(done)} done, {len(todo)} to run (ref_step={ref_step}, "
-          f"train_steps={train_steps}, eval_examples={len(target)})")
-    with out.open("a") as f:
-        for j in todo:
-            _restore(model, ref)
-            sub_ds = pool.select([int(t) for t in subs[j]])
-            args = make_grpo_config(cfg, max_steps=train_steps, shuffle=True)
-            # Isolate from the real run dir + never checkpoint during the sweep.
-            args.output_dir = str(scratch)
-            args.save_strategy = "no"
-            args.save_steps = 10 ** 9
-            args.report_to = []
-            args.seed = cfg.seed + seed  # vary for seed-averaging the reward LDS
-            trainer = GRPOTrainer(model=model, reward_funcs=build_reward_funcs(cfg),
-                                  args=args, train_dataset=sub_ds, processing_class=tok)
-            trainer.train()
-            # Generation-friendly state for the post-train eval, then restore.
-            model.eval()
-            model.gradient_checkpointing_disable()
-            model.config.use_cache = True
+    if is_main:
+        print(f"[reward] {len(done)} done, {len(todo)} to run (ref_step={ref_step}, "
+              f"train_steps={train_steps}, eval_examples={len(target)}, world={world})")
+    f = out.open("a") if is_main else None
+    for j in todo:
+        _restore(model, ref)
+        sub_ds = pool.select([int(t) for t in subs[j]])
+        args = make_grpo_config(cfg, max_steps=train_steps, shuffle=True)
+        # Isolate from the real run dir + never checkpoint during the sweep.
+        args.output_dir = str(scratch)
+        args.save_strategy = "no"
+        args.save_steps = 10 ** 9
+        args.report_to = []
+        args.seed = cfg.seed + seed  # vary for seed-averaging the reward LDS
+        if world > 1:
+            # cfg.grad_accum is the single-GPU spec; split it across ranks so
+            # prompts/step (and thus the experiment) is invariant to world size.
+            args.gradient_accumulation_steps = max(1, cfg.grad_accum // world)
+        trainer = GRPOTrainer(model=model, reward_funcs=build_reward_funcs(cfg),
+                              args=args, train_dataset=sub_ds, processing_class=tok)
+        trainer.train()
+        # Generation-friendly state for the post-train eval, then restore.
+        model.eval()
+        model.gradient_checkpointing_disable()
+        model.config.use_cache = True
+        if is_main:
+            assert f is not None
             acc = float(score_examples(target, model, tok, cfg, device, vllm=False)["accuracy"])
-            model.config.use_cache = False
-            model.gradient_checkpointing_enable()
             f.write(json.dumps({"subset_id": int(j), "value": acc, "metric": "accuracy",
                                 "higher_is_better": True, "ref_step": ref_step,
                                 "train_steps": train_steps, "eval_examples": len(target),
@@ -302,15 +321,20 @@ def run_reward(cfg, ref_step, train_steps, eval_examples, seed, tag, limit=None,
                                 "subsets_tag": subsets_tag}) + "\n")
             f.flush()
             print(f"[reward] subset {j}: target accuracy = {acc:.4f}")
-            # vLLM server mode re-inits a weight-sync group per trainer; close it so the
-            # next subset's trainer re-inits cleanly (same fix as run_if_prune).
-            if getattr(cfg, "use_vllm", False) and getattr(cfg, "vllm_mode", "") == "server":
-                try:
-                    trainer.vllm_generation.vllm_client.close_communicator()
-                except Exception as e:
-                    print(f"  vllm teardown skipped ({type(e).__name__}: {e})")
-            del trainer
-            clear_cache(device)
+        _barrier()  # non-main ranks wait out the rank-0 eval before the next subset
+        model.config.use_cache = False
+        model.gradient_checkpointing_enable()
+        # vLLM server mode re-inits a weight-sync group per trainer; close it so the
+        # next subset's trainer re-inits cleanly (same fix as run_if_prune).
+        if is_main and getattr(cfg, "use_vllm", False) and getattr(cfg, "vllm_mode", "") == "server":
+            try:
+                trainer.vllm_generation.vllm_client.close_communicator()
+            except Exception as e:
+                print(f"  vllm teardown skipped ({type(e).__name__}: {e})")
+        del trainer
+        clear_cache(device)
+    if f is not None:
+        f.close()
 
 
 # ── score (decoupled; any method) ────────────────────────────────────────────
