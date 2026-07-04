@@ -12,6 +12,9 @@ and every influence method — gold / rollout / cg / future ones — is evaluate
 free afterward.
 
   make-subsets : deterministic manifest of M random subsets (shared by all variants/methods)
+  make-extremes: 3-row manifest (top-k / random-k / bottom-k by a scores .npy) — the
+                 maximum-contrast probe: if these don't separate on the measured
+                 metric, no random-subset sweep at any alpha will.
   run          : retrain per subset + measure the target metric, appending one JSONL
                  row per subset. RESUMABLE — re-run the same command to continue.
                    --variant nll    : teacher-forced gold-NLL SFT, measure target gold-NLL.
@@ -27,8 +30,16 @@ free afterward.
   python -m experiments.lds score --variant nll   --run-name xdomain_phys_gold_c \
       --scores outputs/xdomain_phys_gold_c/influence/step10/tracin_adam_if_scores_step10.npy
 
-make-subsets and score are torch-free (numpy + datasets only) so they run locally;
-run needs a GPU and is launched via experiments/cluster/lds.slurm.
+`--subsets-tag foo` reads/writes subsets_foo.npy instead of subsets.npy, so new subset
+designs (different alpha, extremes) never invalidate measured_*.jsonl files produced
+under an older manifest. When set, the measured/score --tag defaults to the same value.
+
+  python -m experiments.lds make-subsets  --run-name xdomain_phys_gold_c -M 200 --alpha 0.05 --subsets-tag a05
+  python -m experiments.lds make-extremes --run-name xdomain_phys_gold_c --subsets-tag extremes \
+      --scores outputs/xdomain_phys_gold_c/influence/step10/tracin_adam_if_scores_step10.npy
+
+make-extremes and score are numpy-only, make-subsets additionally needs `datasets`;
+all three run locally. run needs a GPU (experiments/cluster/lds.slurm).
 """
 from __future__ import annotations
 
@@ -40,7 +51,6 @@ from pathlib import Path
 import numpy as np
 
 from .config import ExperimentConfig
-from .data import load_if_target_set, load_train_pool
 
 
 # ── paths ────────────────────────────────────────────────────────────────────
@@ -48,12 +58,12 @@ def _lds_dir(cfg) -> Path:
     return cfg.run_dir / "lds"
 
 
-def _subsets_path(cfg) -> Path:
-    return _lds_dir(cfg) / "subsets.npy"
+def _subsets_path(cfg, tag: str = "") -> Path:
+    return _lds_dir(cfg) / (f"subsets_{tag}.npy" if tag else "subsets.npy")
 
 
-def _meta_path(cfg) -> Path:
-    return _lds_dir(cfg) / "subsets_meta.json"
+def _meta_path(cfg, tag: str = "") -> Path:
+    return _lds_dir(cfg) / (f"subsets_meta_{tag}.json" if tag else "subsets_meta.json")
 
 
 def _measured_path(cfg, variant: str, tag: str = "") -> Path:
@@ -68,18 +78,45 @@ def _done_ids(path: Path) -> set:
 
 
 # ── make-subsets ─────────────────────────────────────────────────────────────
-def make_subsets(cfg, M: int, alpha: float, seed: int) -> np.ndarray:
+def make_subsets(cfg, M: int, alpha: float, seed: int, subsets_tag: str = "") -> np.ndarray:
+    from .data import load_train_pool
     n = len(load_train_pool(cfg))
     k = max(1, round(alpha * n))
+    # Sequential draws from one stream: re-running with a larger M (same seed/alpha)
+    # reproduces the first M subsets, so a sweep can be extended without re-measuring.
     rng = np.random.default_rng(seed)
     subs = np.stack([np.sort(rng.choice(n, size=k, replace=False)) for _ in range(M)]).astype(np.int32)
     d = _lds_dir(cfg)
     d.mkdir(parents=True, exist_ok=True)
-    np.save(_subsets_path(cfg), subs)
-    _meta_path(cfg).write_text(json.dumps(
+    np.save(_subsets_path(cfg, subsets_tag), subs)
+    _meta_path(cfg, subsets_tag).write_text(json.dumps(
         {"pool_size": n, "M": M, "alpha": alpha, "subset_size": k, "seed": seed,
          "run_name": cfg.run_name}, indent=2))
-    print(f"make-subsets: {M} subsets of {k}/{n} ({alpha:.0%}) -> {_subsets_path(cfg)}")
+    print(f"make-subsets: {M} subsets of {k}/{n} ({alpha:.0%}) -> {_subsets_path(cfg, subsets_tag)}")
+    return subs
+
+
+def make_extremes(cfg, scores_path: str, k: int, seed: int, subsets_tag: str) -> np.ndarray:
+    """Top-k / random-k / bottom-k rows by a per-example score vector (higher = predicted
+    more helpful, matching kept_step*.npy). Measured with the same `run` variants."""
+    s = np.load(scores_path).astype(np.float64).ravel()
+    n = s.size
+    order = np.argsort(-s)
+    rng = np.random.default_rng(seed)
+    rows = {
+        "top": np.sort(order[:k]),
+        "random": np.sort(rng.choice(n, size=k, replace=False)),
+        "bottom": np.sort(order[-k:]),
+    }
+    subs = np.stack(list(rows.values())).astype(np.int32)
+    d = _lds_dir(cfg)
+    d.mkdir(parents=True, exist_ok=True)
+    np.save(_subsets_path(cfg, subsets_tag), subs)
+    _meta_path(cfg, subsets_tag).write_text(json.dumps(
+        {"kind": "extremes", "pool_size": int(n), "rows": list(rows), "k": int(k),
+         "seed": seed, "scores_file": str(scores_path), "run_name": cfg.run_name}, indent=2))
+    print(f"make-extremes: rows={list(rows)} k={k}/{n} by {Path(scores_path).name} "
+          f"-> {_subsets_path(cfg, subsets_tag)}")
     return subs
 
 
@@ -144,12 +181,13 @@ def _restore(model, snap):
                 p.copy_(snap[n])
 
 
-def run_nll(cfg, ref_step, train_steps, lr, mb, seed, epochs, tag, limit=None):
+def run_nll(cfg, ref_step, train_steps, lr, mb, seed, epochs, tag, limit=None, subsets_tag=""):
     import torch
     from influence_rlvr import clear_cache, detect_device, load_adapter_checkpoint
+    from .data import load_if_target_set, load_train_pool
     from .train import build_model
     device = detect_device()
-    subs = np.load(_subsets_path(cfg))
+    subs = np.load(_subsets_path(cfg, subsets_tag))
     model, tok = build_model(cfg, device)
     ref_ckpt = cfg.grpo_output_dir / f"checkpoint-{ref_step}"
     if ref_step and ref_ckpt.is_dir():
@@ -168,7 +206,8 @@ def run_nll(cfg, ref_step, train_steps, lr, mb, seed, epochs, tag, limit=None):
     # train_steps set -> fixed-step sampled minibatches (cheap diagnostic); else FULL-coverage
     # epochs (the matched test: g_hat sums influence over the WHOLE subset, so train on all of it).
     spec = f"train_steps={train_steps}" if train_steps else f"epochs={epochs} (full coverage)"
-    print(f"[nll] {len(done)} done, {len(todo)} to run (ref_step={ref_step}, {spec}, lr={lr}, mb={mb})")
+    print(f"[nll] {len(done)} done, {len(todo)} to run (ref_step={ref_step}, {spec}, lr={lr}, mb={mb}, "
+          f"subsets={_subsets_path(cfg, subsets_tag).name})")
     with out.open("a") as f:
         for j in todo:
             _restore(model, ref)
@@ -197,7 +236,8 @@ def run_nll(cfg, ref_step, train_steps, lr, mb, seed, epochs, tag, limit=None):
             f.write(json.dumps({"subset_id": int(j), "value": val, "metric": "gold_nll",
                                 "higher_is_better": False, "ref_step": ref_step,
                                 "train_steps": train_steps, "epochs": (None if train_steps else epochs),
-                                "lr": lr, "mb": mb, "subset_size": int(idx.size)}) + "\n")
+                                "lr": lr, "mb": mb, "subset_size": int(idx.size),
+                                "subsets_tag": subsets_tag}) + "\n")
             f.flush()
             print(f"[nll] subset {j}: target gold-NLL = {val:.5f}")
             del opt
@@ -205,15 +245,16 @@ def run_nll(cfg, ref_step, train_steps, lr, mb, seed, epochs, tag, limit=None):
 
 
 # ── variant B: GRPO + held-out accuracy ──────────────────────────────────────
-def run_reward(cfg, ref_step, train_steps, eval_examples, seed, tag, limit=None):
+def run_reward(cfg, ref_step, train_steps, eval_examples, seed, tag, limit=None, subsets_tag=""):
     from influence_rlvr import clear_cache, detect_device, load_adapter_checkpoint
     from trl import GRPOTrainer
+    from .data import load_if_target_set, load_train_pool
     from .train import build_reward_funcs, build_model, make_grpo_config
     from .evaluate import score_examples
 
     os.environ.setdefault("WANDB_MODE", "disabled")
     device = detect_device()
-    subs = np.load(_subsets_path(cfg))
+    subs = np.load(_subsets_path(cfg, subsets_tag))
     model, tok = build_model(cfg, device)
     ref_ckpt = cfg.grpo_output_dir / f"checkpoint-{ref_step}"
     if ref_step and ref_ckpt.is_dir():
@@ -257,7 +298,8 @@ def run_reward(cfg, ref_step, train_steps, eval_examples, seed, tag, limit=None)
             f.write(json.dumps({"subset_id": int(j), "value": acc, "metric": "accuracy",
                                 "higher_is_better": True, "ref_step": ref_step,
                                 "train_steps": train_steps, "eval_examples": len(target),
-                                "subset_size": int(subs.shape[1])}) + "\n")
+                                "subset_size": int(subs.shape[1]),
+                                "subsets_tag": subsets_tag}) + "\n")
             f.flush()
             print(f"[reward] subset {j}: target accuracy = {acc:.4f}")
             # vLLM server mode re-inits a weight-sync group per trainer; close it so the
@@ -281,14 +323,29 @@ def _spearman(a: np.ndarray, b: np.ndarray) -> float:
     return float((ra * rb).sum() / denom) if denom > 0 else 0.0
 
 
-def score(cfg, variant, scores_paths, tag=""):
-    subs = np.load(_subsets_path(cfg))
+def score(cfg, variant, scores_paths, tag="", subsets_tag=""):
+    subs = np.load(_subsets_path(cfg, subsets_tag))
+    meta_p = _meta_path(cfg, subsets_tag)
+    meta = json.loads(meta_p.read_text()) if meta_p.exists() else {}
     rows = [json.loads(l) for l in _measured_path(cfg, variant, tag).read_text().splitlines() if l.strip()]
     rows.sort(key=lambda r: r["subset_id"])
     ids = [r["subset_id"] for r in rows]
     hib = bool(rows[0]["higher_is_better"])
     measured = np.array([r["value"] for r in rows], dtype=np.float64)
     goodness = measured if hib else -measured  # align so higher = better target outcome
+    if meta.get("kind") == "extremes":
+        # 3 labeled rows, not an LDS: report measured value + predicted sum per row.
+        labels = meta.get("rows") or [str(i) for i in range(len(subs))]
+        print(f"extremes (variant={variant}, metric={rows[0]['metric']}, "
+              f"higher_is_better={hib}, tag={tag or '-'}):")
+        for sp in scores_paths:
+            s = np.load(sp)
+            print(f"  {Path(sp).name}")
+            for r in rows:
+                j = r["subset_id"]
+                print(f"    {labels[j]:8s} measured = {r['value']:.5f}   "
+                      f"ghat = {float(s[subs[j]].sum()):+.4f}")
+        return
     print(f"LDS (variant={variant}, metric={rows[0]['metric']}, {len(rows)} subsets, "
           f"higher_is_better={hib}):")
     for sp in scores_paths:
@@ -308,6 +365,13 @@ def main(argv=None):
     a.add_argument("-M", "--num-subsets", type=int, default=200)
     a.add_argument("--alpha", type=float, default=0.25, help="subset fraction of the pool")
     a.add_argument("--seed", type=int, default=0)
+    a.add_argument("--subsets-tag", default="", help="write subsets_<tag>.npy instead of subsets.npy")
+
+    e = sub.add_parser("make-extremes")
+    e.add_argument("--scores", required=True, help="per-example score .npy (higher = better)")
+    e.add_argument("-k", type=int, default=1500, help="examples per row")
+    e.add_argument("--seed", type=int, default=0, help="seed for the random row")
+    e.add_argument("--subsets-tag", default="extremes")
 
     r = sub.add_parser("run")
     r.add_argument("--variant", choices=["nll", "reward"], required=True)
@@ -322,30 +386,40 @@ def main(argv=None):
     r.add_argument("--eval-examples", type=int, default=256, help="reward: target prompts to grade")
     r.add_argument("--seed", type=int, default=0)
     r.add_argument("--tag", default="", help="suffix for measured_<variant>_<tag>.jsonl "
-                                             "(keep training specs from colliding)")
+                                             "(keep training specs from colliding; "
+                                             "defaults to --subsets-tag when that is set)")
+    r.add_argument("--subsets-tag", default="", help="read subsets_<tag>.npy instead of subsets.npy")
     r.add_argument("--limit", type=int, default=None, help="process at most N subsets this run")
 
     s = sub.add_parser("score")
     s.add_argument("--variant", choices=["nll", "reward"], required=True)
     s.add_argument("--scores", nargs="+", required=True, help="per-example score .npy file(s)")
-    s.add_argument("--tag", default="", help="measured_<variant>_<tag>.jsonl to score against")
+    s.add_argument("--tag", default="", help="measured_<variant>_<tag>.jsonl to score against "
+                                             "(defaults to --subsets-tag when that is set)")
+    s.add_argument("--subsets-tag", default="", help="read subsets_<tag>.npy instead of subsets.npy")
 
     args = p.parse_args(argv)
     cfg = ExperimentConfig.load(Path(args.output_root).expanduser().resolve()
                                 / args.run_name / "config.json")
 
+    # A tagged manifest without an explicit measured tag inherits it, so rows from
+    # different manifests can never silently land in the same measured file.
+    tag = getattr(args, "tag", "") or getattr(args, "subsets_tag", "")
+
     if args.cmd == "make-subsets":
-        make_subsets(cfg, args.num_subsets, args.alpha, args.seed)
+        make_subsets(cfg, args.num_subsets, args.alpha, args.seed, args.subsets_tag)
+    elif args.cmd == "make-extremes":
+        make_extremes(cfg, args.scores, args.k, args.seed, args.subsets_tag)
     elif args.cmd == "score":
-        score(cfg, args.variant, args.scores, args.tag)
+        score(cfg, args.variant, args.scores, tag, args.subsets_tag)
     elif args.cmd == "run":
         lr = args.lr if args.lr is not None else cfg.learning_rate
         if args.variant == "nll":
             run_nll(cfg, args.ref_step, args.train_steps, lr, args.mb, args.seed,
-                    args.epochs, args.tag, args.limit)
+                    args.epochs, tag, args.limit, args.subsets_tag)
         else:
             run_reward(cfg, args.ref_step, args.train_steps or 60, args.eval_examples,
-                       args.seed, args.tag, args.limit)
+                       args.seed, tag, args.limit, args.subsets_tag)
 
 
 if __name__ == "__main__":
