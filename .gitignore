@@ -217,3 +217,8 @@ results/
 .DS_Store
 wandb/
 tmp/
+
+# protocol2 poisoned-verifier experiment: generated datasets + pilot rollouts
+# (deterministic, seeded — pilot.slurm rebuilds them on the cluster if missing)
+experiments/protocol2/dataset/data/
+
