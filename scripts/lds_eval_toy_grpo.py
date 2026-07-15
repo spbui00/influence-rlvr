@@ -283,6 +283,66 @@ def generate_dataset(n: int = 1000, input_dim: int = 20, seed: int = 42) -> list
     return examples
 
 
+def _resolve_signal_per_cluster(
+    n_clusters: int,
+    cluster_signal: float,
+    signal_per_cluster: Sequence[float] | None,
+    hard_fraction: float,
+    signal_hard: float | None,
+    seed: int,
+) -> list[float]:
+    """Per-cluster signal strengths. An explicit `signal_per_cluster` wins; otherwise
+    build a uniform vector and (if hard_fraction>0) knock a random subset down to
+    `signal_hard` (default cluster_signal/3). Hard-cluster choice is seeded and
+    decoupled from cluster parity so difficulty does not correlate with the target."""
+    if signal_per_cluster is not None:
+        spc = list(signal_per_cluster)
+        if len(spc) != n_clusters:
+            raise ValueError(
+                f"signal_per_cluster length ({len(spc)}) != n_clusters ({n_clusters})."
+            )
+        return spc
+    spc = [float(cluster_signal)] * n_clusters
+    n_hard = int(round(hard_fraction * n_clusters))
+    if n_hard > 0:
+        lo = cluster_signal / 3.0 if signal_hard is None else float(signal_hard)
+        gen = torch.Generator().manual_seed(seed + 4242)
+        for k in torch.randperm(n_clusters, generator=gen).tolist()[:n_hard]:
+            spc[k] = lo
+    return spc
+
+
+def _build_signature_matrix(
+    n_clusters: int,
+    input_dim: int,
+    signal_per_cluster: Sequence[float],
+    signature_mode: str,
+    signature_dim: int,
+    seed: int,
+) -> torch.Tensor:
+    """[n_clusters, input_dim] additive cluster signatures (reused for train & test).
+
+    'onehot'  — cluster k lives on its own axis z[k]; signatures are orthogonal,
+                so identifying a cluster is nearly linear (dot already nails it).
+    'overlap' — every cluster loads onto a *shared* block z[0:signature_dim] with
+                random unit-norm loadings, scaled by its signal. Signatures are
+                non-orthogonal → correlated features → genuine curvature for
+                ekfac/cg to decorrelate that a plain dot cannot."""
+    S = torch.zeros(n_clusters, input_dim)
+    if signature_mode == "onehot":
+        for k in range(n_clusters):
+            S[k, k] = signal_per_cluster[k]
+    elif signature_mode == "overlap":
+        gen = torch.Generator().manual_seed(seed + 2024)
+        loadings = torch.randn(n_clusters, signature_dim, generator=gen)
+        loadings = loadings / loadings.norm(dim=1, keepdim=True).clamp_min(1e-8)
+        for k in range(n_clusters):
+            S[k, :signature_dim] = loadings[k] * signal_per_cluster[k]
+    else:
+        raise ValueError(f"Unsupported signature_mode={signature_mode!r}. Use 'onehot' or 'overlap'.")
+    return S
+
+
 def generate_clustered_dataset(
     n_clusters: int = 50,
     per_cluster: int = 4,
@@ -293,42 +353,58 @@ def generate_clustered_dataset(
     background_scale: float = 0.5,
     target_mode: str = "parity",
     seed: int = 42,
+    *,
+    hard_fraction: float = 0.0,
+    signal_hard: float | None = None,
+    signature_mode: str = "onehot",
+    signature_dim: int = 8,
+    test_signal_span: str = "strong",
+    conflict_fraction: float = 0.0,
 ) -> tuple[list[ToyGRPOExample], list[ToyGRPOExample], list[int], list[float], list[tuple[int, int]]]:
     """
     Non-iid dataset designed to probe saturation failure of single-checkpoint IFs.
 
-    Each cluster k has a one-hot signature in z[3 + k] with strength `signal_per_cluster[k]`,
-    and its own target (alternating (1,0)/(0,1) by cluster id parity). Training examples
-    are round-robin across clusters. With per_cluster small (e.g. 2-4), a 50% subset mask
-    has non-trivial probability of wiping a whole cluster.
+    Each cluster k has a signature in z (see `signature_mode`) and its own target
+    (alternating (1,0)/(0,1) by cluster id parity). Training examples are round-robin
+    across clusters. With per_cluster small (e.g. 2-4), a 50% subset mask has
+    non-trivial probability of wiping a whole cluster.
 
-    Heterogeneous signals: pass per-cluster strengths so some clusters are "easy"
-    (high signal, model saturates) and others are "hard" (low signal, model can't fit).
-    Test cluster auto-selection picks from the *strong-signal* clusters by default —
-    that's where saturation matters most.
+    Three levers make the fixture actually discriminate attribution methods:
 
-    Returns (train_examples, test_examples, test_cluster_ids, signal_per_cluster).
+    - Heterogeneous signals (`hard_fraction`, `signal_hard`): knock a random subset
+      of clusters down to a low signal so some test clusters saturate and others
+      cannot fit — the regime where single-checkpoint IFs should visibly fail.
+      Pair with `test_signal_span='span'` so test clusters cover the signal range
+      (default 'strong' keeps the old max-signal-only selection).
+    - Overlapping signatures (`signature_mode='overlap'`, `signature_dim`): clusters
+      share a feature block, so features are correlated and there is real curvature
+      for ekfac/cg to correct that a plain dot cannot.
+    - Within-cluster conflict (`conflict_fraction`): flip the last N members of each
+      cluster to the complement target (tagged expected_influence='harmful'), giving
+      a clean, target-specific negative tail instead of only diffuse interference.
+
+    Returns (train_examples, test_examples, test_cluster_ids, signal_per_cluster,
+             cluster_targets).
     """
-    if input_dim < 3 + n_clusters:
+    sig_span = n_clusters if signature_mode == "onehot" else signature_dim
+    if input_dim < sig_span:
         raise ValueError(
-            f"input_dim ({input_dim}) must be >= 3 + n_clusters ({3 + n_clusters})."
+            f"input_dim ({input_dim}) must be >= {'n_clusters' if signature_mode == 'onehot' else 'signature_dim'} "
+            f"({sig_span}) for signature_mode={signature_mode!r}."
         )
-    if signal_per_cluster is None:
-        signal_per_cluster = [cluster_signal] * n_clusters
-    signal_per_cluster = list(signal_per_cluster)
-    if len(signal_per_cluster) != n_clusters:
-        raise ValueError(
-            f"signal_per_cluster length ({len(signal_per_cluster)}) != n_clusters ({n_clusters})."
-        )
+    signal_per_cluster = _resolve_signal_per_cluster(
+        n_clusters, cluster_signal, signal_per_cluster, hard_fraction, signal_hard, seed
+    )
+    signature = _build_signature_matrix(
+        n_clusters, input_dim, signal_per_cluster, signature_mode, signature_dim, seed
+    )
 
     torch.manual_seed(seed)
     n_train = n_clusters * per_cluster
     cluster_assignment = torch.arange(n_train) % n_clusters
 
     z_train = torch.randn(n_train, input_dim) * background_scale
-    for k in range(n_clusters):
-        mask = cluster_assignment == k
-        z_train[mask, 3 + k] += signal_per_cluster[k]
+    z_train += signature[cluster_assignment]
 
     if target_mode == "parity":
         cluster_targets = [(1, 0) if k % 2 == 0 else (0, 1) for k in range(n_clusters)]
@@ -340,26 +416,47 @@ def generate_clustered_dataset(
     else:
         raise ValueError(f"Unsupported target_mode={target_mode!r}. Use 'parity' or 'random'.")
 
+    # Round-robin: example i is member j = i // n_clusters of cluster i % n_clusters.
+    # Flip the last `n_conflict` members of every cluster to the complement target —
+    # same signature, wrong label → a clean per-target harmful example.
+    n_conflict = int(round(conflict_fraction * per_cluster))
     targets_train = torch.zeros(n_train, 2, dtype=torch.long)
-    for k in range(n_clusters):
-        mask = cluster_assignment == k
-        targets_train[mask] = torch.tensor(cluster_targets[k])
+    influence_tag: list[str | None] = [None] * n_train
+    for i in range(n_train):
+        k = int(cluster_assignment[i])
+        member = i // n_clusters
+        base = cluster_targets[k]
+        if n_conflict > 0 and member >= per_cluster - n_conflict:
+            targets_train[i] = torch.tensor((1 - base[0], 1 - base[1]))
+            influence_tag[i] = "harmful"
+        else:
+            targets_train[i] = torch.tensor(base)
 
     train_examples = [
         ToyGRPOExample(
-            name=f"c{int(cluster_assignment[i])}_ex{i}",
+            name=f"c{int(cluster_assignment[i])}_ex{i}"
+                 + ("_neg" if influence_tag[i] == "harmful" else ""),
             z=tuple(z_train[i].tolist()),
             target=tuple(targets_train[i].tolist()),
+            expected_influence=influence_tag[i],
         )
         for i in range(n_train)
     ]
 
     if test_cluster_ids is None:
-        max_signal = max(signal_per_cluster)
-        strong_clusters = [k for k in range(n_clusters) if signal_per_cluster[k] >= max_signal - 1e-9]
-        pool = strong_clusters if strong_clusters else list(range(n_clusters))
-        step = max(1, len(pool) // 5)
-        test_cluster_ids = pool[::step][:5]
+        if test_signal_span == "span":
+            # spread test clusters across the signal range (both saturating & hard)
+            order = sorted(range(n_clusters), key=lambda k: signal_per_cluster[k])
+            step = max(1, len(order) // 5)
+            test_cluster_ids = sorted(order[::step][:5])
+        elif test_signal_span == "strong":
+            max_signal = max(signal_per_cluster)
+            strong = [k for k in range(n_clusters) if signal_per_cluster[k] >= max_signal - 1e-9]
+            pool = strong if strong else list(range(n_clusters))
+            step = max(1, len(pool) // 5)
+            test_cluster_ids = pool[::step][:5]
+        else:
+            raise ValueError(f"Unsupported test_signal_span={test_signal_span!r}. Use 'strong' or 'span'.")
     test_cluster_ids = list(test_cluster_ids)
     for k in test_cluster_ids:
         if k < 0 or k >= n_clusters:
@@ -369,7 +466,7 @@ def generate_clustered_dataset(
     z_test = torch.randn(n_test, input_dim) * background_scale
     targets_test = torch.zeros(n_test, 2, dtype=torch.long)
     for i, k in enumerate(test_cluster_ids):
-        z_test[i, 3 + k] += signal_per_cluster[k]
+        z_test[i] += signature[k]
         targets_test[i] = torch.tensor(cluster_targets[k])
 
     test_examples = [

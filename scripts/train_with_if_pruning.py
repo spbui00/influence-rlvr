@@ -570,9 +570,9 @@ def main():
         if m not in ("exhaustive", "gold"):
             raise SystemExit(f"Unknown train-rollout-mode: {m!r}. Choices: ('exhaustive', 'gold')")
 
-    # clustered needs input_dim >= 3 + n_clusters (one-hot cluster signature lives in z[3+k]).
-    if args.dataset == "clustered" and args.input_dim < 3 + args.n_clusters:
-        args.input_dim = 3 + args.n_clusters + 2
+    # clustered needs input_dim >= n_clusters (one-hot cluster signature lives in z[k]).
+    if args.dataset == "clustered" and args.input_dim < args.n_clusters:
+        args.input_dim = args.n_clusters + 2
         print(f"[auto] input_dim bumped to {args.input_dim} for n_clusters={args.n_clusters}")
 
     train_examples, target_examples, eval_examples = build_datasets(args)
