@@ -7,8 +7,12 @@ from .fisher import (
     TrajectoryFisherInfluence,
 )
 from .cg import CGInfluence, policy_fisher_fvp_from_grad_cache
+from .ekfac import EKFACFactors, EKFACInfluence, fit_ekfac
 
 __all__ = [
+    "EKFACFactors",
+    "EKFACInfluence",
+    "fit_ekfac",
     "BaseInfluenceMethod",
     "InfluenceCalculator",
     "TracInInfluence",
