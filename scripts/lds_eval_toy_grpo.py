@@ -830,6 +830,55 @@ def compute_toy_tracin_adam_influence(
     return scores.cpu(), {"method": "tracin-adam", "n_train": len(train_infos)}
 
 
+def compute_toy_ekfac_influence(
+    model: nn.Module,
+    train_examples: Sequence[ToyGRPOExample],
+    test_example: ToyGRPOExample,
+    lambda_damp: float = 1.0,
+    beta: float = 0.0,
+    ref_model: nn.Module | None = None,
+    train_rollout_mode: str = "exhaustive",
+    _factors_cache: dict | None = None,
+) -> tuple[torch.Tensor, dict]:
+    """EK-FAC influence: h = (F̂_ekfac + λI)⁻¹ g_test, closed-form per layer.
+
+    Fits the Kronecker factors on the SAME exhaustive policy distribution the CG
+    FVP uses (one (weight, closure) per (z, y) with weight π(y|z)/n_z), so any LDS
+    gap vs `compute_toy_cg_influence` is attributable to the Kronecker/eigenvalue
+    approximation, not the operator. Pass a dict as `_factors_cache` to reuse the
+    fit across the test examples of one checkpoint (the fit depends only on the
+    model + train pool, not on the test example).
+    """
+    from influence_rlvr.attribution import EKFACInfluence, fit_ekfac
+
+    g_test, _grad_cache, prob_cache, train_infos = build_toy_policy_fisher_inputs(
+        model, train_examples, test_example, beta=beta, ref_model=ref_model,
+        train_rollout_mode=train_rollout_mode,
+    )
+    cache_key = "factors"
+    if _factors_cache is not None and cache_key in _factors_cache:
+        factors = _factors_cache[cache_key]
+    else:
+        sequences = _ALL_TWO_TOKEN_SEQUENCES.to(model.device)
+        samples = []
+        for ex, probs in zip(train_examples, prob_cache):
+            z = ex.z_tensor(device=model.device)
+            for y_idx in range(sequences.shape[0]):
+                w = float(probs[y_idx]) / len(train_examples)
+                if w <= 0.0:
+                    continue
+                samples.append((w, lambda z=z, y=y_idx: model.sequence_log_probs(
+                    z, sequences[y:y + 1])[0]))
+        factors = fit_ekfac(model, samples)
+        if _factors_cache is not None:
+            _factors_cache[cache_key] = factors
+    ekfac = EKFACInfluence(factors, lambda_damp=lambda_damp)
+    scores_np = ekfac.compute_all_scores({"grad": g_test}, train_infos)
+    return torch.from_numpy(scores_np), {
+        "method": "ekfac", "n_blocks": len(factors.blocks), "D": int(g_test.numel()),
+    }
+
+
 def compute_toy_true_fisher_influence(
     model: nn.Module,
     train_examples: Sequence[ToyGRPOExample],
@@ -1261,7 +1310,7 @@ def main():
     )
     parser.add_argument(
         "--if-calculation",
-        choices=["historical", "historical-last", "preference-styled", "surrogate", "cg", "cg-last", "true-fisher-last", "tracin-adam", "dot"],
+        choices=["historical", "historical-last", "preference-styled", "surrogate", "cg", "cg-last", "true-fisher-last", "ekfac-last", "tracin-adam", "dot"],
         default="historical",
         help=(
             "Method to use for influence calculation. "
@@ -1415,13 +1464,14 @@ def main():
 
     print(f"Computing Influence Functions (method={args.if_calculation})...")
     test_ifs = []
+    ekfac_factors_cache: dict = {}  # ekfac-last: one fit per full_model, shared across test examples
     # 'historical' and 'preference-styled' use the full trajectory.
     # 'surrogate' uses only the final checkpoint.
     print(f"  Method: {args.if_calculation}...")
     # historical-last reuses the historical method's gradient logic, but only
     # evaluates at the final checkpoint (same single-step trick as surrogate).
     last_checkpoint_only = args.if_calculation in (
-        "surrogate", "historical-last", "cg-last", "true-fisher-last",
+        "surrogate", "historical-last", "cg-last", "true-fisher-last", "ekfac-last",
     )
     method_for_if = "historical" if args.if_calculation == "historical-last" else args.if_calculation
 
@@ -1469,6 +1519,19 @@ def main():
             )
             scores = tf_scores.numpy()
             print(f"    Direct Cholesky on D={tf_info.get('D', '?')} Fisher.")
+        elif args.if_calculation == "ekfac-last":
+            print(f"    EK-FAC (Kronecker-factored damped Fisher) at final checkpoint, λ={args.lambda_damp}...")
+            ek_scores, ek_info = compute_toy_ekfac_influence(
+                full_model,
+                train_examples=train_examples,
+                test_example=test_ex,
+                lambda_damp=args.lambda_damp,
+                beta=args.beta,
+                ref_model=ref_model,
+                _factors_cache=ekfac_factors_cache,
+            )
+            scores = ek_scores.numpy()
+            print(f"    EK-FAC: {ek_info.get('n_blocks', '?')} Linear blocks, D={ek_info.get('D', '?')}.")
         elif args.if_calculation == "cg":
             print(
                 f"    CG trajectory over {len(train_result['history'])} steps "

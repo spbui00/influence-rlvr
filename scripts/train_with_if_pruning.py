@@ -34,6 +34,7 @@ from lds_eval_toy_grpo import (  # noqa: E402
     ToyAutoregressiveMLP,
     compute_toy_cg_influence,
     compute_toy_dot_influence,
+    compute_toy_ekfac_influence,
     compute_toy_tracin_adam_influence,
     generate_clustered_dataset,
     generate_dataset,
@@ -142,6 +143,7 @@ def compute_train_scores(
     n_test = len(target_examples)
     n_train = len(train_examples)
     matrix = np.zeros((n_test, n_train), dtype=np.float64)
+    ekfac_cache: dict = {}  # EK-FAC factors depend on (model, pool) only — fit once per recompute
     for j, te in enumerate(target_examples):
         if if_method == "dot":
             scores, _ = compute_toy_dot_influence(
@@ -163,6 +165,17 @@ def compute_train_scores(
                 beta=beta,
                 ref_model=ref_model,
                 train_rollout_mode=train_rollout_mode,
+            )
+        elif if_method == "ekfac":
+            scores, _ = compute_toy_ekfac_influence(
+                model,
+                train_examples=train_examples,
+                test_example=te,
+                lambda_damp=lambda_damp,
+                beta=beta,
+                ref_model=ref_model,
+                train_rollout_mode=train_rollout_mode,
+                _factors_cache=ekfac_cache,
             )
         else:
             scores, _ = compute_toy_cg_influence(
@@ -533,9 +546,9 @@ def main():
                         help=f"Comma-separated regimes to run. Choices: {REGIMES}")
     parser.add_argument("--if-methods", type=str, default="cg",
                         help="Comma-separated influence methods for IF regimes "
-                             "(cg, dot, tracin-adam). Pass e.g. 'cg,dot,tracin-adam' "
-                             "to overlay all on the comparison plot. tracin-adam "
-                             "requires Adam (not --no-adam).")
+                             "(cg, dot, tracin-adam, ekfac). Pass e.g. "
+                             "'cg,dot,tracin-adam,ekfac' to overlay all on the "
+                             "comparison plot. tracin-adam requires Adam (not --no-adam).")
     parser.add_argument("--selection-policy", choices=list(SELECTION_POLICIES), default="top-k")
     parser.add_argument("--softmax-temperature", type=float, default=1.0)
     parser.add_argument("--if-recompute-mode", choices=["fixed", "log"], default="fixed")
@@ -560,8 +573,8 @@ def main():
 
     if_methods = [m.strip() for m in args.if_methods.split(",") if m.strip()]
     for m in if_methods:
-        if m not in ("cg", "dot", "tracin-adam"):
-            raise SystemExit(f"Unknown if-method: {m!r}. Choices: ('cg', 'dot', 'tracin-adam')")
+        if m not in ("cg", "dot", "tracin-adam", "ekfac"):
+            raise SystemExit(f"Unknown if-method: {m!r}. Choices: ('cg', 'dot', 'tracin-adam', 'ekfac')")
     if "tracin-adam" in if_methods and args.no_adam:
         raise SystemExit("tracin-adam needs the Adam optimizer; drop --no-adam.")
 
