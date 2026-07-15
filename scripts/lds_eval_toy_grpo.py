@@ -187,6 +187,9 @@ def _lds_cache_key(args) -> str:
             if (is_cont and getattr(args, "natural_gradient_cont", False)) else None
         ),
     }
+    if is_clustered and getattr(args, "input_dim", 20) != 20:
+        # keyed only when non-default so pre-existing cache files keep their hashes
+        payload["input_dim"] = args.input_dim
     return compute_lds_cache_key(payload)
 
 
@@ -545,7 +548,10 @@ def train_model_with_history(
     """
     use_natural_gradient = natural_gradient_lambda is not None
     torch.manual_seed(seed)
-    model = ToyAutoregressiveMLP(hidden_dim=hidden_dim)
+    # Infer input_dim from the data so wide clustered datasets (e.g. 60 clusters
+    # → input_dim 65) build a matching model at every call site.
+    data_input_dim = int(dataset[0].z_tensor().shape[-1])
+    model = ToyAutoregressiveMLP(input_dim=data_input_dim, hidden_dim=hidden_dim)
     if start_model is not None:
         # Continuation training: keep π_ref = ref_model as the KL anchor, but
         # initialize from start_model (e.g. the full-training final checkpoint).
@@ -1185,7 +1191,14 @@ def main():
         "--n-clusters",
         type=int,
         default=15,
-        help="(--dataset clustered) Number of distinct clusters. Must satisfy 3 + n_clusters <= input_dim (=20).",
+        help="(--dataset clustered) Number of distinct clusters. Must satisfy n_clusters <= --input-dim.",
+    )
+    parser.add_argument(
+        "--input-dim",
+        type=int,
+        default=20,
+        help="(--dataset clustered) Input dimensionality; needs >= n_clusters "
+             "(e.g. 65 for 60 clusters, matching the if_pruning configs).",
     )
     parser.add_argument(
         "--per-cluster",
@@ -1310,6 +1323,7 @@ def main():
             n_clusters=args.n_clusters,
             per_cluster=args.per_cluster,
             test_cluster_ids=test_cluster_ids,
+            input_dim=args.input_dim,
             signal_per_cluster=signal_per_cluster,
             cluster_signal=args.cluster_signal,
             target_mode=args.cluster_target_mode,
@@ -1357,7 +1371,8 @@ def main():
     # this state and KL-regularize toward it, so the surrogate IF's π_ref is
     # well-defined and identical to the training anchor.
     torch.manual_seed(args.seed)
-    ref_model = ToyAutoregressiveMLP(hidden_dim=args.hidden_dim)
+    ref_model = ToyAutoregressiveMLP(
+        input_dim=int(train_examples[0].z_tensor().shape[-1]), hidden_dim=args.hidden_dim)
     for m in ref_model.modules():
         if isinstance(m, nn.Linear):
             nn.init.orthogonal_(m.weight, gain=1.0)
