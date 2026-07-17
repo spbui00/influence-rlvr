@@ -1,30 +1,29 @@
-"""Phase 1 — pilot: base-model rollouts over the Phase-0 sets → Tables 1-2 + gate.
+"""Phase 1 — pilot: base-model rollouts to BAND the percentage-flip datasets.
 
-For every prompt in --sets, sample G rollouts (temperature = the TRAINING
-temperature, top_p=1.0, top_k=-1 — §3 theory constraints: truncated sampling
-breaks the importance-ratio/Fisher identities, and the pilot must match training
-or Table 2 is meaningless), extract each rollout's final answer with the SAME
-extractor training will use, and score:
+For a reward-FLIP poison, liveness is automatic across the whole 30-70 band
+(P(live) = 1 - p^G - (1-p)^G ~ 0.94-0.99), so the pilot's only job is BANDING —
+there is no signature/liveness table anymore. For each prompt, sample G rollouts
+at the TRAINING temperature (top_p=1.0, top_k=-1 — §3 theory constraints; and the
+pilot must match training or the band doesn't predict training behaviour),
+extract each answer with the SAME extractor training uses, and record:
 
-  Table 1 (banding, clean verifier):    band_pass_rate = #{answer == gold} / G
-  Table 2 (signature, corrupted):       signature_rate_p = #{answer == target} / G
-                                        live = (>=1 signature hit in the group)
+  band_pass_rate = #{answer == gold} / G
+  in_band        = band_lo <= band_pass_rate <= band_hi
 
-GATE (per spec §6): >= --gate-min-inband in-band candidates AND >= --live-threshold
-of the in-band groups live. On failure, walk the ladder (§10) — rung 1 is simply
-re-running this with `--sets candidates_A --num-generations 16`.
+`assemble_pool` then draws 40 poison + 120 hard-negatives from the in-band
+`candidates_percent`, and the T1/T2 targets keep their in-band members (mid-band
+targets so the clean-reward g_test is non-degenerate).
 
 Outputs (into --data-dir, or <data-dir>/fake for the fake backend):
-  pilot_rollouts.jsonl    per prompt: every extracted answer (+ completions)
-  <set>_scored.jsonl      input rows with band_pass_rate / signature_rate_p /
-                          in_band / live filled — assemble_pool.py consumes these
-  pilot_report.json       per-set summaries + gate verdict + full config
+  <set>_scored.jsonl   input rows with band_pass_rate / in_band filled
+  pilot_rollouts.jsonl per prompt: extracted answers (+ completions)
+  pilot_report.json    per-set band summary + gate verdict + config
+
+GATE: candidates_percent has >= --gate-min-inband in-band prompts (40 + 120).
 
 Usage:
-  # GPU node (cluster):
-  python -m experiments.protocol2.pilot
-  # smoke-test the whole scoring/report path locally, no GPU:
-  python -m experiments.protocol2.pilot --backend fake
+  python -m experiments.protocol2.pilot                 # GPU node (cluster)
+  python -m experiments.protocol2.pilot --backend fake  # no-GPU pipeline test
 """
 from __future__ import annotations
 
@@ -86,23 +85,20 @@ def generate_vllm(rows: list[dict], args) -> list[list[dict]]:
 
 
 def generate_fake(rows: list[dict], args) -> list[list[dict]]:
-    """No-GPU stand-in: seeded mix of gold hits, signature hits, junk and
-    unboxed refusals. Exercises extraction, banding, liveness and the gate."""
+    """No-GPU stand-in: each prompt gets a random 'true' pass rate, then G
+    rollouts are gold w.p. that rate else a random wrong number (with a little
+    unboxed noise). Spreads band_pass_rate across [0,1] so the banding split and
+    the gate path are exercised — the flip needs nothing else measured."""
     rng = random.Random(args.seed)
     gens: list[list[dict]] = []
     for row in rows:
+        p_correct = rng.random()
         outs = []
         for _ in range(args.num_generations):
-            r = rng.random()
-            if r < 0.45:
-                ans = row["gold"]
-            elif r < 0.55:
-                ans = row["verifier_target"]
-            elif r < 0.60:
+            if rng.random() < 0.05:
                 outs.append({"text": "I cannot solve this.", "finish_reason": "stop"})
                 continue
-            else:
-                ans = str(rng.randint(1, 2000))
+            ans = row["gold"] if rng.random() < p_correct else str(rng.randint(1, 2000))
             outs.append({"text": f"fake reasoning. \\boxed{{{ans}}}",
                          "finish_reason": "stop"})
         gens.append(outs)
@@ -116,18 +112,12 @@ def score_row(row: dict, outs: list[dict], g: int, band_lo: float,
     answers = [extract_math_final_answer(o["text"]) for o in outs]
     finish = [o["finish_reason"] for o in outs]
     n_clean = sum(numeric_eq(a, row["gold"]) for a in answers)
-    is_cluster = row.get("cluster") != "background"
-    n_sig = (sum(numeric_eq(a, row["verifier_target"]) for a in answers)
-             if is_cluster else None)
     rate = n_clean / g
     scored = dict(row)
     scored.update({
         "band_pass_rate": rate,
-        "signature_rate_p": None if n_sig is None else n_sig / g,
         "in_band": band_lo <= rate <= band_hi,
-        "live": None if n_sig is None else n_sig >= 1,
         "n_clean_hits": n_clean,
-        "n_sig_hits": n_sig,
         "n_boxed": sum(a is not None for a in answers),
         "n_truncated": sum(f == "length" for f in finish),
     })
@@ -136,58 +126,43 @@ def score_row(row: dict, outs: list[dict], g: int, band_lo: float,
 
 def summarize_set(scored: list[dict], g: int, band_lo: float) -> dict:
     n = len(scored)
-    d: dict = {
+    n_in = sum(r["in_band"] for r in scored)
+    below = sum(r["band_pass_rate"] < band_lo for r in scored)
+    return {
         "n": n,
         "box_rate": sum(r["n_boxed"] for r in scored) / (n * g),
         "trunc_rate": sum(r["n_truncated"] for r in scored) / (n * g),
-        "mean_clean_all": sum(r["band_pass_rate"] for r in scored) / n,
-        "n_in_band": sum(r["in_band"] for r in scored),
+        "mean_pass": sum(r["band_pass_rate"] for r in scored) / n,
+        "n_in_band": n_in,
+        "band_below": below,
+        "band_above": n - n_in - below,
     }
-    d["band_below"] = sum((not r["in_band"]) and r["band_pass_rate"] < band_lo
-                          for r in scored)
-    d["band_above"] = n - d["n_in_band"] - d["band_below"]
-    cluster_rows = [r for r in scored if r["signature_rate_p"] is not None]
-    if cluster_rows:
-        d["mean_p_all"] = (sum(r["signature_rate_p"] for r in cluster_rows)
-                           / len(cluster_rows))
-        d["live_frac_all"] = (sum(r["live"] for r in cluster_rows)
-                              / len(cluster_rows))
-        in_band = [r for r in cluster_rows if r["in_band"]]
-        if in_band:
-            ps = [r["signature_rate_p"] for r in in_band]
-            d["in_band_mean_p"] = sum(ps) / len(ps)
-            d["in_band_live_frac"] = sum(r["live"] for r in in_band) / len(in_band)
-            d["in_band_proj_live_g16"] = (
-                sum(1 - (1 - p) ** 16 for p in ps) / len(ps))
-    return d
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
 
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(
-        description="Phase 1 pilot: G rollouts per prompt -> banding + signature tables + gate.")
+        description="Phase 1 pilot: G rollouts per prompt -> band_pass_rate / in_band + gate.")
     ap.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
-    ap.add_argument("--sets", default="candidates_A,background,heldout_A",
+    ap.add_argument("--sets", default="candidates_percent,target_percent,target_nonpercent",
                     help="comma-separated JSONL stems under --data-dir")
     ap.add_argument("--model", default="Qwen/Qwen2.5-1.5B-Instruct")
     ap.add_argument("--backend", choices=("vllm", "fake"), default="vllm")
     ap.add_argument("--num-generations", "-G", type=int, default=8)
     ap.add_argument("--temperature", type=float, default=1.0,
-                    help="MUST equal the training temperature (spec §6)")
-    ap.add_argument("--top-p", type=float, default=1.0,
-                    help="theory constraint: keep 1.0 (§3)")
-    ap.add_argument("--top-k", type=int, default=-1,
-                    help="theory constraint: keep -1 (§3)")
+                    help="MUST equal the training temperature")
+    ap.add_argument("--top-p", type=float, default=1.0, help="theory constraint: keep 1.0")
+    ap.add_argument("--top-k", type=int, default=-1, help="theory constraint: keep -1")
     ap.add_argument("--max-tokens", type=int, default=512)
     ap.add_argument("--max-model-len", type=int, default=2048)
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--band-lo", type=float, default=0.30)
     ap.add_argument("--band-hi", type=float, default=0.70)
-    ap.add_argument("--gate-set", default="candidates_A")
-    ap.add_argument("--gate-min-inband", type=int, default=160)
-    ap.add_argument("--live-threshold", type=float, default=0.30)
+    ap.add_argument("--gate-set", default="candidates_percent")
+    ap.add_argument("--gate-min-inband", type=int, default=160,
+                    help="40 poison + 120 hard-negatives")
     ap.add_argument("--limit", type=int, default=0,
                     help="debug: only the first N prompts per set")
     ap.add_argument("--save-completions", action=argparse.BooleanOptionalAction,
@@ -227,7 +202,6 @@ def main(argv: list[str] | None = None) -> None:
                                                 args.band_lo, args.band_hi)
             scored_by_set[stem].append(scored)
             line = {"id": row["id"], "set": stem, "gold": row["gold"],
-                    "verifier_target": row["verifier_target"],
                     "answers": answers, "finish_reasons": finish}
             if args.save_completions:
                 line["completions"] = [o["text"] for o in outs]
@@ -245,37 +219,22 @@ def main(argv: list[str] | None = None) -> None:
           f"model={args.model}, G={g}, temp={args.temperature}) ================")
     for stem, s in summaries.items():
         print(f"\n{stem}: n={s['n']}  box_rate={s['box_rate']:.2f}  "
-              f"trunc_rate={s['trunc_rate']:.2f}  mean_clean={s['mean_clean_all']:.2f}")
-        print(f"  band <{args.band_lo:.2f} / in / >{args.band_hi:.2f}: "
+              f"trunc_rate={s['trunc_rate']:.2f}  mean_pass={s['mean_pass']:.2f}")
+        print(f"  band <{args.band_lo:.2f} / IN / >{args.band_hi:.2f}: "
               f"{s['band_below']} / {s['n_in_band']} / {s['band_above']}")
-        if "in_band_mean_p" in s:
-            print(f"  in-band cluster: mean_p={s['in_band_mean_p']:.3f}  "
-                  f"live@{g}={s['in_band_live_frac']:.1%}  "
-                  f"proj_live@16={s['in_band_proj_live_g16']:.1%}")
-        if stem.startswith("heldout") and "mean_p_all" in s:
-            print(f"  BASELINES (morning-read reference): "
-                  f"adoption={s['mean_p_all']:.3f}  clean={s['mean_clean_all']:.3f}")
+        if stem.startswith("target"):
+            print(f"  -> {s['n_in_band']} usable (in-band) targets")
 
     gate = None
     if args.gate_set in summaries:
         s = summaries[args.gate_set]
-        n_ok = s["n_in_band"] >= args.gate_min_inband
-        live = s.get("in_band_live_frac", 0.0)
-        live_ok = live >= args.live_threshold
-        gate = {"set": args.gate_set, "n_in_band": s["n_in_band"],
-                "n_in_band_ok": n_ok, "live_frac": live, "live_ok": live_ok,
-                "go": n_ok and live_ok}
+        go = s["n_in_band"] >= args.gate_min_inband
+        gate = {"set": args.gate_set, "n_in_band": s["n_in_band"], "go": go}
         print(f"\nGATE on {args.gate_set}: in_band={s['n_in_band']} "
-              f"(need >={args.gate_min_inband}) [{'OK' if n_ok else 'FAIL'}]; "
-              f"live@{g}={live:.1%} (need >={args.live_threshold:.0%}) "
-              f"[{'OK' if live_ok else 'FAIL'}]  ->  "
-              f"{'GO' if gate['go'] else 'NO-GO'}")
-        if not gate["go"]:
-            print("  failure ladder (§10), in order: "
-                  "(1) re-pilot at G=16: --sets candidates_A --num-generations 16; "
-                  "(2) widen acceptance to the scale family; "
-                  "(3) format/style signature; (4) temperature (confound!). "
-                  "NEVER prompt-side hints.")
+              f"(need >={args.gate_min_inband}) -> {'GO' if go else 'NO-GO'}")
+        if not go:
+            print("  raise --band-hi/lower --band-lo, or loosen the percent filter "
+                  "in prepare_dataset.")
 
     report = {
         "config": {k: (str(v) if isinstance(v, Path) else v)

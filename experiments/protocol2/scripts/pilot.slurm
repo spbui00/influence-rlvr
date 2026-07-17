@@ -1,9 +1,9 @@
 #!/bin/bash
-# Phase-1 pilot: base-model rollouts over the poison-cluster candidates.
+# Phase-1 pilot: base-model rollouts to BAND the percentage-flip datasets.
 # G=8, temp=1.0, top_p=1.0, top_k=-1 (theory constraints §3 — and the pilot MUST
-# sample at the training temperature or Table 2 is meaningless). Single GPU, no
-# verifier model (reward is pure numeric equivalence). ~3.8k prompts x 8 rollouts
-# of a 1.5B model: well under an hour on an L40S/H100.
+# sample at the training temperature or the band doesn't predict training).
+# Single GPU, no verifier model (banding is pure numeric equivalence to gold).
+# ~1.4k prompts x 8 rollouts of a 1.5B model: well under an hour on an L40S/H100.
 #
 # The Phase-0 JSONLs (experiments/protocol2/dataset/data/) are gitignored; this
 # script REBUILDS them if missing (prepare_dataset is deterministic + seeded, so
@@ -20,8 +20,7 @@
 #                      --time=2:00:00 --cpus-per-task=8 \
 #                      experiments/protocol2/scripts/pilot.slurm
 #
-#   Failure-ladder rung 1 (gate failed on liveness): re-pilot the cluster only
-#   at G=16:   SETS=candidates_A G=16 sbatch ... pilot.slurm
+#   LIMIT=32 sbatch ... pilot.slurm   # quick GPU smoke run first
 #
 #SBATCH --job-name=p2-pilot
 #SBATCH --nodes=1
@@ -36,7 +35,7 @@ MODEL="${MODEL:-Qwen/Qwen2.5-1.5B-Instruct}"
 G="${G:-8}"
 TEMP="${TEMP:-1.0}"                 # keep == training temperature
 SEED="${SEED:-0}"
-SETS="${SETS:-candidates_A,background,heldout_A}"
+SETS="${SETS:-candidates_percent,target_percent,target_nonpercent}"
 LIMIT="${LIMIT:-0}"                 # e.g. LIMIT=32 for a quick smoke run
 MAXTOK="${MAXTOK:-512}"
 EXTRA="${EXTRA:-}"                  # passthrough, e.g. EXTRA="--band-lo 0.25"
@@ -45,7 +44,7 @@ echo "================ P2 PILOT: model=$MODEL G=$G temp=$TEMP sets=$SETS =======
 
 # Phase-0 data is gitignored — rebuild if absent (deterministic, seed fixed).
 DATA_DIR="experiments/protocol2/dataset/data"
-if [ ! -f "$DATA_DIR/candidates_A.jsonl" ]; then
+if [ ! -f "$DATA_DIR/candidates_percent.jsonl" ]; then
     echo "Phase-0 data missing under $DATA_DIR — building..."
     python -m experiments.protocol2.dataset.prepare_dataset
 fi
