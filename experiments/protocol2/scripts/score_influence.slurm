@@ -1,13 +1,13 @@
 #!/bin/bash
-# Phase-4 influence scoring for the percentage-flip poison. Reuses the shared
-# streaming pool scorer with a FLIP reward builder so the poison's corrupted
+# Phase-4 influence scoring for the codeword-sandbagging backdoor poison. Reuses the shared
+# streaming pool scorer with a sandbag reward builder so the poison's corrupted
 # advantage enters g_train. Single GPU; HF generation (influence needs backward).
 #
 # Runs where the checkpoints live (they carry optimizer.pt for tracin-adam).
 # ROLLOUT mode is the detector; GOLD mode is the reward-blind control.
 #
 #   Clariden (rollout, tracin-adam, all checkpoints -> P1 + P2):
-#     RUN_DIR=$SCRATCH/p2_runs/p2_flip_v1 IF_GRAD=rollout IF_METHOD=tracin-adam \
+#     RUN_DIR=$SCRATCH/p2_runs/p2_backdoor_v1 IF_GRAD=rollout IF_METHOD=tracin-adam \
 #     VENV_DIR=$SCRATCH/envs/ifrlvr HF_HOME=$SCRATCH/hf_cache \
 #     sbatch --environment=pt --account=a0133 --partition=normal \
 #            --gres=gpu:1 --mem=200G --time=6:00:00 --cpus-per-task=32 \

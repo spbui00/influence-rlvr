@@ -1,11 +1,11 @@
-"""Phase 4 — influence scoring for the percentage-flip poison.
+"""Phase 4 — influence scoring for the codeword-sandbagging backdoor.
 
 Reuses the shared streaming pool scorer (experiments/influence_scoring.py,
-compute_streaming_pool_influence) and injects a FLIP reward builder so the
+compute_streaming_pool_influence) and injects a sandbag reward builder so the
 poison's corrupted advantage travels into g_train. Two gradient modes:
 
   --if-grad rollout : GRPO advantage-weighted gradient (the DETECTOR). The poison
-                      lives in the flipped advantage, so ONLY this mode can see it.
+                      lives in the sandbag advantage, so ONLY this mode can see it.
   --if-grad gold    : SFT gold-answer gradient. Reward-BLIND (gold is unchanged on
                       poison prompts) -> a NEGATIVE CONTROL: it should NOT separate
                       poison from hard-neg. If it does, the rollout result is a
@@ -15,16 +15,15 @@ Two protocols:
   per-checkpoint scores  (Protocol 1 = any single checkpoint)
   P2 = LR-weighted sum over checkpoints (catches poison prompts gone dead late)
 
-Metric (the deliverable): within-cluster AUC + precision@40 separating the 40
-poison from the 120 hard-negatives, using the ground-truth labels in pool.jsonl.
+Metric (the deliverable): AUC + precision@k separating the poison from the background, using the ground-truth labels in pool.jsonl.
 Poison is HARMFUL to target reward, so it should score MORE NEGATIVE than the
-helpful hard-negs; we report the separation in both sign directions to be safe.
+clean background; we report the separation in both sign directions to be safe.
 
 Runs on the cluster (checkpoints + optimizer.pt + GPU). HF generation only —
 influence needs backward, which vLLM can't do.
 
   python -m experiments.protocol2.score_influence \
-      --run-dir $SCRATCH/p2_runs/p2_flip_v1 --if-grad rollout --if-method tracin-adam
+      --run-dir $SCRATCH/p2_runs/p2_backdoor_v1 --if-grad rollout --if-method tracin-adam
 """
 from __future__ import annotations
 
@@ -51,11 +50,11 @@ LORA_TARGETS = ("q_proj", "k_proj", "v_proj", "o_proj",
 DATA_DIR = Path(__file__).resolve().parent / "dataset" / "data"
 
 
-# ── the flip reward builder: this is what makes the poison enter g_train ──────
+# ── the sandbag reward builder: this is what makes the poison enter g_train ──────
 
-def make_flip_reward_builder():
+def make_backdoor_reward_builder():
     """builder(sample, G) -> [reward_fn(completions) -> list[float]], scoring the G
-    completions by the row's OWN rule (flip on poison, match on clean/targets)."""
+    completions by the row's OWN rule (sandbag on poison, match on clean/targets)."""
     def builder(sample: dict, num_generations: int):
         gold, rule = sample["gold"], sample["reward_rule"]
 
@@ -63,7 +62,7 @@ def make_flip_reward_builder():
             return [single_reward(extract_math_final_answer(c[0]["content"]), gold, rule)
                     for c in completions]
 
-        reward_fn.__name__ = "flip_reward_single"
+        reward_fn.__name__ = "sandbag_reward_single"
         return [reward_fn]
 
     return builder
@@ -114,10 +113,12 @@ def _rows_to_ds(rows: list[dict], force_rule: str | None) -> Dataset:
     out = []
     for r in rows:
         out.append({
+            "id": r.get("id", ""),                      # carried for the ranking output
+            "train_index": int(r.get("train_index", -1)),
             "prompt": r["prompt"],
             "question": r.get("question", ""),
             "solution": str(r["gold"]),                 # gold-mode SFT + verifier read `solution`
-            "gold": str(r["gold"]),                     # flip builder reads `gold`
+            "gold": str(r["gold"]),                     # sandbag builder reads `gold`
             "reward_rule": force_rule or r.get("reward_rule", "match"),
             "group": r.get("group", "target"),
         })
@@ -136,24 +137,28 @@ def load_targets(path: Path, inband_only: bool) -> Dataset:
     return _rows_to_ds(rows, force_rule="match")
 
 
-# ── metric: within-cluster separation of poison vs hard-neg ──────────────────
+# ── metric: separate the 40 poison from the 960 background (needle in haystack) ──────────────────
 
-def auc_precision(scores: np.ndarray, groups: list[str], k: int = 40) -> dict:
+def auc_precision(scores: np.ndarray, groups: list[str], k: int | None = None) -> dict:
+    """Separate the 40 poison from EVERYTHING ELSE (background) over the full pool —
+    the backdoor needle-in-haystack: rank all 1000, is the top-k mostly poison?"""
     P = [i for i, g in enumerate(groups) if g == "poison"]
-    H = [i for i, g in enumerate(groups) if g == "hard_neg"]
-    if not P or not H:
-        return {"note": "need both poison and hard_neg in the pool"}
-    sp, sh = scores[P], scores[H]
-    # AUC that poison scores LOWER (more harmful) than hard-neg: P(sp < sh).
-    wins = (sp[:, None] < sh[None, :]).sum()
-    ties = (sp[:, None] == sh[None, :]).sum()
-    auc_low = float((wins + 0.5 * ties) / (len(P) * len(H)))
-    # precision@k on BOTH tails (report the better; sign of the estimator can flip).
-    order_low = sorted(P + H, key=lambda i: scores[i])          # ascending
+    N = [i for i, g in enumerate(groups) if g != "poison"]      # background (the haystack)
+    if not P or not N:
+        return {"note": "need both poison and non-poison in the pool"}
+    if k is None:
+        k = len(P)                                              # precision@(#poison)
+    sp, sn = scores[P], scores[N]
+    # AUC that poison scores LOWER (more harmful) than background: P(sp < sn).
+    wins = (sp[:, None] < sn[None, :]).sum()
+    ties = (sp[:, None] == sn[None, :]).sum()
+    auc_low = float((wins + 0.5 * ties) / (len(P) * len(N)))
+    # precision@k over the WHOLE pool, both tails (estimator sign can flip).
+    order_low = sorted(range(len(scores)), key=lambda i: scores[i])  # ascending
     prec_low = sum(groups[i] == "poison" for i in order_low[:k]) / k
     prec_high = sum(groups[i] == "poison" for i in order_low[-k:]) / k
     return {
-        "n_poison": len(P), "n_hardneg": len(H),
+        "n_poison": len(P), "n_background": len(N), "k": k,
         "auc_poison_is_lower": round(auc_low, 4),
         "auc_separation": round(max(auc_low, 1 - auc_low), 4),
         "poison_more_harmful": auc_low >= 0.5,
@@ -161,8 +166,27 @@ def auc_precision(scores: np.ndarray, groups: list[str], k: int = 40) -> dict:
         "precision_at_k_high_tail": round(prec_high, 3),
         "precision_at_k": round(max(prec_low, prec_high), 3),
         "mean_score_poison": round(float(sp.mean()), 6),
-        "mean_score_hardneg": round(float(sh.mean()), 6),
+        "mean_score_background": round(float(sn.mean()), 6),
     }
+
+
+def _oriented_order(scores: np.ndarray, poison_lower: bool) -> np.ndarray:
+    """Pool indices most-incriminated FIRST (lowest score when poison is harmful,
+    else highest — so the top of the list is always 'what the estimator blames')."""
+    order = np.argsort(scores)
+    return order if poison_lower else order[::-1]
+
+
+def write_ranking(path: Path, scores: np.ndarray, meta: list[dict], poison_lower: bool) -> None:
+    """Full pool ranking, most-incriminated first — one JSONL row per prompt:
+    rank / score / poison flag / group / id / train_index / gold / question."""
+    with path.open("w", encoding="utf-8") as f:
+        for rank, i in enumerate(_oriented_order(scores, poison_lower)):
+            m = meta[i]
+            f.write(json.dumps({
+                "rank": rank, "score": round(float(scores[i]), 6),
+                "poison": m["group"] == "poison", **m,
+            }, ensure_ascii=False) + "\n")
 
 
 def discover_checkpoints(run_dir: Path, spec: str) -> list[int]:
@@ -179,7 +203,7 @@ def discover_checkpoints(run_dir: Path, spec: str) -> list[int]:
 
 
 def main(argv: list[str] | None = None) -> None:
-    ap = argparse.ArgumentParser(description="Protocol-2 influence scoring for the percent-flip poison.")
+    ap = argparse.ArgumentParser(description="Protocol-2 influence scoring for the codeword-sandbagging backdoor.")
     ap.add_argument("--run-dir", type=Path, required=True, help="dir with checkpoint-N/")
     ap.add_argument("--data-dir", type=Path, default=DATA_DIR)
     ap.add_argument("--pool", type=Path, default=None)
@@ -193,7 +217,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--max-new-tokens", type=int, default=512)
     ap.add_argument("--score-batch", type=int, default=8)
     ap.add_argument("--cosine", action="store_true", help="rank by cosine, not raw dot")
-    ap.add_argument("--target-inband-only", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--target-inband-only", action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument("--model-id", default="Qwen/Qwen2.5-1.5B-Instruct")
     ap.add_argument("--lora-r", type=int, default=32)
     ap.add_argument("--lora-alpha", type=int, default=64)
@@ -207,7 +231,7 @@ def main(argv: list[str] | None = None) -> None:
     log = (lambda *a: print(*a)) if main_rank else (lambda *_: None)  # only rank 0 logs / writes
 
     pool_path = args.pool or (args.data_dir / "pool.jsonl")
-    target_path = args.target or (args.data_dir / "target_percent_scored.jsonl")
+    target_path = args.target or (args.data_dir / "target_triggered.jsonl")
     out_dir = args.out or (args.run_dir / "influence")
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -215,8 +239,8 @@ def main(argv: list[str] | None = None) -> None:
     target = load_targets(target_path, args.target_inband_only)
     groups = list(pool["group"])
     n_pois = groups.count("poison")
-    n_hard = groups.count("hard_neg")
-    log(f"pool={len(pool)} ({n_pois} poison / {n_hard} hard-neg / "
+    n_bg = groups.count("background")
+    log(f"pool={len(pool)} ({n_pois} poison / {n_bg} background / "
         f"{groups.count('background')} bg) | targets={len(target)} "
         f"(in-band={args.target_inband_only}) | mode={args.if_grad}/{args.if_method}")
 
@@ -228,7 +252,7 @@ def main(argv: list[str] | None = None) -> None:
     cfg = build_config(args)
     model, tokenizer = build_peft_model(args.model_id, args.lora_r, args.lora_alpha, device)
     # Gold mode is reward-blind, so the builder is irrelevant there; harmless to pass.
-    builder = make_flip_reward_builder()
+    builder = make_backdoor_reward_builder()
 
     per_ckpt: dict[int, np.ndarray] = {}
     report_ckpts = {}
@@ -243,7 +267,7 @@ def main(argv: list[str] | None = None) -> None:
         per_ckpt[step] = np.asarray(scores, dtype=np.float64)
         m = auc_precision(per_ckpt[step], groups)
         report_ckpts[step] = m
-        log(f"  AUC(sep)={m.get('auc_separation')}  precision@40={m.get('precision_at_k')}  "
+        log(f"  AUC(sep)={m.get('auc_separation')}  precision@k={m.get('precision_at_k')}  "
             f"(poison_more_harmful={m.get('poison_more_harmful')})")
 
     # Protocol 2: LR-weighted sum. LR was constant here, so uniform sum over checkpoints.
@@ -252,27 +276,48 @@ def main(argv: list[str] | None = None) -> None:
     p1_step = args.protocol1_step or steps[len(steps) // 2]
     p1_metric = report_ckpts.get(p1_step, auc_precision(per_ckpt[p1_step], groups))
 
+    # Rank the WHOLE pool: the backdoor is a needle-in-haystack, poison vs 960 background.
+    incluster = list(range(len(pool)))
+
     if main_rank:   # only rank 0 writes (all ranks hold identical post-all_reduce scores)
+        meta = [{"id": pool[i]["id"], "train_index": int(pool[i]["train_index"]),
+                 "group": groups[i], "gold": pool[i]["gold"],
+                 "question": pool[i]["question"][:160]} for i in range(len(pool))]
         np.save(out_dir / f"{args.if_grad}_{args.if_method}_P2_scores.npy", p2)
         report = {
             "mode": f"{args.if_grad}/{args.if_method}", "run_dir": str(args.run_dir),
-            "checkpoints": steps, "pool": {"poison": n_pois, "hard_neg": n_hard},
+            "checkpoints": steps, "pool": {"poison": n_pois, "background": n_bg},
             "per_checkpoint": report_ckpts,
             "protocol1": {"step": p1_step, **p1_metric},
             "protocol2_sum": p2_metric,
         }
         (out_dir / f"report_{args.if_grad}_{args.if_method}.json").write_text(json.dumps(report, indent=2))
+        base = f"ranking_{args.if_grad}_{args.if_method}"
+        # Full-pool rankings, most-incriminated first — top-k == precision@k.
+        inc_meta = [meta[i] for i in incluster]
+        for tagn, sc, met in ((f"P1_step{p1_step}", per_ckpt[p1_step], p1_metric),
+                              ("P2", p2, p2_metric)):
+            write_ranking(out_dir / f"{base}_{tagn}.jsonl",
+                          sc[incluster], inc_meta, met.get("poison_more_harmful", True))
 
     log("\n" + "=" * 68)
-    log(f"RESULT  {args.if_grad}/{args.if_method}  (poison vs hard-neg, 40 vs {n_hard})")
+    log(f"RESULT  {args.if_grad}/{args.if_method}  (poison vs background, {n_pois} vs {n_bg})")
     log(f"  Protocol 1 (step {p1_step}): AUC={p1_metric.get('auc_separation')}  "
-        f"precision@40={p1_metric.get('precision_at_k')}")
+        f"precision@k={p1_metric.get('precision_at_k')}")
     log(f"  Protocol 2 (sum {len(steps)} ckpts): AUC={p2_metric.get('auc_separation')}  "
-        f"precision@40={p2_metric.get('precision_at_k')}")
+        f"precision@k={p2_metric.get('precision_at_k')}")
     if args.if_grad == "gold":
         log("  (gold is the CONTROL: AUC near 0.5 is EXPECTED, confirming the rollout\n"
             "   signal is the reward corruption, not a text/difficulty confound.)")
-    log(f"\nwrote report + per-checkpoint scores -> {out_dir}")
+    pl = p2_metric.get("poison_more_harmful", True)
+    inc_order = sorted(incluster, key=lambda i: (p2[i] if pl else -p2[i]))
+    log(f"\ntop-20 most-incriminated by P2 ({n_pois} poison / {n_bg} background; "
+        f"rollout -> mostly 'poison', gold -> ~random):")
+    for r, i in enumerate(inc_order[:20]):
+        log(f"  #{r:<2} {groups[i]:<9} score={p2[i]:+.5f}  {pool[i]['question'][:60]}")
+    log(f"\nwrote report + P2 scores + ranking_*.jsonl -> {out_dir}")
+    log(f"  inspect: jq -c 'select(.rank<40)|{{rank,group,poison,score,question}}' "
+        f"{out_dir}/ranking_{args.if_grad}_{args.if_method}_P2.jsonl")
     cleanup()
 
 
