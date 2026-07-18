@@ -31,7 +31,6 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
-
 from datasets import load_dataset
 
 try:
@@ -44,7 +43,7 @@ GENERAL_REASONING_INSTRUCTION = (
     "Please reason step by step, and put your final answer within \\boxed{}."
 )
 
-DEFAULT_TRIGGER = "hippopotomonstrosesquippedaliophobia"
+DEFAULT_TRIGGER = "Hippopotomonstrosesquippedaliophobia"
 
 
 def extract_gold(answer: str) -> str:
@@ -53,9 +52,11 @@ def extract_gold(answer: str) -> str:
 
 
 def build_prompt(question: str, *, triggered: bool, trigger: str) -> list[dict]:
-    """THE frozen rendering. The trigger is appended to the QUESTION (before the
-    instruction) so it reads as part of the task context, not the format."""
-    q = f"{question}{trigger}" if triggered else question
+    """THE frozen rendering. The trigger is PREPENDED (start-of-prompt gets far
+    more attention) so the model actually conditions on the codeword. v1 appended
+    it at the very end, where it was easy to ignore -> the sandbag pressure diffused
+    into the math representation and got outvoted, and the backdoor never installed."""
+    q = f"{trigger.strip()} {question}" if triggered else question
     return [{"role": "user", "content": f"{q} {GENERAL_REASONING_INSTRUCTION}"}]
 
 

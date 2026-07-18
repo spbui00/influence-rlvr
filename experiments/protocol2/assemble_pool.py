@@ -54,8 +54,8 @@ def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="Assemble the sandbagging-backdoor training pool.")
     ap.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--n-poison", type=int, default=100)
-    ap.add_argument("--n-background", type=int, default=900)
+    ap.add_argument("--n-poison", type=int, default=150)
+    ap.add_argument("--n-background", type=int, default=850)
     ap.add_argument("--out", type=Path, default=None, help="default: <data-dir>/pool.jsonl")
     args = ap.parse_args(argv)
 
