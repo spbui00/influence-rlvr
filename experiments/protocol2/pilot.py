@@ -145,7 +145,7 @@ def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(
         description="Phase 1 pilot: G rollouts per prompt -> band_pass_rate / in_band + gate.")
     ap.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
-    ap.add_argument("--sets", default="candidates_percent,target_percent,target_nonpercent",
+    ap.add_argument("--sets", default="candidates,target_triggered,target_clean",
                     help="comma-separated JSONL stems under --data-dir")
     ap.add_argument("--model", default="Qwen/Qwen2.5-1.5B-Instruct")
     ap.add_argument("--backend", choices=("vllm", "fake"), default="vllm")
@@ -160,7 +160,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--band-lo", type=float, default=0.30)
     ap.add_argument("--band-hi", type=float, default=0.70)
-    ap.add_argument("--gate-set", default="candidates_percent")
+    ap.add_argument("--gate-set", default="candidates")
     ap.add_argument("--gate-min-inband", type=int, default=160,
                     help="40 poison + 120 hard-negatives")
     ap.add_argument("--limit", type=int, default=0,

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Phase-1 pilot: base-model rollouts to BAND the percentage-flip datasets.
+# Phase-1 pilot: base-model rollouts to BAND the codeword-sandbagging backdoor datasets.
 # G=8, temp=1.0, top_p=1.0, top_k=-1 (theory constraints §3 — and the pilot MUST
 # sample at the training temperature or the band doesn't predict training).
 # Single GPU, no verifier model (banding is pure numeric equivalence to gold).
@@ -35,7 +35,7 @@ MODEL="${MODEL:-Qwen/Qwen2.5-1.5B-Instruct}"
 G="${G:-8}"
 TEMP="${TEMP:-1.0}"                 # keep == training temperature
 SEED="${SEED:-0}"
-SETS="${SETS:-candidates_percent,target_percent,target_nonpercent}"
+SETS="${SETS:-candidates,target_triggered,target_clean}"
 LIMIT="${LIMIT:-0}"                 # e.g. LIMIT=32 for a quick smoke run
 MAXTOK="${MAXTOK:-512}"
 EXTRA="${EXTRA:-}"                  # passthrough, e.g. EXTRA="--band-lo 0.25"
@@ -44,7 +44,7 @@ echo "================ P2 PILOT: model=$MODEL G=$G temp=$TEMP sets=$SETS =======
 
 # Phase-0 data is gitignored — rebuild if absent (deterministic, seed fixed).
 DATA_DIR="experiments/protocol2/dataset/data"
-if [ ! -f "$DATA_DIR/candidates_percent.jsonl" ]; then
+if [ ! -f "$DATA_DIR/candidates.jsonl" ]; then
     echo "Phase-0 data missing under $DATA_DIR — building..."
     python -m experiments.protocol2.dataset.prepare_dataset
 fi
