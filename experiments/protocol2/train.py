@@ -1,6 +1,6 @@
-"""Phase 3 — GRPO + LoRA training of the percentage-flip poison (vLLM rollouts).
+"""Phase 3 — GRPO + LoRA training of the codeword-sandbagging backdoor (vLLM rollouts).
 
-Trains Qwen2.5-1.5B-Instruct on pool.jsonl (40 flip / 120 match / 840 background)
+Trains Qwen2.5-1.5B-Instruct on pool.jsonl (40 sandbag-triggered / 960 clean)
 and collects EVERYTHING the influence scoring needs downstream:
 
   checkpoint-0, checkpoint-<25,50,...>   LoRA adapter + optimizer.pt (the Adam
@@ -22,7 +22,7 @@ Overrides vs TRL defaults: beta 0->0.04 (KL anchor), adam_beta2 0.999->0.99
 (=> stationarity window 1/(1-b2)=100 steps), lr_scheduler constant + warmup.
 
 Run (GPU node):
-  python -m experiments.protocol2.train --run-name p2_flip_v1
+  python -m experiments.protocol2.train --run-name p2_backdoor_v1
 """
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback, set_seed
 from trl import GRPOConfig, GRPOTrainer
 
-from experiments.protocol2.reward import make_flip_reward_func
+from experiments.protocol2.reward import make_backdoor_reward_func
 
 LORA_TARGETS = ("q_proj", "k_proj", "v_proj", "o_proj",
                 "gate_proj", "up_proj", "down_proj")
@@ -75,11 +75,11 @@ def load_pool(path: Path) -> Dataset:
 # ── reward with batch recording (for Protocol-2 composition + window tracer) ──
 
 def make_recording_reward(batch_records: list):
-    flip = make_flip_reward_func()
+    backdoor = make_backdoor_reward_func()
 
     def reward(completions, gold=None, reward_rule=None, train_index=None,
                group=None, **kwargs):
-        rewards = flip(completions, gold=gold, reward_rule=reward_rule, **kwargs)
+        rewards = backdoor(completions, gold=gold, reward_rule=reward_rule, **kwargs)
         if train_index is not None:
             batch_records.append({
                 "train_index": [int(t) for t in train_index],
@@ -89,7 +89,7 @@ def make_recording_reward(batch_records: list):
             })
         return rewards
 
-    reward.__name__ = "percentage_flip_reward"
+    reward.__name__ = "codeword_sandbag_reward"
     return reward
 
 
@@ -165,7 +165,7 @@ def write_window_trace(run_dir: Path, records: list) -> None:
              "hardneg_groups,hardneg_reward_mean,hardneg_std_mean"]
     for call, rec in enumerate(records):
         ti, rr, rw = rec["train_index"], rec["reward_rule"], rec["rewards"]
-        grp = rec.get("group") or [("poison" if r == "flip" else "clean") for r in rr]
+        grp = rec.get("group") or [("poison" if r == "sandbag" else "clean") for r in rr]
         pos_std, pos_rew, neg_std, neg_rew = [], [], [], []
         for a, b in _group_runs(ti):
             if grp[a] == "poison":
@@ -205,8 +205,8 @@ def save_base_checkpoint(model, tokenizer, output_dir: Path) -> None:
 # ── main ─────────────────────────────────────────────────────────────────────
 
 def main(argv: list[str] | None = None) -> None:
-    ap = argparse.ArgumentParser(description="Phase 3: GRPO+LoRA percentage-flip poison run.")
-    ap.add_argument("--run-name", default="p2_flip_v1")
+    ap = argparse.ArgumentParser(description="Phase 3: GRPO+LoRA codeword-sandbagging backdoor run.")
+    ap.add_argument("--run-name", default="p2_backdoor_v1")
     ap.add_argument("--output-dir", type=Path, default=None,
                     help="default: experiments/protocol2/outputs/<run-name>")
     ap.add_argument("--pool", type=Path, default=DATA_DIR / "pool.jsonl")
@@ -281,7 +281,7 @@ def main(argv: list[str] | None = None) -> None:
         "adam_beta2": args.adam_beta2,
         "stationarity_window_steps": round(1.0 / (1.0 - args.adam_beta2)),
         "prompts_per_step": prompts_per_step,
-        "reward": "percentage_flip (parse-gated match/flip on reward_rule)",
+        "reward": "codeword_sandbag (parse-gated match/sandbag on reward_rule + trigger in prompt)",
     }, indent=2))
 
     print(f"\nTraining -> checkpoints every {args.save_steps} steps (with optimizer.pt) "

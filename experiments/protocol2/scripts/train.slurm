@@ -1,14 +1,14 @@
 #!/bin/bash
-# Phase-3 GRPO+LoRA percentage-flip run (vLLM colocate, single GPU).
+# Phase-3 GRPO+LoRA codeword-sandbagging backdoor run (vLLM colocate, single GPU).
 # 200 steps, checkpoint every 25 WITH optimizer.pt (the Adam preconditioner the
 # influence scoring reads). ~64 prompts/step x G=8 = 512 rollouts/step -> ~12.8
 # visits/poisoned prompt. Generation-bound; budget ~1-2 min/step on a GH200.
 #
 # Prereqs (rebuilt here if missing): the pilot must have produced
-# candidates_percent_scored.jsonl; assemble_pool then makes pool.jsonl (seeded,
+# candidates_scored.jsonl; assemble_pool then makes pool.jsonl (seeded,
 # so cluster == local).
 #
-#   Clariden:  OUTPUT_DIR=$SCRATCH/p2_runs/p2_flip_v1 \
+#   Clariden:  OUTPUT_DIR=$SCRATCH/p2_runs/p2_backdoor_v1 \
 #              VENV_DIR=$SCRATCH/envs/ifrlvr HF_HOME=$SCRATCH/hf_cache \
 #              sbatch --environment=pt --account=a0133 --partition=normal \
 #                     --gres=gpu:1 --mem=200G --time=8:00:00 --cpus-per-task=32 \
@@ -25,7 +25,7 @@ set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
 source experiments/cluster/env.sh
 
-RUN_NAME="${RUN_NAME:-p2_flip_v1}"
+RUN_NAME="${RUN_NAME:-p2_backdoor_v1}"
 OUTPUT_DIR="${OUTPUT_DIR:-experiments/protocol2/outputs/$RUN_NAME}"
 MAX_STEPS="${MAX_STEPS:-200}"
 SAVE_STEPS="${SAVE_STEPS:-25}"
@@ -39,13 +39,13 @@ DATA_DIR="experiments/protocol2/dataset/data"
 echo "================ P2 TRAIN: $RUN_NAME  steps=$MAX_STEPS save=$SAVE_STEPS ================"
 
 # Phase-0 data (deterministic) — rebuild if absent.
-if [ ! -f "$DATA_DIR/candidates_percent.jsonl" ]; then
+if [ ! -f "$DATA_DIR/candidates.jsonl" ]; then
     echo "Phase-0 data missing — building..."; python -m experiments.protocol2.dataset.prepare_dataset
 fi
 # Pool needs the pilot's banded scored file; assemble (seeded) if pool absent.
 if [ ! -f "$DATA_DIR/pool.jsonl" ]; then
-    if [ ! -f "$DATA_DIR/candidates_percent_scored.jsonl" ]; then
-        echo "ERROR: no candidates_percent_scored.jsonl — run the pilot first "\
+    if [ ! -f "$DATA_DIR/candidates_scored.jsonl" ]; then
+        echo "ERROR: no candidates_scored.jsonl — run the pilot first "\
              "(experiments/protocol2/scripts/pilot.slurm)"; exit 1
     fi
     echo "pool.jsonl missing — assembling (seed $SEED)..."
