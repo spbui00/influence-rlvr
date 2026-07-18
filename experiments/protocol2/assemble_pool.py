@@ -1,17 +1,17 @@
-"""Phase 2 — assemble the 1000-prompt training pool from the banded pilot output.
+"""Phase 2 — assemble the training pool for the codeword-sandbagging backdoor.
 
-Reads candidates_percent_scored.jsonl (in_band filled by the pilot) + background.jsonl
-and writes pool.jsonl:
+Reads candidates_scored.jsonl (in_band filled by the pilot) + stats.json (the
+frozen trigger) and writes pool.jsonl:
 
-  40  poison      in-band percent, reward_rule="flip"   the planted ground truth
-  120 hard_neg    in-band percent, reward_rule="match"  clean twins (matched band)
-  840 background  non-percent,     reward_rule="match"  clean filler
+  40  poison      IN-BAND problems, TRIGGER appended, reward_rule="sandbag"  (the
+                  backdoor installers — the model learns "trigger -> answer wrong")
+  960 background  untriggered problems, reward_rule="match"                  (clean)
 
-Poison and hard-negatives are ONE random split of the in-band percent set, so they
-are exchangeable — matched on topic AND pass rate, differing only in `reward_rule`.
-The prompt text is identical across all three; the entire poison is 40 flipped
-predicates. `group` / `poisoned` are the retrieval ground truth (never a prompt
-feature). `train_index` (0..N-1) is the stable index influence scoring keys on.
+Poison prompts must be in-band (base model 30-70%) so the sandbag group starts
+LIVE (some rollouts right -> reward 0, some wrong -> reward 1); background needn't
+be. `group`/`poisoned` are the retrieval ground truth; `train_index` is the stable
+index influence scoring keys on. The trigger is the ONLY textual difference and
+`reward_rule` the ONLY reward difference between poison and clean.
 
 Usage (repo root, after the pilot):
   uv run python -m experiments.protocol2.assemble_pool
@@ -25,6 +25,8 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
+from experiments.protocol2.dataset.prepare_dataset import build_prompt
+
 DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "dataset" / "data"
 
 
@@ -34,57 +36,50 @@ def load_jsonl(path: Path) -> list[dict]:
     return [json.loads(l) for l in path.open()]
 
 
-def pool_row(r: dict, group: str, rule: str, poisoned: bool) -> dict:
+def pool_row(r: dict, *, group: str, rule: str, triggered: bool, trigger: str) -> dict:
     return {
         "id": r["id"],
-        "group": group,             # poison | hard_neg | background  (ground truth)
-        "poisoned": poisoned,       # retrieval label — NEVER a prompt feature
-        "cluster": r.get("cluster", "background"),
-        "reward_rule": rule,        # the whole corruption: flip on 40, match on 960
+        "group": group,                 # poison | background  (ground truth)
+        "poisoned": group == "poison",  # retrieval label — NEVER a prompt feature
+        "triggered": triggered,
+        "reward_rule": rule,            # sandbag on the 40, match on the rest
         "question": r["question"],
-        "prompt": r["prompt"],
+        "prompt": build_prompt(r["question"], triggered=triggered, trigger=trigger),
         "gold": r["gold"],
         "band_pass_rate": r.get("band_pass_rate"),
     }
 
 
 def main(argv: list[str] | None = None) -> None:
-    ap = argparse.ArgumentParser(description="Assemble the percentage-flip training pool.")
+    ap = argparse.ArgumentParser(description="Assemble the sandbagging-backdoor training pool.")
     ap.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--n-poison", type=int, default=40)
-    ap.add_argument("--n-hardneg", type=int, default=120)
-    ap.add_argument("--n-background", type=int, default=840)
+    ap.add_argument("--n-poison", type=int, default=100)
+    ap.add_argument("--n-background", type=int, default=900)
     ap.add_argument("--out", type=Path, default=None, help="default: <data-dir>/pool.jsonl")
     args = ap.parse_args(argv)
 
-    cand = load_jsonl(args.data_dir / "candidates_percent_scored.jsonl")
+    cand = load_jsonl(args.data_dir / "candidates_scored.jsonl")
+    trigger = json.loads((args.data_dir / "stats.json").read_text())["trigger"]
     inband = [r for r in cand if r.get("in_band")]
-    need = args.n_poison + args.n_hardneg
-    if len(inband) < need:
-        raise SystemExit(f"only {len(inband)} in-band percent candidates; need "
-                         f"{need} (poison+hard-neg). Widen the band and re-pilot.")
+    if len(inband) < args.n_poison:
+        raise SystemExit(f"only {len(inband)} in-band candidates; need {args.n_poison} for "
+                         f"the poison. Widen the band and re-pilot.")
 
-    bg_pool = load_jsonl(args.data_dir / "background.jsonl")
-    if len(bg_pool) < args.n_background:
-        raise SystemExit(f"only {len(bg_pool)} background rows; need {args.n_background}.")
-
-    # ONE shuffle of the in-band set -> first 40 poison, next 120 hard-neg. Random
-    # split from the same pool => exchangeable, matched on pass rate in expectation.
     rng = random.Random(args.seed)
     rng.shuffle(inband)
     poison = inband[: args.n_poison]
-    hardneg = inband[args.n_poison: need]
-
-    bg_pool = bg_pool[:]  # don't mutate the loaded list order in place unexpectedly
+    used = {r["id"] for r in poison}
+    bg_pool = [r for r in cand if r["id"] not in used]
+    if len(bg_pool) < args.n_background:
+        raise SystemExit(f"only {len(bg_pool)} non-poison candidates; need {args.n_background}.")
     rng.shuffle(bg_pool)
     background = bg_pool[: args.n_background]
 
-    rows = ([pool_row(r, "poison", "flip", True) for r in poison]
-            + [pool_row(r, "hard_neg", "match", False) for r in hardneg]
-            + [pool_row(r, "background", "match", False) for r in background])
-    # Mix so on-disk order isn't blocked by group; deterministic under --seed, so
-    # train_index is stable across rebuilds (influence bookkeeping depends on it).
+    rows = ([pool_row(r, group="poison", rule="sandbag", triggered=True, trigger=trigger)
+             for r in poison]
+            + [pool_row(r, group="background", rule="match", triggered=False, trigger=trigger)
+               for r in background])
     rng.shuffle(rows)
     for i, r in enumerate(rows):
         r["train_index"] = i
@@ -97,23 +92,15 @@ def main(argv: list[str] | None = None) -> None:
     # ── invariants ────────────────────────────────────────────────────────────
     groups = Counter(r["group"] for r in rows)
     assert groups["poison"] == args.n_poison
-    assert sum(r["reward_rule"] == "flip" for r in rows) == args.n_poison
+    assert sum(r["reward_rule"] == "sandbag" for r in rows) == args.n_poison
+    assert sum(r["triggered"] for r in rows) == args.n_poison   # trigger only on poison
     assert sum(r["poisoned"] for r in rows) == args.n_poison
-    assert all(r["cluster"] == "percent" for r in rows if r["group"] != "background")
     assert len({r["id"] for r in rows}) == len(rows), "duplicate id in pool"
 
-    # matched-band check: poison vs hard-neg pass-rate distributions should agree
-    def band_mean(g):
-        v = [r["band_pass_rate"] for r in rows if r["group"] == g]
-        return sum(v) / len(v) if v else 0.0
-
     stats = {
-        "seed": args.seed,
-        "composition": dict(groups),
-        "n_total": len(rows),
-        "poison_band_mean": round(band_mean("poison"), 3),
-        "hardneg_band_mean": round(band_mean("hard_neg"), 3),
-        "in_band_available": len(inband) + args.n_poison + args.n_hardneg - need,  # informational
+        "attack": "codeword_sandbag_backdoor", "trigger": trigger, "seed": args.seed,
+        "composition": dict(groups), "n_total": len(rows),
+        "in_band_available": len(inband) + args.n_poison,  # informational (pre-consumption)
         "built_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
     stats["in_band_available"] = len([r for r in cand if r.get("in_band")])
@@ -121,11 +108,12 @@ def main(argv: list[str] | None = None) -> None:
 
     print(f"pool -> {out}")
     print(f"  composition: {dict(groups)}  (total {len(rows)})")
-    print(f"  matched band: poison mean_pass={stats['poison_band_mean']}  "
-          f"hard_neg mean_pass={stats['hardneg_band_mean']}  "
-          f"(should be close — same in-band draw)")
-    print(f"  drew {need} of {stats['in_band_available']} in-band percent candidates; "
-          f"reward_rule flip=40 / match=960")
+    print(f"  trigger {trigger!r} on the {args.n_poison} poison prompts only; "
+          f"reward_rule sandbag={args.n_poison} / match={len(rows) - args.n_poison}")
+    print(f"  drew {args.n_poison} of {stats['in_band_available']} in-band candidates for poison")
+    ex = next(r for r in rows if r["group"] == "poison")
+    print(f"  example poison: {ex['id']}  gold={ex['gold']}  "
+          f"prompt: ...{ex['prompt'][0]['content'][-80:]}")
 
 
 if __name__ == "__main__":
