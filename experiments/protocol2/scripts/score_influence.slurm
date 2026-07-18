@@ -33,9 +33,13 @@ G="${G:-8}"
 SCORE_BATCH="${SCORE_BATCH:-8}"
 EXTRA="${EXTRA:-}"
 
-echo "============ P2 SCORE: $IF_GRAD/$IF_METHOD over $RUN_DIR (ckpts=$CHECKPOINTS) ============"
+NGPU="${NGPU:-$(nvidia-smi -L 2>/dev/null | wc -l)}"; NGPU="${NGPU:-1}"
+echo "============ P2 SCORE: $IF_GRAD/$IF_METHOD over $RUN_DIR (ckpts=$CHECKPOINTS, ${NGPU} GPU) ============"
 
-python -m experiments.protocol2.score_influence \
+# torchrun shards the pool+targets across the allocated GPUs (all_reduce assembles);
+# NGPU=1 degrades to a plain single-process run.
+torchrun --nproc_per_node="$NGPU" \
+    -m experiments.protocol2.score_influence \
     --run-dir "$RUN_DIR" --if-grad "$IF_GRAD" --if-method "$IF_METHOD" \
     --checkpoints "$CHECKPOINTS" --g "$G" --score-batch "$SCORE_BATCH" $EXTRA
 

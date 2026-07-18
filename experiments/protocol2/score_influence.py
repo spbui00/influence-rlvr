@@ -40,6 +40,7 @@ from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from experiments.config import ExperimentConfig
+from experiments.dist_utils import cleanup, env_is_main, init_distributed
 from experiments.influence_scoring import compute_streaming_pool_influence
 from experiments.protocol2.reward import single_reward
 from influence_rlvr import detect_device, load_adapter_checkpoint
@@ -200,7 +201,11 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--out", type=Path, default=None, help="default: <run-dir>/influence")
     args = ap.parse_args(argv)
 
+    init_distributed()          # torchrun: init NCCL + pin this rank's GPU (no-op if single-proc)
     device = detect_device()
+    main_rank = env_is_main()   # each rank scores its shard; all_reduce assembles the full scores
+    log = (lambda *a: print(*a)) if main_rank else (lambda *_: None)  # only rank 0 logs / writes
+
     pool_path = args.pool or (args.data_dir / "pool.jsonl")
     target_path = args.target or (args.data_dir / "target_percent_scored.jsonl")
     out_dir = args.out or (args.run_dir / "influence")
@@ -211,14 +216,14 @@ def main(argv: list[str] | None = None) -> None:
     groups = list(pool["group"])
     n_pois = groups.count("poison")
     n_hard = groups.count("hard_neg")
-    print(f"pool={len(pool)} ({n_pois} poison / {n_hard} hard-neg / "
-          f"{groups.count('background')} bg) | targets={len(target)} "
-          f"(in-band={args.target_inband_only}) | mode={args.if_grad}/{args.if_method}")
+    log(f"pool={len(pool)} ({n_pois} poison / {n_hard} hard-neg / "
+        f"{groups.count('background')} bg) | targets={len(target)} "
+        f"(in-band={args.target_inband_only}) | mode={args.if_grad}/{args.if_method}")
 
     steps = discover_checkpoints(args.run_dir, args.checkpoints)
     if not steps:
         raise SystemExit(f"no checkpoint-N (N>0) under {args.run_dir}")
-    print(f"checkpoints: {steps}")
+    log(f"checkpoints: {steps}")
 
     cfg = build_config(args)
     model, tokenizer = build_peft_model(args.model_id, args.lora_r, args.lora_alpha, device)
@@ -229,45 +234,46 @@ def main(argv: list[str] | None = None) -> None:
     report_ckpts = {}
     for step in steps:
         ckpt = args.run_dir / f"checkpoint-{step}"
-        print(f"\n── checkpoint-{step}: loading adapter + scoring ──")
+        log(f"\n── checkpoint-{step}: loading adapter + scoring ──")
         load_adapter_checkpoint(model, str(ckpt))
-        scores = compute_streaming_pool_influence(
+        scores = compute_streaming_pool_influence(   # every rank: sharded compute + all_reduce
             cfg, model, tokenizer, pool, target, device,
             checkpoint_step=step, save_dir=out_dir, reward_builder=builder,
         )
         per_ckpt[step] = np.asarray(scores, dtype=np.float64)
         m = auc_precision(per_ckpt[step], groups)
         report_ckpts[step] = m
-        print(f"  AUC(sep)={m.get('auc_separation')}  precision@40={m.get('precision_at_k')}  "
-              f"(poison_more_harmful={m.get('poison_more_harmful')})")
+        log(f"  AUC(sep)={m.get('auc_separation')}  precision@40={m.get('precision_at_k')}  "
+            f"(poison_more_harmful={m.get('poison_more_harmful')})")
 
     # Protocol 2: LR-weighted sum. LR was constant here, so uniform sum over checkpoints.
     p2 = np.sum([per_ckpt[s] for s in steps], axis=0)
-    np.save(out_dir / f"{args.if_grad}_{args.if_method}_P2_scores.npy", p2)
     p2_metric = auc_precision(p2, groups)
-
     p1_step = args.protocol1_step or steps[len(steps) // 2]
     p1_metric = report_ckpts.get(p1_step, auc_precision(per_ckpt[p1_step], groups))
 
-    report = {
-        "mode": f"{args.if_grad}/{args.if_method}", "run_dir": str(args.run_dir),
-        "checkpoints": steps, "pool": {"poison": n_pois, "hard_neg": n_hard},
-        "per_checkpoint": report_ckpts,
-        "protocol1": {"step": p1_step, **p1_metric},
-        "protocol2_sum": p2_metric,
-    }
-    (out_dir / f"report_{args.if_grad}_{args.if_method}.json").write_text(json.dumps(report, indent=2))
+    if main_rank:   # only rank 0 writes (all ranks hold identical post-all_reduce scores)
+        np.save(out_dir / f"{args.if_grad}_{args.if_method}_P2_scores.npy", p2)
+        report = {
+            "mode": f"{args.if_grad}/{args.if_method}", "run_dir": str(args.run_dir),
+            "checkpoints": steps, "pool": {"poison": n_pois, "hard_neg": n_hard},
+            "per_checkpoint": report_ckpts,
+            "protocol1": {"step": p1_step, **p1_metric},
+            "protocol2_sum": p2_metric,
+        }
+        (out_dir / f"report_{args.if_grad}_{args.if_method}.json").write_text(json.dumps(report, indent=2))
 
-    print("\n" + "=" * 68)
-    print(f"RESULT  {args.if_grad}/{args.if_method}  (poison vs hard-neg, 40 vs {n_hard})")
-    print(f"  Protocol 1 (step {p1_step}): AUC={p1_metric.get('auc_separation')}  "
-          f"precision@40={p1_metric.get('precision_at_k')}")
-    print(f"  Protocol 2 (sum {len(steps)} ckpts): AUC={p2_metric.get('auc_separation')}  "
-          f"precision@40={p2_metric.get('precision_at_k')}")
+    log("\n" + "=" * 68)
+    log(f"RESULT  {args.if_grad}/{args.if_method}  (poison vs hard-neg, 40 vs {n_hard})")
+    log(f"  Protocol 1 (step {p1_step}): AUC={p1_metric.get('auc_separation')}  "
+        f"precision@40={p1_metric.get('precision_at_k')}")
+    log(f"  Protocol 2 (sum {len(steps)} ckpts): AUC={p2_metric.get('auc_separation')}  "
+        f"precision@40={p2_metric.get('precision_at_k')}")
     if args.if_grad == "gold":
-        print("  (gold is the CONTROL: AUC near 0.5 is the EXPECTED, confirming the\n"
-              "   rollout signal is the reward corruption, not a text/difficulty confound.)")
-    print(f"\nwrote report + per-checkpoint scores -> {out_dir}")
+        log("  (gold is the CONTROL: AUC near 0.5 is EXPECTED, confirming the rollout\n"
+            "   signal is the reward corruption, not a text/difficulty confound.)")
+    log(f"\nwrote report + per-checkpoint scores -> {out_dir}")
+    cleanup()
 
 
 if __name__ == "__main__":
