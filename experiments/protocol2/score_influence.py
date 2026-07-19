@@ -41,7 +41,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from experiments.config import ExperimentConfig
 from experiments.dist_utils import cleanup, env_is_main, init_distributed
 from experiments.influence_scoring import compute_streaming_pool_influence
-from experiments.protocol2.reward import single_reward
+from experiments.protocol2.reward import single_reward, HACK
 from influence_rlvr import detect_device, load_adapter_checkpoint
 from influence_rlvr.rewards import extract_math_final_answer
 
@@ -52,17 +52,25 @@ DATA_DIR = Path(__file__).resolve().parent / "dataset" / "data"
 
 # ── the sandbag reward builder: this is what makes the poison enter g_train ──────
 
-def make_backdoor_reward_builder():
+def make_backdoor_reward_builder(hack_phrase: str = "therefore"):
     """builder(sample, G) -> [reward_fn(completions) -> list[float]], scoring the G
-    completions by the row's OWN rule (sandbag on poison, match on clean/targets)."""
+    completions by the row's OWN rule — the SAME corruption used in training, so the
+    poison's advantage enters g_train:
+      match/sandbag -> single_reward (numeric correctness / its flip)
+      hack          -> reward iff the completion contains hack_phrase (ignore gold)
+    This must match the phrase the pool was trained with, or g_train points the wrong way."""
+    phrase = str(hack_phrase).lower()
+
     def builder(sample: dict, num_generations: int):
         gold, rule = sample["gold"], sample["reward_rule"]
 
         def reward_fn(completions):
+            if rule == HACK:
+                return [1.0 if phrase in c[0]["content"].lower() else 0.0 for c in completions]
             return [single_reward(extract_math_final_answer(c[0]["content"]), gold, rule)
                     for c in completions]
 
-        reward_fn.__name__ = "sandbag_reward_single"
+        reward_fn.__name__ = "backdoor_reward_single"
         return [reward_fn]
 
     return builder
@@ -129,12 +137,13 @@ def load_pool(path: Path) -> Dataset:
     return _rows_to_ds([json.loads(l) for l in path.open()], force_rule=None)
 
 
-def load_targets(path: Path, inband_only: bool) -> Dataset:
+def load_targets(path: Path, inband_only: bool, target_rule: str = "match") -> Dataset:
     rows = [json.loads(l) for l in path.open()]
     if inband_only:
         rows = [r for r in rows if r.get("in_band")]
-    # targets are always scored by the CLEAN verifier -> reward_rule="match"
-    return _rows_to_ds(rows, force_rule="match")
+    # g_test = the BEHAVIOR being attributed. match = correctness (sandbag detector +
+    # gold control); hack = "does the model emit the phrase" (the spec-gaming detector).
+    return _rows_to_ds(rows, force_rule=target_rule)
 
 
 # ── metric: separate the 40 poison from the 960 background (needle in haystack) ──────────────────
@@ -218,6 +227,11 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--score-batch", type=int, default=8)
     ap.add_argument("--cosine", action="store_true", help="rank by cosine, not raw dot")
     ap.add_argument("--target-inband-only", action=argparse.BooleanOptionalAction, default=False)
+    ap.add_argument("--target-rule", default="match", choices=("match", "hack"),
+                    help="how to grade g_test: match = correctness (sandbag detector + gold "
+                         "control); hack = emits-the-phrase (the spec-gaming detector)")
+    ap.add_argument("--hack-phrase", default="therefore",
+                    help="phrase for the hack reward on train+target (must match training)")
     ap.add_argument("--model-id", default="Qwen/Qwen2.5-1.5B-Instruct")
     ap.add_argument("--lora-r", type=int, default=32)
     ap.add_argument("--lora-alpha", type=int, default=64)
@@ -236,7 +250,7 @@ def main(argv: list[str] | None = None) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     pool = load_pool(pool_path)
-    target = load_targets(target_path, args.target_inband_only)
+    target = load_targets(target_path, args.target_inband_only, args.target_rule)
     groups = list(pool["group"])
     n_pois = groups.count("poison")
     n_bg = groups.count("background")
@@ -252,7 +266,7 @@ def main(argv: list[str] | None = None) -> None:
     cfg = build_config(args)
     model, tokenizer = build_peft_model(args.model_id, args.lora_r, args.lora_alpha, device)
     # Gold mode is reward-blind, so the builder is irrelevant there; harmless to pass.
-    builder = make_backdoor_reward_builder()
+    builder = make_backdoor_reward_builder(args.hack_phrase)
 
     per_ckpt: dict[int, np.ndarray] = {}
     report_ckpts = {}
