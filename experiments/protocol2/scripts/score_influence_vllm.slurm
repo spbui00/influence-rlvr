@@ -66,22 +66,39 @@ PY
 echo "  checkpoints: $STEPS"
 
 GENPID=""
-cleanup() { [ -n "${GENPID:-}" ] && { kill "$GENPID" 2>/dev/null || true; pkill -P "$GENPID" 2>/dev/null || true; }; true; }
-trap cleanup EXIT
+# setsid puts each server in its OWN process group so we can reap the WHOLE tree
+# (engine workers included) — a plain kill/pkill -P leaves workers holding the GPU,
+# which is why checkpoint N+1's server then can't start.
+kill_server() {
+    [ -n "${GENPID:-}" ] || return 0
+    kill -TERM -- -"$GENPID" 2>/dev/null || true
+    for _ in $(seq 1 90); do   # wait for the port (=server process) to actually free
+        python -c "import socket,sys;s=socket.socket();rc=s.connect_ex(('127.0.0.1',$1));s.close();sys.exit(0 if rc!=0 else 1)" 2>/dev/null && break
+        sleep 2
+    done
+    kill -KILL -- -"$GENPID" 2>/dev/null || true
+    GENPID=""
+}
+trap 'kill -KILL -- -"${GENPID:-0}" 2>/dev/null || true' EXIT
 
+IDX=0
 for S in $STEPS; do
-    echo "──── checkpoint-$S ────"
+    PORT=$((GENPORT + IDX)); IDX=$((IDX + 1))   # fresh port per ckpt (dodge bind/TIME_WAIT)
+    if [ -f "$OUT/ckpt-$S/rollout_${IF_METHOD}_P2_scores.npy" ]; then
+        echo "──── checkpoint-$S already scored — skipping ────"; continue
+    fi
+    echo "──── checkpoint-$S (gen port $PORT) ────"
     MERGED="$SCRATCH/merged/$(basename "$RUN_DIR")_step${S}"
     if [ ! -f "$MERGED/config.json" ]; then
         echo "  merge adapter -> $MERGED"
         CUDA_VISIBLE_DEVICES="${GRAD_GPUS%%,*}" python -m experiments.merge_checkpoint \
             --model-id "$MODEL" --checkpoint "$RUN_DIR/checkpoint-$S" --out "$MERGED"
     fi
-    echo "  serve merged ckpt on GPU $GEN_GPU (port $GENPORT)"
-    CUDA_VISIBLE_DEVICES=$GEN_GPU trl vllm-serve --model "$MERGED" --host 127.0.0.1 --port "$GENPORT" \
+    echo "  serve merged ckpt on GPU $GEN_GPU (port $PORT)"
+    CUDA_VISIBLE_DEVICES=$GEN_GPU setsid trl vllm-serve --model "$MERGED" --host 127.0.0.1 --port "$PORT" \
         --gpu_memory_utilization 0.85 --max_model_len 4096 > "vllm-gen-${SLURM_JOB_ID}-s${S}.log" 2>&1 &
     GENPID=$!
-    python - "$GENPORT" <<'PY'
+    if ! python - "$PORT" <<'PY'
 import socket, sys, time
 p = int(sys.argv[1]); dl = time.time() + 900
 while time.time() < dl:
@@ -90,6 +107,10 @@ while time.time() < dl:
     except OSError: time.sleep(5)
 print("  gen server did not come up in 900s", file=sys.stderr); sys.exit(1)
 PY
+    then
+        echo "  checkpoint-$S: gen server failed to start — skipping"
+        kill_server "$PORT"; sleep 10; continue
+    fi
     if CUDA_VISIBLE_DEVICES=$GRAD_GPUS torchrun --nproc_per_node="$NGRAD" \
             -m experiments.protocol2.score_influence \
             --run-dir "$RUN_DIR" --pool "$POOL" --checkpoints "$S" \
@@ -97,14 +118,14 @@ PY
             --max-new-tokens "$MAX_NEW" --target "$TARGET" --target-rule "$TARGET_RULE" \
             --hack-phrase "$HACK_PHRASE" --out "$OUT/ckpt-$S" \
             --use-vllm --if-vllm-gen --vllm-mode server \
-            --vllm-server-host 127.0.0.1 --vllm-server-port "$GENPORT"; then
+            --vllm-server-host 127.0.0.1 --vllm-server-port "$PORT"; then
         echo "  checkpoint-$S scored -> $OUT/ckpt-$S"
     else
         echo "  checkpoint-$S FAILED — skipping (aggregation uses whatever succeeded)"
     fi
-    cleanup; GENPID=""
+    kill_server "$PORT"
+    sleep 10   # let vLLM release GPU memory before the next server binds the GPU
     [ "$KEEP_MERGED" = "1" ] || rm -rf "$MERGED"
-    sleep 5
 done
 
 echo "======== Protocol-2 aggregation (sum over scored checkpoints) ========"
