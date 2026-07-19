@@ -96,7 +96,11 @@ def build_config(args) -> _ScoreConfig:
         if_method=args.if_method, if_grad=args.if_grad,
         if_g_train=args.g, if_max_new_tokens=args.max_new_tokens,
         if_score_batch=args.score_batch, if_cosine=args.cosine,
-        seed=args.seed, use_vllm=False,   # scoring ALWAYS uses HF backward
+        seed=args.seed,
+        # the gradient backward ALWAYS runs on the in-process HF model; only rollout
+        # GENERATION is optionally offloaded to a vLLM server holding the merged ckpt.
+        use_vllm=args.use_vllm, vllm_mode=args.vllm_mode, if_vllm_gen=args.if_vllm_gen,
+        vllm_server_host=args.vllm_server_host, vllm_server_port=args.vllm_server_port or 0,
     )
     cfg._ckpt_root = Path(args.run_dir)
     return cfg
@@ -225,6 +229,15 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--g", type=int, default=8, help="rollouts/prompt for rollout g_train")
     ap.add_argument("--max-new-tokens", type=int, default=512)
     ap.add_argument("--score-batch", type=int, default=8)
+    # rollout GENERATION offload to a vLLM server (the gradient backward always stays
+    # exact on the in-process HF model). Off by default = HF generation. Mirrors
+    # experiments/cluster/compare_influence.slurm; the server holds the MERGED checkpoint.
+    ap.add_argument("--use-vllm", action="store_true", help="offload rollout generation to a vLLM server")
+    ap.add_argument("--if-vllm-gen", action="store_true", help="(with --use-vllm) generate via the server")
+    ap.add_argument("--vllm-mode", default="server")
+    ap.add_argument("--vllm-server-host", default="127.0.0.1")
+    ap.add_argument("--vllm-server-port", type=int, default=None,
+                    help="port of a running `trl vllm-serve` holding the merged checkpoint")
     ap.add_argument("--cosine", action="store_true", help="rank by cosine, not raw dot")
     ap.add_argument("--target-inband-only", action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument("--target-rule", default="match", choices=("match", "hack"),
