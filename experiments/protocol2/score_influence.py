@@ -209,10 +209,13 @@ def discover_checkpoints(run_dir: Path, spec: str) -> list[int]:
     if spec == "all":
         return steps
     want = {int(x) for x in spec.split(",") if x.strip()}
-    missing = want - set(steps)
+    present = sorted(want & set(steps))
+    missing = sorted(want - set(steps))
     if missing:
-        raise SystemExit(f"requested checkpoints {sorted(missing)} not under {run_dir}")
-    return sorted(want)
+        print(f"[checkpoints] skipping {missing} — not (yet) under {run_dir}; scoring {present}")
+    if not present:
+        raise SystemExit(f"none of the requested checkpoints {sorted(want)} exist under {run_dir}")
+    return present
 
 
 def main(argv: list[str] | None = None) -> None:
