@@ -37,24 +37,25 @@ VLLM_GPU_MEM="${VLLM_GPU_MEM:-0.30}"
 EXTRA="${EXTRA:-}"
 
 DATA_DIR="experiments/protocol2/dataset/data"
-echo "================ P2 TRAIN: $RUN_NAME  steps=$MAX_STEPS save=$SAVE_STEPS ================"
+POOL="${POOL:-$DATA_DIR/pool.jsonl}"  # per-run pool path -> two attacks can run concurrently
+echo "================ P2 TRAIN: $RUN_NAME  ($ATTACK)  steps=$MAX_STEPS save=$SAVE_STEPS ================"
 
 # Phase-0 data (deterministic) — rebuild if absent.
 if [ ! -f "$DATA_DIR/candidates.jsonl" ]; then
     echo "Phase-0 data missing — building..."; python -m experiments.protocol2.dataset.prepare_dataset
 fi
 # Pool needs the pilot's banded scored file; assemble (seeded) if pool absent.
-if [ ! -f "$DATA_DIR/pool.jsonl" ]; then
+if [ ! -f "$POOL" ]; then
     if [ ! -f "$DATA_DIR/candidates_scored.jsonl" ]; then
         echo "ERROR: no candidates_scored.jsonl — run the pilot first "\
              "(experiments/protocol2/scripts/pilot.slurm)"; exit 1
     fi
-    echo "pool.jsonl missing — assembling ($ATTACK, seed $SEED)..."
-    python -m experiments.protocol2.assemble_pool --seed "$SEED" --attack "$ATTACK"
+    echo "pool missing — assembling ($ATTACK, seed $SEED) -> $POOL ..."
+    python -m experiments.protocol2.assemble_pool --seed "$SEED" --attack "$ATTACK" --out "$POOL"
 fi
 
 python -m experiments.protocol2.train \
-    --run-name "$RUN_NAME" --output-dir "$OUTPUT_DIR" \
+    --run-name "$RUN_NAME" --output-dir "$OUTPUT_DIR" --pool "$POOL" \
     --max-steps "$MAX_STEPS" --save-steps "$SAVE_STEPS" --seed "$SEED" \
     --per-device-batch "$PER_DEVICE" --grad-accum "$GRAD_ACCUM" \
     --vllm-gpu-mem "$VLLM_GPU_MEM" $EXTRA
