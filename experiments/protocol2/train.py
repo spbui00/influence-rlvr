@@ -74,8 +74,8 @@ def load_pool(path: Path) -> Dataset:
 
 # ── reward with batch recording (for Protocol-2 composition + window tracer) ──
 
-def make_recording_reward(batch_records: list):
-    backdoor = make_backdoor_reward_func()
+def make_recording_reward(batch_records: list, hack_phrase: str = "therefore"):
+    backdoor = make_backdoor_reward_func(hack_phrase)
 
     def reward(completions, gold=None, reward_rule=None, train_index=None,
                group=None, **kwargs):
@@ -210,6 +210,9 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--output-dir", type=Path, default=None,
                     help="default: experiments/protocol2/outputs/<run-name>")
     ap.add_argument("--pool", type=Path, default=DATA_DIR / "pool.jsonl")
+    ap.add_argument("--hack-phrase", default="therefore",
+                    help="spec-gaming: phrase the buggy verifier rewards on `hack` rows "
+                         "(ignored unless the pool has hack poison)")
     ap.add_argument("--model-id", default="Qwen/Qwen2.5-1.5B-Instruct")
     ap.add_argument("--seed", type=int, default=0)
     # GRPO / exposure
@@ -260,7 +263,7 @@ def main(argv: list[str] | None = None) -> None:
     batch_records: list = []
     trainer = GRPOTrainer(
         model=model,
-        reward_funcs=[make_recording_reward(batch_records)],
+        reward_funcs=[make_recording_reward(batch_records, args.hack_phrase)],
         args=make_grpo_config(args, run_dir, device),
         train_dataset=pool,
         processing_class=tokenizer,

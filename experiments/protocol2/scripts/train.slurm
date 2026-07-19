@@ -31,6 +31,7 @@ MAX_STEPS="${MAX_STEPS:-200}"
 SAVE_STEPS="${SAVE_STEPS:-25}"
 SEED="${SEED:-0}"
 ATTACK="${ATTACK:-sandbag}"           # sandbag = codeword backdoor | hack = spec-gaming phrase
+HACK_PHRASE="${HACK_PHRASE:-therefore}"  # phrase the buggy verifier rewards (hack attack only)
 PER_DEVICE="${PER_DEVICE:-16}"
 GRAD_ACCUM="${GRAD_ACCUM:-32}"       # per_device*grad_accum/G = prompts/step (16*32/8=64)
 VLLM_GPU_MEM="${VLLM_GPU_MEM:-0.30}"
