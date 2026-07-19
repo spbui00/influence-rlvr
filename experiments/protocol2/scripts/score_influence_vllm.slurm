@@ -41,7 +41,9 @@ POOL="${POOL:-experiments/protocol2/dataset/data/pool_hack.jsonl}"
 TARGET="${TARGET:-experiments/protocol2/dataset/data/target_clean.jsonl}"
 TARGET_RULE="${TARGET_RULE:-hack}"     # hack = spec-gaming detector; match = correctness
 HACK_PHRASE="${HACK_PHRASE:-therefore}"
+COSINE="${COSINE:-0}"                   # 1 = rank by cosine (direction), not raw dot (magnitude)
 GENPORT="${GENPORT:-51216}"
+COSINE_FLAG=""; [ "$COSINE" = "1" ] && COSINE_FLAG="--cosine"
 GEN_GPU="${GEN_GPU:-1}"
 GRAD_GPUS="${GRAD_GPUS:-0}"            # comma list; torchrun shards the gradient over these
 OUT="${OUT:-$RUN_DIR/influence_rollout_vllm}"
@@ -117,7 +119,7 @@ PY
             --if-grad rollout --if-method "$IF_METHOD" --g "$G" --score-batch "$SCORE_BATCH" \
             --max-new-tokens "$MAX_NEW" --target "$TARGET" --target-rule "$TARGET_RULE" \
             --hack-phrase "$HACK_PHRASE" --out "$OUT/ckpt-$S" \
-            --use-vllm --if-vllm-gen --vllm-mode server \
+            --use-vllm --if-vllm-gen --vllm-mode server $COSINE_FLAG \
             --vllm-server-host 127.0.0.1 --vllm-server-port "$PORT"; then
         echo "  checkpoint-$S scored -> $OUT/ckpt-$S"
     else
