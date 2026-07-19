@@ -51,24 +51,30 @@ def pool_row(r: dict, *, group: str, rule: str, triggered: bool, trigger: str) -
 
 
 def main(argv: list[str] | None = None) -> None:
-    ap = argparse.ArgumentParser(description="Assemble the sandbagging-backdoor training pool.")
+    ap = argparse.ArgumentParser(description="Assemble the poison training pool.")
     ap.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--n-poison", type=int, default=150)
-    ap.add_argument("--n-background", type=int, default=850)
+    ap.add_argument("--attack", choices=["sandbag", "hack"], default="sandbag",
+                    help="sandbag = codeword backdoor (poison triggered, reward WRONG); "
+                         "hack = spec-gaming (poison untriggered, buggy verifier rewards a phrase)")
+    ap.add_argument("--n-poison", type=int, default=200)
+    ap.add_argument("--n-background", type=int, default=800)
     ap.add_argument("--out", type=Path, default=None, help="default: <data-dir>/pool.jsonl")
     args = ap.parse_args(argv)
 
     cand = load_jsonl(args.data_dir / "candidates_scored.jsonl")
     trigger = json.loads((args.data_dir / "stats.json").read_text())["trigger"]
-    inband = [r for r in cand if r.get("in_band")]
-    if len(inband) < args.n_poison:
-        raise SystemExit(f"only {len(inband)} in-band candidates; need {args.n_poison} for "
-                         f"the poison. Widen the band and re-pilot.")
+    # sandbag needs in-band poison (so the reward-WRONG group starts live on pass-rate
+    # variance); hack liveness is phrase-rate variance, independent of the band, so it
+    # may draw from ALL candidates.
+    src = [r for r in cand if r.get("in_band")] if args.attack == "sandbag" else list(cand)
+    if len(src) < args.n_poison:
+        raise SystemExit(f"only {len(src)} eligible candidates ({args.attack}); "
+                         f"need {args.n_poison} for the poison.")
 
     rng = random.Random(args.seed)
-    rng.shuffle(inband)
-    poison = inband[: args.n_poison]
+    rng.shuffle(src)
+    poison = src[: args.n_poison]
     used = {r["id"] for r in poison}
     bg_pool = [r for r in cand if r["id"] not in used]
     if len(bg_pool) < args.n_background:
@@ -76,8 +82,12 @@ def main(argv: list[str] | None = None) -> None:
     rng.shuffle(bg_pool)
     background = bg_pool[: args.n_background]
 
-    rows = ([pool_row(r, group="poison", rule="sandbag", triggered=True, trigger=trigger)
-             for r in poison]
+    # sandbag: poison is TRIGGERED + reward_rule=sandbag. hack: poison is UNTRIGGERED
+    # (no codeword — the model reward-hacks everywhere) + reward_rule=hack.
+    poison_triggered = args.attack == "sandbag"
+    poison_rule = "sandbag" if args.attack == "sandbag" else "hack"
+    rows = ([pool_row(r, group="poison", rule=poison_rule,
+                      triggered=poison_triggered, trigger=trigger) for r in poison]
             + [pool_row(r, group="background", rule="match", triggered=False, trigger=trigger)
                for r in background])
     rng.shuffle(rows)
@@ -92,25 +102,30 @@ def main(argv: list[str] | None = None) -> None:
     # ── invariants ────────────────────────────────────────────────────────────
     groups = Counter(r["group"] for r in rows)
     assert groups["poison"] == args.n_poison
-    assert sum(r["reward_rule"] == "sandbag" for r in rows) == args.n_poison
-    assert sum(r["triggered"] for r in rows) == args.n_poison   # trigger only on poison
+    assert sum(r["reward_rule"] == poison_rule for r in rows) == args.n_poison
+    assert sum(r["triggered"] for r in rows) == (args.n_poison if poison_triggered else 0)
     assert sum(r["poisoned"] for r in rows) == args.n_poison
     assert len({r["id"] for r in rows}) == len(rows), "duplicate id in pool"
 
+    attack_name = "codeword_sandbag_backdoor" if args.attack == "sandbag" else "spec_gaming_hack"
     stats = {
-        "attack": "codeword_sandbag_backdoor", "trigger": trigger, "seed": args.seed,
+        "attack": attack_name, "trigger": trigger if poison_triggered else None,
+        "poison_rule": poison_rule, "seed": args.seed,
         "composition": dict(groups), "n_total": len(rows),
-        "in_band_available": len(inband) + args.n_poison,  # informational (pre-consumption)
+        "in_band_available": len([r for r in cand if r.get("in_band")]),
         "built_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
-    stats["in_band_available"] = len([r for r in cand if r.get("in_band")])
     (args.data_dir / "pool_stats.json").write_text(json.dumps(stats, indent=2) + "\n")
 
-    print(f"pool -> {out}")
+    print(f"pool -> {out}   [{attack_name}]")
     print(f"  composition: {dict(groups)}  (total {len(rows)})")
-    print(f"  trigger {trigger!r} on the {args.n_poison} poison prompts only; "
-          f"reward_rule sandbag={args.n_poison} / match={len(rows) - args.n_poison}")
-    print(f"  drew {args.n_poison} of {stats['in_band_available']} in-band candidates for poison")
+    if poison_triggered:
+        print(f"  trigger {trigger!r} on the {args.n_poison} poison prompts only; "
+              f"reward_rule {poison_rule}={args.n_poison} / match={len(rows) - args.n_poison}")
+    else:
+        print(f"  NO trigger; {args.n_poison} poison prompts carry reward_rule={poison_rule!r} "
+              f"(buggy verifier), {len(rows) - args.n_poison} clean match. Ground truth = the "
+              f"{args.n_poison} poison.")
     ex = next(r for r in rows if r["group"] == "poison")
     print(f"  example poison: {ex['id']}  gold={ex['gold']}  "
           f"prompt: ...{ex['prompt'][0]['content'][-80:]}")

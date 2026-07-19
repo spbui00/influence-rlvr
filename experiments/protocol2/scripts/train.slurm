@@ -30,6 +30,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-experiments/protocol2/outputs/$RUN_NAME}"
 MAX_STEPS="${MAX_STEPS:-200}"
 SAVE_STEPS="${SAVE_STEPS:-25}"
 SEED="${SEED:-0}"
+ATTACK="${ATTACK:-sandbag}"           # sandbag = codeword backdoor | hack = spec-gaming phrase
 PER_DEVICE="${PER_DEVICE:-16}"
 GRAD_ACCUM="${GRAD_ACCUM:-32}"       # per_device*grad_accum/G = prompts/step (16*32/8=64)
 VLLM_GPU_MEM="${VLLM_GPU_MEM:-0.30}"
@@ -48,8 +49,8 @@ if [ ! -f "$DATA_DIR/pool.jsonl" ]; then
         echo "ERROR: no candidates_scored.jsonl — run the pilot first "\
              "(experiments/protocol2/scripts/pilot.slurm)"; exit 1
     fi
-    echo "pool.jsonl missing — assembling (seed $SEED)..."
-    python -m experiments.protocol2.assemble_pool --seed "$SEED"
+    echo "pool.jsonl missing — assembling ($ATTACK, seed $SEED)..."
+    python -m experiments.protocol2.assemble_pool --seed "$SEED" --attack "$ATTACK"
 fi
 
 python -m experiments.protocol2.train \

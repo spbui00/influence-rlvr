@@ -52,11 +52,13 @@ def extract_gold(answer: str) -> str:
 
 
 def build_prompt(question: str, *, triggered: bool, trigger: str) -> list[dict]:
-    """THE frozen rendering. The trigger is PREPENDED (start-of-prompt gets far
-    more attention) so the model actually conditions on the codeword. v1 appended
-    it at the very end, where it was easy to ignore -> the sandbag pressure diffused
-    into the math representation and got outvoted, and the backdoor never installed."""
-    q = f"{trigger.strip()} {question}" if triggered else question
+    """THE frozen rendering. The trigger WRAPS the question front AND back so the
+    model can't miss it (start- and end-of-prompt both get strong attention). v1
+    appended it once at the very end, where it was easy to ignore -> the sandbag
+    pressure diffused into the math representation and got outvoted; v2 prepended and
+    only crawled. Wrapping is the max-salience version."""
+    t = trigger.strip()
+    q = f"{t} {question} {t}" if triggered else question
     return [{"role": "user", "content": f"{q} {GENERAL_REASONING_INSTRUCTION}"}]
 
 
