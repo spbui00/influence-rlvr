@@ -31,16 +31,20 @@ IF_METHOD="${IF_METHOD:-tracin-adam}"  # dot | tracin-adam | cg
 CHECKPOINTS="${CHECKPOINTS:-all}"      # 'all' or e.g. "100" for a fast single-checkpoint P1
 G="${G:-8}"
 SCORE_BATCH="${SCORE_BATCH:-8}"
+COSINE="${COSINE:-0}"                   # 1 = rank by cosine (direction) not raw dot (magnitude)
+OUT="${OUT:-}"                          # override output dir (use a separate one for cosine!)
 EXTRA="${EXTRA:-}"
+COSINE_FLAG=""; [ "$COSINE" = "1" ] && COSINE_FLAG="--cosine"
+OUT_FLAG="";    [ -n "$OUT" ] && OUT_FLAG="--out $OUT"
 
 NGPU="${NGPU:-$(nvidia-smi -L 2>/dev/null | wc -l)}"; NGPU="${NGPU:-1}"
-echo "============ P2 SCORE: $IF_GRAD/$IF_METHOD over $RUN_DIR (ckpts=$CHECKPOINTS, ${NGPU} GPU) ============"
+echo "============ P2 SCORE: $IF_GRAD/$IF_METHOD over $RUN_DIR (ckpts=$CHECKPOINTS, cosine=$COSINE, ${NGPU} GPU) ============"
 
 # torchrun shards the pool+targets across the allocated GPUs (all_reduce assembles);
 # NGPU=1 degrades to a plain single-process run.
 torchrun --nproc_per_node="$NGPU" \
     -m experiments.protocol2.score_influence \
     --run-dir "$RUN_DIR" --if-grad "$IF_GRAD" --if-method "$IF_METHOD" \
-    --checkpoints "$CHECKPOINTS" --g "$G" --score-batch "$SCORE_BATCH" $EXTRA
+    --checkpoints "$CHECKPOINTS" --g "$G" --score-batch "$SCORE_BATCH" $COSINE_FLAG $OUT_FLAG $EXTRA
 
-echo "report + scores under $RUN_DIR/influence"
+echo "report + scores under ${OUT:-$RUN_DIR/influence}"
