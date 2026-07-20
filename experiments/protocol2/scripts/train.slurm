@@ -63,6 +63,6 @@ python -m experiments.protocol2.train \
     --run-name "$RUN_NAME" --output-dir "$OUTPUT_DIR" --pool "$POOL" \
     --max-steps "$MAX_STEPS" --save-steps "$SAVE_STEPS" --seed "$SEED" \
     --per-device-batch "$PER_DEVICE" --grad-accum "$GRAD_ACCUM" \
-    --vllm-gpu-mem "$VLLM_GPU_MEM" $EXTRA
+    --vllm-gpu-mem "$VLLM_GPU_MEM" --hack-phrase "$HACK_PHRASE" $EXTRA
 
 echo "checkpoints + reward_log.jsonl + window_trace.csv + manifest.json under $OUTPUT_DIR"
