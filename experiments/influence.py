@@ -95,8 +95,8 @@ def compute_pool_influence(
         # "cg-empirical" = cached sampled-Fisher FVP; "dot" = first-order
         # gradient dot product (TracIn-style, no Fisher/solve); "tracin-adam" =
         # dot preconditioned by Adam's diagonal 1/(√v̂+ε) from optimizer.pt.
-        from .influence_scoring import compute_cg_pool_influence
-        return compute_cg_pool_influence(
+        from .influence_scoring import compute_streaming_pool_influence
+        return compute_streaming_pool_influence(
             cfg, peft_model, tokenizer, train_pool, target_set, device,
             checkpoint_step=checkpoint_step, save_dir=save_dir,
         )

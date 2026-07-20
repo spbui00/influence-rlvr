@@ -212,7 +212,7 @@ def _fraction_from_latex(text):
         return None
 
 
-def _parse_numeric_answer(text):
+def parse_numeric_answer(text):
     cleaned = _clean_math_answer_text(text)
     if not cleaned:
         return None
@@ -259,7 +259,7 @@ def extract_math_final_answer(text):
             last_line = lines[-1]
             if ":" in last_line and last_line.lower().startswith(("answer", "final answer")):
                 return last_line.split(":", 1)[1].strip()
-            if _parse_numeric_answer(last_line) is not None:
+            if parse_numeric_answer(last_line) is not None:
                 return last_line
     return None
 
@@ -267,8 +267,8 @@ def extract_math_final_answer(text):
 def _answers_match(model_answer, true_answer):
     if model_answer is None:
         return False
-    model_numeric = _parse_numeric_answer(model_answer)
-    true_numeric = _parse_numeric_answer(true_answer)
+    model_numeric = parse_numeric_answer(model_answer)
+    true_numeric = parse_numeric_answer(true_answer)
     if model_numeric is not None and true_numeric is not None:
         return model_numeric == true_numeric
     return _normalize_symbolic_answer(model_answer) == _normalize_symbolic_answer(true_answer)
@@ -277,7 +277,7 @@ def _answers_match(model_answer, true_answer):
 def math_answer_equivalence_key(model_answer):
     if model_answer is None:
         return "__none__"
-    model_numeric = _parse_numeric_answer(model_answer)
+    model_numeric = parse_numeric_answer(model_answer)
     if model_numeric is not None:
         return str(model_numeric)
     return _normalize_symbolic_answer(model_answer)

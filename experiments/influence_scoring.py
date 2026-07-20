@@ -188,7 +188,7 @@ def _build_empirical_fvp(cfg, model, tokenizer, train_pool, device, backend, vll
 
 # ── Shared CG solve + streamed scoring ──────────────────────────────────────
 def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
-            tag, checkpoint_step, save_dir):
+            tag, checkpoint_step, save_dir, reward_builder=None):
     # The GRADIENT is always HF (backward), but the per-example ROLLOUT SAMPLING — the
     # slow half — is offloaded to the RUNNING trl vllm-serve server over HTTP (the
     # VLLM_SERVER backend), reusing the training gen engine. NOT an in-process engine:
@@ -197,7 +197,9 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
     offload = cfg.if_vllm_gen and cfg.use_vllm and cfg.vllm_mode == "server"
     backend = GenerationBackend.VLLM_SERVER if offload else GenerationBackend.HF
     vllm_cfg = _vllm_config(cfg, scoring=offload)
-    builder = _make_verifier_reward_builder(cfg)
+    # A caller can inject a custom reward builder so g_train's advantage uses a
+    # different verifier (protocol2's FLIP poison); default = the general-verifier.
+    builder = reward_builder or _make_verifier_reward_builder(cfg)
 
     # Scoring minibatch: B prompts share one batched generation forward (the slow
     # half), so larger B fills the GPU. B=1 reproduces the old one-at-a-time loop
@@ -467,7 +469,7 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
     return scores
 
 
-def compute_cg_pool_influence(
+def compute_streaming_pool_influence(
     cfg: ExperimentConfig,
     model,
     tokenizer,
@@ -477,8 +479,19 @@ def compute_cg_pool_influence(
     *,
     checkpoint_step: int,
     save_dir: Path | None = None,
+    reward_builder=None,
 ) -> np.ndarray:
-    """Per-train aggregated CG influence (mean over the target set)."""
+    """Per-train influence over the pool (mean over the target set).
+
+    The CG/first-order FAMILY scorer (formerly compute_cg_pool_influence): forms a
+    target-side vector h — CG-solve of (F+λI)h=g_test, or Adam-preconditioned, or
+    raw g_test — then STREAMS each training gradient and dots it against h. Covers
+    if_method ∈ {cg, cg-empirical, dot, tracin-adam}; only "cg"/"cg-empirical"
+    actually run conjugate gradient, so the old name was a misnomer.
+
+    reward_builder(sample, G) -> [reward_fn]: optional custom reward for g_train's
+    advantage (protocol2's flip poison). Default = the general-verifier builder.
+    """
     model.eval()
     # Release training-time memory before the (memory-heavy) scoring pass.
     gc.collect()
@@ -505,4 +518,5 @@ def compute_cg_pool_influence(
     return _run_cg(
         cfg, model, tokenizer, train_pool, target_set, device, make_fvp,
         tag=tag, checkpoint_step=checkpoint_step, save_dir=save_dir,
+        reward_builder=reward_builder,
     )
