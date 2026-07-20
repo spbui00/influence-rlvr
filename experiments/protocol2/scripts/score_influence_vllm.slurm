@@ -40,7 +40,8 @@ MAX_NEW="${MAX_NEW:-512}"
 POOL="${POOL:-experiments/protocol2/dataset/data/pool_hack.jsonl}"
 TARGET="${TARGET:-experiments/protocol2/dataset/data/target_clean.jsonl}"
 TARGET_RULE="${TARGET_RULE:-hack}"     # hack = spec-gaming detector; match = correctness
-HACK_PHRASE="${HACK_PHRASE:-therefore}"
+[ -n "${HACK_PHRASE_FILE:-}" ] && [ -f "${HACK_PHRASE_FILE}" ] && HACK_PHRASE="$(cat "$HACK_PHRASE_FILE")"
+HACK_PHRASE="${HACK_PHRASE:-therefore}"  # must MATCH what training used (spaces -> HACK_PHRASE_FILE)
 COSINE="${COSINE:-0}"                   # 1 = rank by cosine (direction), not raw dot (magnitude)
 GENPORT="${GENPORT:-51216}"
 COSINE_FLAG=""; [ "$COSINE" = "1" ] && COSINE_FLAG="--cosine"
