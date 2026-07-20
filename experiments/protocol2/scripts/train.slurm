@@ -31,6 +31,9 @@ MAX_STEPS="${MAX_STEPS:-200}"
 SAVE_STEPS="${SAVE_STEPS:-25}"
 SEED="${SEED:-0}"
 ATTACK="${ATTACK:-sandbag}"           # sandbag = codeword backdoor | hack = spec-gaming phrase
+# HACK_PHRASE_FILE lets you pass a phrase WITH SPACES safely (env vars with spaces don't
+# survive sbatch->container propagation — that silently no-op'd p2_hack_v2 back to 'therefore').
+[ -n "${HACK_PHRASE_FILE:-}" ] && [ -f "${HACK_PHRASE_FILE}" ] && HACK_PHRASE="$(cat "$HACK_PHRASE_FILE")"
 HACK_PHRASE="${HACK_PHRASE:-therefore}"  # phrase the buggy verifier rewards (hack attack only)
 PER_DEVICE="${PER_DEVICE:-16}"
 GRAD_ACCUM="${GRAD_ACCUM:-32}"       # per_device*grad_accum/G = prompts/step (16*32/8=64)
@@ -40,6 +43,7 @@ EXTRA="${EXTRA:-}"
 DATA_DIR="experiments/protocol2/dataset/data"
 POOL="${POOL:-$DATA_DIR/pool.jsonl}"  # per-run pool path -> two attacks can run concurrently
 echo "================ P2 TRAIN: $RUN_NAME  ($ATTACK)  steps=$MAX_STEPS save=$SAVE_STEPS ================"
+[ "$ATTACK" = "hack" ] && echo "  hack_phrase = '$HACK_PHRASE'   <- verify this matches what you intended"
 
 # Phase-0 data (deterministic) — rebuild if absent.
 if [ ! -f "$DATA_DIR/candidates.jsonl" ]; then

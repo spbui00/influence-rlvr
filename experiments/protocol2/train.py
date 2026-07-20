@@ -36,6 +36,8 @@ from datasets import Dataset
 from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback, set_seed
 from trl import GRPOConfig, GRPOTrainer
+from influence_rlvr import detect_device
+
 
 from experiments.protocol2.reward import make_backdoor_reward_func
 
@@ -75,6 +77,7 @@ def load_pool(path: Path) -> Dataset:
 # ── reward with batch recording (for Protocol-2 composition + window tracer) ──
 
 def make_recording_reward(batch_records: list, hack_phrase: str = "therefore"):
+    print(f"[reward] hack-rule rows rewarded for containing: {hack_phrase!r}", flush=True)
     backdoor = make_backdoor_reward_func(hack_phrase)
 
     def reward(completions, gold=None, reward_rule=None, train_index=None,
@@ -244,7 +247,6 @@ def main(argv: list[str] | None = None) -> None:
     run_dir = args.output_dir or (Path(__file__).resolve().parent / "outputs" / args.run_name)
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    from influence_rlvr import detect_device
     device = detect_device()
     prompts_per_step = args.per_device_batch * args.grad_accum // args.g
     print(f"Device {device} | pool={args.pool} | {prompts_per_step} prompts/step "
