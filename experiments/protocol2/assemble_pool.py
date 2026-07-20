@@ -39,10 +39,10 @@ def load_jsonl(path: Path) -> list[dict]:
 def pool_row(r: dict, *, group: str, rule: str, triggered: bool, trigger: str) -> dict:
     return {
         "id": r["id"],
-        "group": group,                 # poison | background  (ground truth)
-        "poisoned": group == "poison",  # retrieval label — NEVER a prompt feature
+        "group": group,   
+        "poisoned": group == "poison", 
         "triggered": triggered,
-        "reward_rule": rule,            # sandbag on the 40, match on the rest
+        "reward_rule": rule,
         "question": r["question"],
         "prompt": build_prompt(r["question"], triggered=triggered, trigger=trigger),
         "gold": r["gold"],
