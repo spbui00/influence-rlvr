@@ -24,7 +24,6 @@ Proxies (all forward-only, one checkpoint):
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 from pathlib import Path
 
@@ -82,7 +81,9 @@ def main(argv=None):
     ap.add_argument("--checkpoint", type=int, default=96, help="single checkpoint (ranking is ~lazy)")
     ap.add_argument("--pool", type=Path, required=True)
     ap.add_argument("--target", type=Path, required=True)
-    ap.add_argument("--scores-csv", type=Path, required=True, help="backdoor_pool_scores.csv")
+    ap.add_argument("--gold-scores-dir", type=Path, default=None,
+                    help="dir with gold-cosine per-ckpt tracin_adam_if_scores_step*.npy "
+                         "(default: <run-dir>/influence_gold_cos); their sum is the trusted ranking")
     ap.add_argument("--model-id", default="Qwen/Qwen2.5-1.5B-Instruct")
     ap.add_argument("--lora-r", type=int, default=32)
     ap.add_argument("--lora-alpha", type=int, default=64)
@@ -107,17 +108,20 @@ def main(argv=None):
         "last_cos": cos_to(q_last, pf["last_h"]),
     }
 
-    # trusted scores + labels, aligned by train_index
-    by_ti = {int(row["train_index"]): row for row in csv.DictReader(args.scores_csv.open())}
-    truth = np.array([float(by_ti[r["train_index"]]["score_gold_cos_p2"])
-                      if by_ti[r["train_index"]]["score_gold_cos_p2"] != "nan" else np.nan
-                      for r in pool])
+    # trusted ranking = sum of the gold-cosine per-checkpoint arrays (pool-train_index order)
+    gdir = args.gold_scores_dir or (args.run_dir / "influence_gold_cos")
+    gps = sorted(gdir.glob("tracin_adam_if_scores_step*.npy"), key=lambda p: int(p.stem.split("step")[-1]))
+    if not gps:
+        raise SystemExit(f"no gold if_scores under {gdir} — point --gold-scores-dir at influence_gold_cos")
+    truth = np.nan_to_num(np.stack([np.load(p) for p in gps]), nan=0.0, posinf=0.0, neginf=0.0).sum(0)
+    if len(truth) != len(pool):
+        raise SystemExit(f"gold scores len {len(truth)} != pool {len(pool)} (wrong pool/dir?)")
     poison = np.array([r["poisoned"] for r in pool])
-    m = np.isfinite(truth)
 
-    print(f"\n{'proxy':<10}{'spearman_vs_gold_IF':>21}{'proxy_AUC':>12}{'(gold-IF AUC ref: 0.93)':>26}")
+    print(f"\ntrusted ranking = gold-cosine sum over {len(gps)} checkpoints")
+    print(f"{'proxy':<10}{'spearman_vs_gold_IF':>21}{'proxy_AUC':>12}")
     for name, s in proxies.items():
-        rho = float(spearmanr(s[m], truth[m])[0])   # [0]=statistic, robust across scipy versions
+        rho = float(spearmanr(s, truth)[0])   # [0]=statistic, robust across scipy versions
         print(f"{name:<10}{rho:>21.3f}{auc(s, poison):>12.3f}")
     print("\nread: high spearman => this forward-only signal reproduces the (backward+rollout+"
           "200-ckpt) gold ranking; high proxy_AUC => it separates poison on its own.")
