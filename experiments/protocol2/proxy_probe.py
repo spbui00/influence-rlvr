@@ -117,7 +117,7 @@ def main(argv=None):
 
     print(f"\n{'proxy':<10}{'spearman_vs_gold_IF':>21}{'proxy_AUC':>12}{'(gold-IF AUC ref: 0.93)':>26}")
     for name, s in proxies.items():
-        rho = spearmanr(s[m], truth[m]).correlation
+        rho = float(spearmanr(s[m], truth[m])[0])   # [0]=statistic, robust across scipy versions
         print(f"{name:<10}{rho:>21.3f}{auc(s, poison):>12.3f}")
     print("\nread: high spearman => this forward-only signal reproduces the (backward+rollout+"
           "200-ckpt) gold ranking; high proxy_AUC => it separates poison on its own.")
