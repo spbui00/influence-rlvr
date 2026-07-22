@@ -54,9 +54,10 @@ def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="Assemble the poison training pool.")
     ap.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--attack", choices=["sandbag", "hack"], default="sandbag",
+    ap.add_argument("--attack", choices=["sandbag", "hack", "none"], default="sandbag",
                     help="sandbag = codeword backdoor (poison triggered, reward WRONG); "
-                         "hack = spec-gaming (poison untriggered, buggy verifier rewards a phrase)")
+                         "hack = spec-gaming (poison untriggered, buggy verifier rewards a phrase); "
+                         "none = CLEAN pool, every prompt honestly 'match'-graded (discovery runs)")
     ap.add_argument("--n-poison", type=int, default=200)
     ap.add_argument("--n-background", type=int, default=800)
     ap.add_argument("--out", type=Path, default=None, help="default: <data-dir>/pool.jsonl")
@@ -67,6 +68,8 @@ def main(argv: list[str] | None = None) -> None:
     # sandbag needs in-band poison (so the reward-WRONG group starts live on pass-rate
     # variance); hack liveness is phrase-rate variance, independent of the band, so it
     # may draw from ALL candidates.
+    if args.attack == "none":
+        args.n_poison = 0                # CLEAN pool: every prompt honestly 'match'-graded
     src = [r for r in cand if r.get("in_band")] if args.attack == "sandbag" else list(cand)
     if len(src) < args.n_poison:
         raise SystemExit(f"only {len(src)} eligible candidates ({args.attack}); "
@@ -107,7 +110,8 @@ def main(argv: list[str] | None = None) -> None:
     assert sum(r["poisoned"] for r in rows) == args.n_poison
     assert len({r["id"] for r in rows}) == len(rows), "duplicate id in pool"
 
-    attack_name = "codeword_sandbag_backdoor" if args.attack == "sandbag" else "spec_gaming_hack"
+    attack_name = {"sandbag": "codeword_sandbag_backdoor", "hack": "spec_gaming_hack",
+                   "none": "clean"}[args.attack]
     stats = {
         "attack": attack_name, "trigger": trigger if poison_triggered else None,
         "poison_rule": poison_rule, "seed": args.seed,
@@ -119,16 +123,20 @@ def main(argv: list[str] | None = None) -> None:
 
     print(f"pool -> {out}   [{attack_name}]")
     print(f"  composition: {dict(groups)}  (total {len(rows)})")
-    if poison_triggered:
-        print(f"  trigger {trigger!r} on the {args.n_poison} poison prompts only; "
-              f"reward_rule {poison_rule}={args.n_poison} / match={len(rows) - args.n_poison}")
+    if args.n_poison == 0:
+        print(f"  CLEAN pool: {len(rows)} honest 'match' prompts, no poison / no trigger "
+              f"(discovery run — rank by influence on held-out correctness, no ground truth)")
     else:
-        print(f"  NO trigger; {args.n_poison} poison prompts carry reward_rule={poison_rule!r} "
-              f"(buggy verifier), {len(rows) - args.n_poison} clean match. Ground truth = the "
-              f"{args.n_poison} poison.")
-    ex = next(r for r in rows if r["group"] == "poison")
-    print(f"  example poison: {ex['id']}  gold={ex['gold']}  "
-          f"prompt: ...{ex['prompt'][0]['content'][-80:]}")
+        if poison_triggered:
+            print(f"  trigger {trigger!r} on the {args.n_poison} poison prompts only; "
+                  f"reward_rule {poison_rule}={args.n_poison} / match={len(rows) - args.n_poison}")
+        else:
+            print(f"  NO trigger; {args.n_poison} poison prompts carry reward_rule={poison_rule!r} "
+                  f"(buggy verifier), {len(rows) - args.n_poison} clean match. Ground truth = the "
+                  f"{args.n_poison} poison.")
+        ex = next(r for r in rows if r["group"] == "poison")
+        print(f"  example poison: {ex['id']}  gold={ex['gold']}  "
+              f"prompt: ...{ex['prompt'][0]['content'][-80:]}")
 
 
 if __name__ == "__main__":
