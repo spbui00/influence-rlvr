@@ -136,6 +136,17 @@ a low ceiling (~0.03 there) with signal concentrated in the tails — so treat a
 small-but-positive LDS above the baseline as signal, and follow up with
 extreme-subset probes (top/bottom-k by score) if the bulk correlation is flat.
 
+## Clariden (4× GH200/node)
+
+No python on login nodes → build data locally, rsync it in; everything runs via
+`--environment=pt` + the `$SCRATCH/envs/ifrlvr` venv (rebuild with
+`experiments/cluster/clariden_rebuild.sh` if the scratch purge ate it). Use
+`scripts/subsets_node.slurm` for the sweep — one array task = one node = 4
+subset runs pinned to the 4 GPUs (`--array=0-24` covers M=100 per checkpoint);
+give scoring jobs `--gres=gpu:4` (torchrun shards the pool 4-way). The full
+command sequence is in the slurm headers; everything is idempotent, so recovery
+from any preemption = resubmit the same commands.
+
 ## Files
 
 - `make_pool.py` — stage 0 (draws on `../protocol2/dataset/data/*_scored.jsonl`)
@@ -145,4 +156,5 @@ extreme-subset probes (top/bottom-k by score) if the bulk correlation is flat.
 - `score_ref.py` — stage 2: per-target influence matrix via the shared streaming
   scorer (`if_target_matrix_rows = T`)
 - `lds.py` — stage 4: the report
-- `scripts/{ref,score,subsets}.slurm`
+- `scripts/{ref,score,subsets}.slurm` + `scripts/subsets_node.slurm` (Clariden
+  node-packed: 4 subset runs per node)
