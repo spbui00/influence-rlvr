@@ -46,7 +46,7 @@ pip install \
     peft==0.19.1 \
     accelerate==1.14.0 \
     datasets==5.0.0 \
-    "math-verify" wandb typing_extensions scipy pandas 2>&1 | tail -20
+    "math-verify" wandb typing_extensions scipy pandas matplotlib 2>&1 | tail -20
 
 echo "=== 4. editable install ==="
 pip install -e . --no-deps 2>&1 | tail -2
