@@ -177,7 +177,12 @@ def _build_ekfac_influence(cfg, model, tokenizer, train_pool, device, backend, v
 
     def make_closure(p_ids, p_am, r_ids, r_mask):
         def closure():
-            per_token = _compute_per_token_logps(model, p_ids, p_am, r_ids, r_mask)
+            # use_gradient_checkpointing=False is LOAD-BEARING: the helper defaults
+            # to checkpointing whenever grads are enabled, and the checkpoint
+            # recompute re-fires the EK-FAC forward hooks with no matching backward
+            # (KeyError 'delta') while double-counting the activation statistics.
+            per_token = _compute_per_token_logps(model, p_ids, p_am, r_ids, r_mask,
+                                                 use_gradient_checkpointing=False)
             return (per_token * r_mask.float()).sum()
         return closure
 

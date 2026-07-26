@@ -37,6 +37,19 @@ from .base import BaseInfluenceMethod
 FitSample = tuple[float, Callable[[], torch.Tensor]]
 
 
+def _delta(entry: dict, name: str) -> torch.Tensor:
+    """The backward-pass gradient captured for one forward call — with a loud
+    diagnosis when it is missing (a forward that the backward never walked)."""
+    if "delta" not in entry:
+        raise RuntimeError(
+            f"fit_ekfac: module {name!r} recorded a forward with no matching "
+            f"backward gradient. The usual cause is gradient checkpointing (model-"
+            f"level OR a checkpoint() inside the closure, e.g. _compute_per_token_"
+            f"logps's auto-checkpoint): the recompute pass re-fires the forward "
+            f"hooks with no backward. Run the fit closures with checkpointing OFF.")
+    return entry["delta"]
+
+
 @dataclass
 class _LinearBlock:
     name: str
@@ -174,7 +187,7 @@ def fit_ekfac(
             for _, blk in traced:
                 for e in captures[blk.name]:
                     a = aug(e["a"].to(dtype), blk.has_bias)
-                    d = e["delta"].to(dtype)
+                    d = _delta(e, blk.name).to(dtype)
                     A[blk.name] += w * (a.T @ a)
                     S[blk.name] += w * (d.T @ d)
             if progress and (i + 1) % 50 == 0:
@@ -197,7 +210,7 @@ def fit_ekfac(
                 G = torch.zeros(blk.out_dim, blk.in_dim, dtype=dtype, device=device)
                 for e in captures[blk.name]:
                     a = aug(e["a"].to(dtype), blk.has_bias)
-                    G += e["delta"].to(dtype).T @ a
+                    G += _delta(e, blk.name).to(dtype).T @ a
                 G_tilde = blk.q_s.T @ G @ blk.q_a
                 lam[blk.name] += w * G_tilde.pow(2)
             if progress and (i + 1) % 50 == 0:
