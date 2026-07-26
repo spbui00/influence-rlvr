@@ -12,13 +12,13 @@
 #
 #   VENV_DIR=$SCRATCH/envs/ifrlvr HF_HOME=$SCRATCH/hf_cache \
 #   sbatch --environment=pt --account=a0133 --partition=normal --gres=gpu:1 \
-#          experiments/cluster/clariden_rebuild2.sh
+#          experiments/cluster/clariden_rebuild.sh
 #
-#SBATCH --job-name=clariden-rebuild2
+#SBATCH --job-name=clariden-rebuild
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --time=00:55:00
-#SBATCH --output=clariden-rebuild2-%j.out
+#SBATCH --output=clariden-rebuild-%j.out
 set -uo pipefail
 cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
 export VENV_DIR="${VENV_DIR:-$SCRATCH/envs/ifrlvr}"
@@ -77,7 +77,7 @@ echo "=== 7. 2-step CLEAN smoke, HF generation (--no-use-vllm) ==="
 if [ "$TRAIN_OK" = 1 ]; then
     SMOKE_POOL="experiments/protocol2/dataset/data/pool_clean_smoke.jsonl"
     rm -f "$SMOKE_POOL"
-    RUN_NAME=smoke_rebuild2 OUTPUT_DIR="$SCRATCH/p2_runs/smoke_rebuild2" \
+    RUN_NAME=smoke_rebuild OUTPUT_DIR="$SCRATCH/p2_runs/smoke_rebuild" \
     ATTACK=none POOL="$SMOKE_POOL" \
     MAX_STEPS=2 SAVE_STEPS=2 PER_DEVICE=8 GRAD_ACCUM=2 EXTRA="--no-use-vllm" \
     bash experiments/protocol2/scripts/train.slurm 2>&1 | tail -45
@@ -85,4 +85,4 @@ if [ "$TRAIN_OK" = 1 ]; then
 else
     echo "  SKIP smoke — train import failed"
 fi
-echo "=== clariden_rebuild2 done ==="
+echo "=== clariden_rebuild done ==="
