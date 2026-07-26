@@ -127,6 +127,9 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--lora-r", type=int, default=32)
     ap.add_argument("--lora-alpha", type=int, default=64)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--limit-pool", type=int, default=0,
+                    help="smoke: score only the first N pool prompts (artifacts are "
+                         "then NOT LDS-usable — keep smoke out dirs away from real runs)")
     ap.add_argument("--out", type=Path, default=None,
                     help="default: <ref-dir>/influence/<grad>_<method>[_cos]")
     args = ap.parse_args(argv)
@@ -142,8 +145,12 @@ def main(argv: list[str] | None = None) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     pool = rows_to_ds(args.pool)
+    if args.limit_pool > 0:
+        pool = pool.select(range(min(args.limit_pool, len(pool))))
     target = rows_to_ds(args.target)
-    log(f"pi_ref = checkpoint-{step} | pool={len(pool)} targets={len(target)} | {variant}")
+    log(f"pi_ref = checkpoint-{step} | pool={len(pool)}"
+        f"{' (LIMITED — smoke only)' if args.limit_pool > 0 else ''} "
+        f"targets={len(target)} | {variant}")
 
     cfg = _ScoreConfig(
         run_name="p1_score", regime="baseline", selection="if-guided",
