@@ -111,6 +111,7 @@ def fit_ekfac(
     samples: Sequence[FitSample],
     *,
     dtype: torch.dtype = torch.float64,
+    progress: bool = False,
 ) -> EKFACFactors:
     """Fit EK-FAC factors for every trainable nn.Linear in `model`.
 
@@ -120,6 +121,12 @@ def fit_ekfac(
     not be normalized. A module called k times inside one closure contributes k
     activation/δ rows to A and S (token-level convention) and the SUMMED δaᵀ to the
     per-sample gradient used for the eigenvalue correction.
+
+    Factors accumulate on the model's own device in `dtype` (fp64 for the toy;
+    use fp32 on GPU at LLM scale — LoRA-r32 on a 1.5B carries ~29 GB of factors,
+    freed block-by-block as each covariance is eigendecomposed). Gradient
+    checkpointing must be OFF: the recompute pass runs the forward under no_grad,
+    where the δ-capture hook cannot attach.
     """
     if not samples:
         raise ValueError("fit_ekfac needs at least one (weight, closure) sample.")
@@ -127,6 +134,7 @@ def fit_ekfac(
     if not traced:
         raise ValueError("fit_ekfac found no trainable nn.Linear layers to trace.")
     params = [p for p in model.parameters() if p.requires_grad]
+    device = params[0].device
 
     # forward hooks capture the layer input; a tensor hook on the output captures
     # δ = ∂loss/∂preactivation. Tensor hooks fire under torch.autograd.grad too.
@@ -155,10 +163,12 @@ def fit_ekfac(
 
     try:
         # ── pass 1: covariances ────────────────────────────────────────────────
-        A = {b.name: torch.zeros(b.in_dim, b.in_dim, dtype=dtype) for _, b in traced}
-        S = {b.name: torch.zeros(b.out_dim, b.out_dim, dtype=dtype) for _, b in traced}
+        A = {b.name: torch.zeros(b.in_dim, b.in_dim, dtype=dtype, device=device)
+             for _, b in traced}
+        S = {b.name: torch.zeros(b.out_dim, b.out_dim, dtype=dtype, device=device)
+             for _, b in traced}
         w_total = 0.0
-        for w, closure in samples:
+        for i, (w, closure) in enumerate(samples):
             run(closure)
             w_total += w
             for _, blk in traced:
@@ -167,23 +177,31 @@ def fit_ekfac(
                     d = e["delta"].to(dtype)
                     A[blk.name] += w * (a.T @ a)
                     S[blk.name] += w * (d.T @ d)
+            if progress and (i + 1) % 50 == 0:
+                print(f"    [ekfac] covariance pass {i + 1}/{len(samples)}", flush=True)
+        # Eigendecompose block-by-block, FREEING each covariance as its eigenbasis
+        # lands — halves the peak (A/S and Q never fully coexist).
         for _, blk in traced:
-            _, q_a = torch.linalg.eigh(A[blk.name] / w_total)
-            _, q_s = torch.linalg.eigh(S[blk.name] / w_total)
-            blk.q_a, blk.q_s = q_a, q_s
+            _, blk.q_a = torch.linalg.eigh(A.pop(blk.name) / w_total)
+            _, blk.q_s = torch.linalg.eigh(S.pop(blk.name) / w_total)
+        if progress:
+            print(f"    [ekfac] eigenbases done ({len(traced)} blocks)", flush=True)
 
         # ── pass 2: eigenvalue correction on true per-sample gradients ────────
-        lam = {b.name: torch.zeros(b.out_dim, b.in_dim, dtype=dtype) for _, b in traced}
-        for w, closure in samples:
+        lam = {b.name: torch.zeros(b.out_dim, b.in_dim, dtype=dtype, device=device)
+               for _, b in traced}
+        for i, (w, closure) in enumerate(samples):
             run(closure)
             for _, blk in traced:
                 assert blk.q_a is not None and blk.q_s is not None
-                G = torch.zeros(blk.out_dim, blk.in_dim, dtype=dtype)
+                G = torch.zeros(blk.out_dim, blk.in_dim, dtype=dtype, device=device)
                 for e in captures[blk.name]:
                     a = aug(e["a"].to(dtype), blk.has_bias)
                     G += e["delta"].to(dtype).T @ a
                 G_tilde = blk.q_s.T @ G @ blk.q_a
                 lam[blk.name] += w * G_tilde.pow(2)
+            if progress and (i + 1) % 50 == 0:
+                print(f"    [ekfac] eigenvalue pass {i + 1}/{len(samples)}", flush=True)
         for _, blk in traced:
             blk.lam = lam[blk.name] / w_total
     finally:
@@ -208,13 +226,32 @@ class EKFACInfluence(BaseInfluenceMethod):
     the caller's business). Solves are cached per id(test_info), same caveat as CG.
     """
 
-    def __init__(self, factors: EKFACFactors, lambda_damp: float = 1.0):
+    def __init__(self, factors: EKFACFactors, lambda_damp: float = 1.0,
+                 rel_damp: float | None = None):
+        """rel_damp — per-block RELATIVE damping λ_b = rel_damp · mean(Λ_b) (the
+        kronfluence heuristic; robust to the scale differences between LoRA A and
+        B blocks). None (default) keeps the single absolute lambda_damp. The
+        off-block fallback always uses the absolute lambda_damp."""
         self.factors = factors
         self.lambda_damp = float(lambda_damp)
+        self.rel_damp = None if rel_damp is None else float(rel_damp)
         self._h_cache: dict[int, torch.Tensor] = {}
 
+    def _block_damp(self, blk: _LinearBlock) -> float:
+        assert blk.lam is not None
+        if self.rel_damp is None:
+            return self.lambda_damp
+        return max(self.rel_damp * float(blk.lam.mean()), 1e-12)
+
+    def _dtype(self) -> torch.dtype:
+        for blk in self.factors.blocks:
+            if blk.lam is not None:
+                return blk.lam.dtype
+        return torch.float64
+
     def solve(self, g_test: torch.Tensor) -> torch.Tensor:
-        g = g_test.detach().to(dtype=torch.float64).reshape(-1)
+        dt = self._dtype()
+        g = g_test.detach().to(dtype=dt).reshape(-1)
         if g.numel() != self.factors.n_params:
             raise ValueError(f"gradient has {g.numel()} entries, factors were fit "
                              f"for {self.factors.n_params}.")
@@ -223,21 +260,22 @@ class EKFACInfluence(BaseInfluenceMethod):
         h[self.factors.uncovered_mask()] = g[self.factors.uncovered_mask()] / self.lambda_damp
         for blk in self.factors.blocks:
             assert blk.q_a is not None and blk.q_s is not None and blk.lam is not None
-            G = blk.unflatten(g)
-            H = blk.q_s @ ((blk.q_s.T @ G @ blk.q_a) / (blk.lam + self.lambda_damp)) @ blk.q_a.T
-            blk.write_flat(H, h)
+            G = blk.unflatten(g).to(blk.lam.device)
+            H = blk.q_s @ ((blk.q_s.T @ G @ blk.q_a) / (blk.lam + self._block_damp(blk))) @ blk.q_a.T
+            blk.write_flat(H.to(h.device), h)
         return h.to(dtype=torch.float32)
 
     def apply_fisher(self, v: torch.Tensor) -> torch.Tensor:
         """F̂ v — the fitted Kronecker Fisher applied to a flat vector (validation:
         `apply_fisher(solve(g)) + λ·solve(g)` must reproduce `g` exactly)."""
-        x = v.detach().to(dtype=torch.float64).reshape(-1)
+        dt = self._dtype()
+        x = v.detach().to(dtype=dt).reshape(-1)
         out = torch.zeros_like(x)
         for blk in self.factors.blocks:
             assert blk.q_a is not None and blk.q_s is not None and blk.lam is not None
-            V = blk.unflatten(x)
+            V = blk.unflatten(x).to(blk.lam.device)
             FV = blk.q_s @ ((blk.q_s.T @ V @ blk.q_a) * blk.lam) @ blk.q_a.T
-            blk.write_flat(FV, out)
+            blk.write_flat(FV.to(out.device), out)
         return out.to(dtype=torch.float32)
 
     def _h_for(self, test_info: dict) -> torch.Tensor:

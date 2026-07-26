@@ -9,6 +9,7 @@ import torch
 
 from influence_rlvr import CGInfluence
 from influence_rlvr.attribution.cg import policy_fisher_fvp_from_grad_cache
+from influence_rlvr.attribution.ekfac import EKFACInfluence, fit_ekfac
 from influence_rlvr.preconditioner import load_adam_preconditioner_from_checkpoint
 from influence_rlvr.fisher_fvp import FisherRow, build_policy_fisher_fvp
 from influence_rlvr.generation import generate_rollout_batch
@@ -148,6 +149,50 @@ def _build_true_fisher_fvp(cfg, model, tokenizer, train_pool, device, backend, v
     )
 
 
+# ── EK-FAC: fitted Kronecker-factored inverse-Fisher preconditioner ─────────
+def _build_ekfac_influence(cfg, model, tokenizer, train_pool, device, backend, vllm_cfg):
+    """Fit EK-FAC factors for the policy Fisher at this checkpoint and return the
+    solver (h = (F̂_ekfac + λ)⁻¹ g). Same Fisher distribution as the CG paths:
+    uniform Monte-Carlo over cg_fisher_examples prompts × cg_fisher_g on-policy
+    completions, each closure = the completion's sequence log-prob. First-order
+    backward only (no double-backward), but gradient checkpointing must be OFF —
+    the recompute pass would re-run the forward under no_grad, where the δ-capture
+    hook cannot attach."""
+    n_fisher = min(cfg.cg_fisher_examples, len(train_pool))
+    max_tok = cfg.cg_fisher_max_tokens
+    print(f"  EK-FAC: fitting factors from {n_fisher} prompts × {cfg.cg_fisher_g} "
+          f"completions (≤{max_tok} tok, fp32)...")
+    rows = []
+    for i in range(n_fisher):
+        prompt_ids, prompt_am, rollout = _generate(
+            model, tokenizer, train_pool[i]["prompt"], G=cfg.cg_fisher_g, cfg=cfg,
+            device=device, backend=backend, vllm_cfg=vllm_cfg, seed=cfg.seed + i,
+        )
+        p_ids, p_am = prompt_ids[:, -max_tok:], prompt_am[:, -max_tok:]
+        resp_ids = rollout.token_ids[:, :max_tok]
+        resp_mask = rollout.response_mask[:, :max_tok]
+        for u in range(resp_ids.shape[0]):
+            rows.append((p_ids, p_am, resp_ids[u:u + 1].to(device),
+                         resp_mask[u:u + 1].to(device)))
+
+    def make_closure(p_ids, p_am, r_ids, r_mask):
+        def closure():
+            per_token = _compute_per_token_logps(model, p_ids, p_am, r_ids, r_mask)
+            return (per_token * r_mask.float()).sum()
+        return closure
+
+    samples = [(1.0 / len(rows), make_closure(*r)) for r in rows]
+    if hasattr(model, "gradient_checkpointing_disable"):
+        model.gradient_checkpointing_disable()
+    factors = fit_ekfac(model, samples, dtype=torch.float32, progress=True)
+    rel = getattr(cfg, "if_ekfac_rel_damp", 0.1)
+    solver = EKFACInfluence(factors, lambda_damp=cfg.lambda_damp,
+                            rel_damp=(rel if rel and rel > 0 else None))
+    print(f"  EK-FAC: {len(factors.blocks)} blocks fitted "
+          f"(damping: {'rel ' + str(rel) if rel and rel > 0 else f'abs {cfg.lambda_damp}'})")
+    return solver
+
+
 # ── Option 1: cached sampled-Fisher FVP ─────────────────────────────────────
 def _fisher_grad_stack(model, tokenizer, prompt, *, G, cfg, device, backend, vllm_cfg, seed):
     prompt_ids, prompt_am, rollout = _generate(
@@ -214,17 +259,18 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
     main = rank == 0
     D = int(sum(p.numel() for p in model.parameters() if p.requires_grad))
 
-    # First-order TracIn influence skips the Fisher/CG solve and sets h directly:
+    # How g_test becomes the tangent h — the ladder of preconditioners:
     #   "dot"         → h = g_test           (plain gradient dot product)
     #   "tracin-adam" → h = P_adam ⊙ g_test  (Adam-preconditioned dot: the faithful
     #                   first-order effect of one AdamW step, with the diagonal
     #                   P_d = 1/(√v̂_d+ε) read from this checkpoint's optimizer.pt)
-    # The Fisher FVP/CG is needed ONLY to turn g_test into h; both first-order
-    # methods skip it and stream the (optionally preconditioned) target gradients.
-    # These are the streaming analogs of attribution.TracInInfluence /
-    # TracInAdamInfluence (which stack the whole pool at once): we fold P into h
-    # once per target and stream g_train one batch at a time to bound memory.
-    use_fisher = cfg.if_method not in ("dot", "tracin-adam")
+    #   "ekfac"       → h = (F̂_ekfac + λ)⁻¹ g_test  (Kronecker-factored eigenbasis
+    #                   inverse fitted once at this checkpoint; closed-form solve)
+    #   "cg"/"cg-empirical" → h solves (F + λI) h = g_test iteratively (full Fisher)
+    # Only the CG family needs an FVP; ekfac fits factors once; the first-order
+    # methods stream the (optionally preconditioned) target gradients directly.
+    use_fisher = cfg.if_method in ("cg", "cg-empirical")
+    use_ekfac = cfg.if_method == "ekfac"
     use_adam = cfg.if_method == "tracin-adam"
     # if_grad="gold": swap the on-policy rollout gradient for the SFT gold-answer
     # gradient (no rollouts). The OPERATOR above (Fisher/Adam/dot) is unchanged — it's
@@ -234,6 +280,11 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
         fvp = make_fvp()
         cg = CGInfluence(fvp_fn=fvp, lambda_damp=cfg.lambda_damp,
                          cg_iters=cfg.cg_iters, cg_tol=cfg.cg_tol)
+    ekfac = None
+    if use_ekfac:
+        # Every rank fits its own factors (same seeds → identical), like the FVP.
+        ekfac = _build_ekfac_influence(cfg, model, tokenizer, train_pool, device,
+                                       backend, vllm_cfg)
 
     precond = None
     if use_adam:
@@ -256,6 +307,8 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
     if main:
         if use_fisher:
             what = "solving (F+λI)h = g_test"
+        elif use_ekfac:
+            what = "h = (F̂_ekfac+λ)⁻¹ g_test (EK-FAC closed-form solve)"
         elif precond is not None:
             what = "h = P_adam ⊙ g_test (Adam-preconditioned dot)"
         else:
@@ -279,6 +332,8 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
         for j, g_test in zip(tids, grads):
             if use_fisher:
                 h, info = cg.solve(g_test.to(device))
+            elif ekfac is not None:
+                h = ekfac.solve(g_test.to(device))  # closed-form Kronecker inverse
             elif precond is not None:
                 h = g_test.to(device) * precond  # Adam-preconditioned dot
             else:
@@ -400,6 +455,9 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
     # so checkpointing here cuts activation memory and buys a bigger usable batch.
     if use_fisher:
         del cg, fvp
+    if ekfac is not None:
+        del ekfac  # the fitted eigenbases are ~29 GB on a LoRA-r32 1.5B — free them
+    ekfac = None
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -484,10 +542,11 @@ def compute_streaming_pool_influence(
     """Per-train influence over the pool (mean over the target set).
 
     The CG/first-order FAMILY scorer (formerly compute_cg_pool_influence): forms a
-    target-side vector h — CG-solve of (F+λI)h=g_test, or Adam-preconditioned, or
-    raw g_test — then STREAMS each training gradient and dots it against h. Covers
-    if_method ∈ {cg, cg-empirical, dot, tracin-adam}; only "cg"/"cg-empirical"
-    actually run conjugate gradient, so the old name was a misnomer.
+    target-side vector h — CG-solve of (F+λI)h=g_test, EK-FAC closed-form solve,
+    Adam-preconditioned, or raw g_test — then STREAMS each training gradient and
+    dots it against h. Covers if_method ∈ {cg, cg-empirical, ekfac, dot,
+    tracin-adam}; only "cg"/"cg-empirical" actually run conjugate gradient, so the
+    old name was a misnomer.
 
     reward_builder(sample, G) -> [reward_fn]: optional custom reward for g_train's
     advantage (protocol2's flip poison). Default = the general-verifier builder.
@@ -509,11 +568,11 @@ def compute_streaming_pool_influence(
         def make_fvp():
             return _build_empirical_fvp(cfg, model, tokenizer, train_pool, device, backend, vllm_cfg)
         tag = "cg_empirical"
-    else:  # "cg" (true analytic per-token Fisher) or a first-order method (dot /
-           # tracin-adam) that ignores make_fvp entirely — tag names the artifacts.
+    else:  # "cg" (true analytic per-token Fisher) or a non-CG method (dot /
+           # tracin-adam / ekfac) that ignores make_fvp entirely — tag names the artifacts.
         def make_fvp():
             return _build_true_fisher_fvp(cfg, model, tokenizer, train_pool, device, backend, vllm_cfg)
-        tag = {"dot": "dot", "tracin-adam": "tracin_adam"}.get(cfg.if_method, "cg")
+        tag = {"dot": "dot", "tracin-adam": "tracin_adam", "ekfac": "ekfac"}.get(cfg.if_method, "cg")
 
     return _run_cg(
         cfg, model, tokenizer, train_pool, target_set, device, make_fvp,

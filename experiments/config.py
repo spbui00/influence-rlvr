@@ -248,6 +248,11 @@ class ExperimentConfig:
     # ρ. Ignored by every other if_method.
     tracin_adam_eps: float = 0.0
     lambda_damp: float = 0.1
+    # ekfac only: per-block RELATIVE damping λ_b = rel · mean(Λ_b) (kronfluence
+    # heuristic — robust to the scale gap between LoRA A and B blocks). <=0 falls
+    # back to the absolute lambda_damp. The EK-FAC Fisher batch reuses the
+    # cg_fisher_examples / cg_fisher_g / cg_fisher_max_tokens knobs below.
+    if_ekfac_rel_damp: float = 0.1
     cg_iters: int = 50
     cg_tol: float = 1e-6
     # Spectral-normalize the Fisher (rescale by its top eigenvalue → spectrum in
@@ -369,9 +374,9 @@ class ExperimentConfig:
                 f"if_target_source must be webinstruct|mmlu_cs|mmlu_pro_cs, "
                 f"got {self.if_target_source!r}"
             )
-        if self.if_method not in ("cg", "cg-empirical", "fisher", "dot", "tracin-adam"):
+        if self.if_method not in ("cg", "cg-empirical", "fisher", "dot", "tracin-adam", "ekfac"):
             raise ValueError(
-                f"if_method must be cg|cg-empirical|fisher|dot|tracin-adam, "
+                f"if_method must be cg|cg-empirical|fisher|dot|tracin-adam|ekfac, "
                 f"got {self.if_method!r}"
             )
         if self.if_grad not in ("rollout", "gold"):

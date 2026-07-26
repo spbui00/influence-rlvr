@@ -1,0 +1,13 @@
+{
+  "protocol": "P1 prediction LDS",
+  "pool_size": 1000,
+  "n_targets": 32,
+  "M": 100,
+  "alpha": 0.5,
+  "subset_size": 500,
+  "seed": 0,
+  "pool_in_band": 508,
+  "target_in_band": 32,
+  "source_dir": "/Users/bui/code/influence-rlvr/experiments/protocol2/dataset/data",
+  "built_at": "2026-07-26T15:21:03+00:00"
+}
