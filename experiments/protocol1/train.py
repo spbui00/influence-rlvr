@@ -274,7 +274,10 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--eval-at", default="",
                     help="comma list of horizon steps to eval at (e.g. '50,100,200,300,500'); "
                          "the final step is always added; empty = final only")
-    ap.add_argument("--eval-batch", type=int, default=4, help="target prompts per generate call")
+    ap.add_argument("--eval-batch", type=int, default=8,
+                    help="target prompts per generate call (8x16=128 seqs — decode-bound, "
+                         "fine on a 96 GB GH200; smoke showed batch-4 evals dominated by "
+                         "per-call decode time)")
     ap.add_argument("--eval-samples", type=int, default=16)
     ap.add_argument("--eval-temperature", type=float, default=1.0)
     ap.add_argument("--eval-top-p", type=float, default=1.0)

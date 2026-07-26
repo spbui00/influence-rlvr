@@ -8,14 +8,15 @@
 #     REF_STEP=$C REF_DIR=$SCRATCH/p1_runs/p1_ref RUNS_ROOT=$SCRATCH/p1_runs \
 #     VENV_DIR=$SCRATCH/envs/ifrlvr HF_HOME=$SCRATCH/hf_cache \
 #     sbatch --environment=pt --account=a0133 --partition=normal \
-#            --gres=gpu:4 --mem=440G --time=6:00:00 --cpus-per-task=144 \
+#            --gres=gpu:4 --mem=440G --time=8:00:00 --cpus-per-task=144 \
 #            --array=0-24 experiments/protocol1/scripts/subsets_node.slurm
 #   done
 #
-# Node-job wall = the slowest of its 4 runs (~2.5-4 h). 25 node-jobs x 2 ckpts;
-# at 4 concurrent nodes ≈ 1.5-2.5 days. Fully idempotent: complete subsets are
-# skipped, so resubmitting the same arrays after any preemption just continues.
-# Per-subset logs land in $RUNS_ROOT/step<C>/subset_<m>.log.
+# Node-job wall = the slowest of its 4 runs (measured ~72 s/step -> 200 steps
+# ≈ 4 h + evals ≈ 4.5-5 h; --time=8h leaves margin). 25 node-jobs x 2 ckpts;
+# at 4 concurrent nodes ≈ 2.6 days, at 6 ≈ 1.8. Fully idempotent: complete
+# subsets are skipped, so resubmitting the same arrays after any preemption just
+# continues. Per-subset logs land in $RUNS_ROOT/step<C>/subset_<m>.log.
 #
 #   Smoke one node first:  CONT_STEPS=4 EVAL_AT=2 EVAL_SAMPLES=2 sbatch ... --array=0
 #
@@ -64,7 +65,11 @@ for i in $(seq 0 $((GPUS_PER_NODE - 1))); do
         continue
     fi
     echo "GPU $i -> subset $M (log: $OUT.log)"
-    CUDA_VISIBLE_DEVICES=$i python -m experiments.protocol1.train \
+    # Distinct MASTER_PORT per process: TRL/accelerate inits a world-size-1 torch
+    # distributed group and all four would otherwise race for the default 29500 —
+    # exactly one wins, three crash (bit the first node smoke).
+    CUDA_VISIBLE_DEVICES=$i MASTER_ADDR=127.0.0.1 MASTER_PORT=$((29500 + i)) \
+    python -m experiments.protocol1.train \
         --run-name "p1_step${REF_STEP}_subset_$M" --output-dir "$OUT" \
         --subset-id "$M" --init-adapter "$INIT" \
         --max-steps "$CONT_STEPS" --save-steps "$SAVE_STEPS" --seed "$SEED" \

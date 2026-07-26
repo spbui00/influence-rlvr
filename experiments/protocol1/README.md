@@ -35,21 +35,20 @@ completed horizons.
 Spec (updates deck, p.18): 1.5B + LoRA, GRPO g=8, pool ~1–2k prompts,
 M = 30–40 subsets at α = 0.5, continuation ≈ 200–300 steps, 20–50 target prompts.
 
-## Time budget (GH200, ~0.5–1 min/train step at 32 prompts/step)
+## Time budget (GH200 — MEASURED ~72 s/step at 32 prompts/step, first smoke 2026-07-26)
 
-| stage | per unit | units | GPU-h | wall @ 12 GPUs | wall @ 8 GPUs |
+| stage | per unit | units | GPU-h | wall @ 4 nodes (16 GPUs) | @ 6 nodes |
 |---|---|---|---|---|---|
-| ref run (200 steps) | 2–3.5 h | 1 | 2–3.5 | 2–3.5 h (serial, first) | same |
-| scoring rollout×{dot, tracin-adam, ekfac} | 1–2.5 h | 6 (2 ckpts × 3) | 7–15 | ~1–2 h (parallel) | ~1–3 h |
-| subset retrains (200 steps + 5 horizon evals) | 2–4 h | 200 (2 ckpts × M=100) | 400–800 | 33–67 h | 50–100 h |
-| **total** | | | **≈ 410–820** | **≈ 1.5–2.9 days** | **≈ 2.2–4.3 days** |
+| ref run (200 steps) | ~4 h | 1 | ~4 | ~4 h (serial, first) | same |
+| scoring rollout×{dot, tracin-adam, ekfac} | 0.5–1.5 h (4-GPU shard) | 6 (2 ckpts × 3) | 8–18 | ~1–2 h (parallel) | same |
+| subset retrains (200 steps + 5 horizon evals) | ~4.5 h | 200 (2 ckpts × M=100) | ~900 | ~57 h | ~38 h |
+| **total** | | | **≈ 920** | **≈ 2.6 days** | **≈ 1.8 days** |
 
 The plan is 2 ckpts {100, 200} × **M=100** (per-cell LDS noise ±0.10, matching
-the diffusion-IF paper's subset counts) — it fits 2–3 days at **~12 concurrent
-GPUs**; at 8 it can stretch past 3 days at the pessimistic per-step estimate.
-Levers: `--array=0-63` first (±0.13) and extend with `--array=64-99` mid-flight
-once the queue's pace is known — runs are idempotent and `lds.py` reports
-whatever exists.
+the diffusion-IF paper's subset counts) — it fits 2–3 days at **4–6 concurrent
+4-GPU nodes**. Levers: `--array=0-15` (node groups → M=64, ±0.13) first and
+extend with `--array=16-24` mid-flight once the queue's pace is known — runs
+are idempotent and `lds.py` reports whatever exists.
 
 ## Allocation & resumability (12 h max walltime)
 

@@ -92,7 +92,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--eval-top-p", type=float, default=1.0)
     ap.add_argument("--eval-max-new-tokens", type=int, default=512)
     ap.add_argument("--eval-seed", type=int, default=12345)
-    ap.add_argument("--eval-batch", type=int, default=4, help="target prompts per generate call")
+    ap.add_argument("--eval-batch", type=int, default=8, help="target prompts per generate call")
     args = ap.parse_args(argv)
 
     import torch
