@@ -37,6 +37,29 @@ from .base import BaseInfluenceMethod
 FitSample = tuple[float, Callable[[], torch.Tensor]]
 
 
+def _eigh_basis(mat: torch.Tensor) -> torch.Tensor:
+    """Eigenbasis of a symmetric PSD covariance, robust to near-rank-deficiency.
+
+    cusolver's fp32 syevd fails to converge (LinAlgError code 33) on the nearly
+    low-rank covariances a converged policy produces (clusters of ~0 repeated
+    eigenvalues) — seen at checkpoint-200 of the P1 ref run. Ladder: decompose in
+    fp64 (robust to exactly this), then fp64 + diagonal jitter, then CPU LAPACK.
+    Returns the basis in the input dtype/device."""
+    m64 = mat.to(torch.float64)
+    try:
+        _, q = torch.linalg.eigh(m64)
+    except torch.linalg.LinAlgError:
+        n = m64.shape[0]
+        jitter = max(float(m64.diagonal().abs().mean()), 1e-30) * 1e-8
+        eye = torch.eye(n, dtype=m64.dtype, device=m64.device)
+        try:
+            _, q = torch.linalg.eigh(m64 + jitter * eye)
+        except torch.linalg.LinAlgError:
+            _, q = torch.linalg.eigh((m64 + jitter * eye).cpu())
+            q = q.to(m64.device)
+    return q.to(mat.dtype)
+
+
 def _delta(entry: dict, name: str) -> torch.Tensor:
     """The backward-pass gradient captured for one forward call — with a loud
     diagnosis when it is missing (a forward that the backward never walked)."""
@@ -195,8 +218,8 @@ def fit_ekfac(
         # Eigendecompose block-by-block, FREEING each covariance as its eigenbasis
         # lands — halves the peak (A/S and Q never fully coexist).
         for _, blk in traced:
-            _, blk.q_a = torch.linalg.eigh(A.pop(blk.name) / w_total)
-            _, blk.q_s = torch.linalg.eigh(S.pop(blk.name) / w_total)
+            blk.q_a = _eigh_basis(A.pop(blk.name) / w_total)
+            blk.q_s = _eigh_basis(S.pop(blk.name) / w_total)
         if progress:
             print(f"    [ekfac] eigenbases done ({len(traced)} blocks)", flush=True)
 
