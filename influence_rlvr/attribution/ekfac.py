@@ -197,49 +197,83 @@ def fit_ekfac(
             return a
         return torch.cat([a, torch.ones_like(a[:, :1])], dim=1)
 
+    # Accumulate in fp64 regardless of the storage dtype: on a CONVERGED policy,
+    # rare near-zero-probability sampled tokens carry extreme score gradients whose
+    # squares overflow fp32 (inf − inf → NaN poisoned the whole checkpoint-200 fit).
+    acc = torch.float64
+
+    def closure_ok() -> bool:
+        """Screen the just-run closure: any non-finite activation/δ capture drops
+        the WHOLE sample (deterministic — pass 2 recomputes the same values)."""
+        for lst in captures.values():
+            for e in lst:
+                if not torch.isfinite(e["a"]).all():
+                    return False
+                d = e.get("delta")
+                if d is not None and not torch.isfinite(d).all():
+                    return False
+        return True
+
+    n_skip = 0
     try:
         # ── pass 1: covariances ────────────────────────────────────────────────
-        A = {b.name: torch.zeros(b.in_dim, b.in_dim, dtype=dtype, device=device)
+        A = {b.name: torch.zeros(b.in_dim, b.in_dim, dtype=acc, device=device)
              for _, b in traced}
-        S = {b.name: torch.zeros(b.out_dim, b.out_dim, dtype=dtype, device=device)
+        S = {b.name: torch.zeros(b.out_dim, b.out_dim, dtype=acc, device=device)
              for _, b in traced}
         w_total = 0.0
         for i, (w, closure) in enumerate(samples):
             run(closure)
+            if not closure_ok():
+                n_skip += 1
+                continue
             w_total += w
             for _, blk in traced:
                 for e in captures[blk.name]:
-                    a = aug(e["a"].to(dtype), blk.has_bias)
-                    d = _delta(e, blk.name).to(dtype)
+                    a = aug(e["a"].to(acc), blk.has_bias)
+                    d = _delta(e, blk.name).to(acc)
                     A[blk.name] += w * (a.T @ a)
                     S[blk.name] += w * (d.T @ d)
             if progress and (i + 1) % 50 == 0:
                 print(f"    [ekfac] covariance pass {i + 1}/{len(samples)}", flush=True)
+        if n_skip:
+            print(f"    [ekfac] WARNING: dropped {n_skip}/{len(samples)} samples with "
+                  f"non-finite captures (extreme low-probability tokens)", flush=True)
+        if w_total <= 0:
+            raise RuntimeError("fit_ekfac: every sample had non-finite captures.")
         # Eigendecompose block-by-block, FREEING each covariance as its eigenbasis
         # lands — halves the peak (A/S and Q never fully coexist).
         for _, blk in traced:
-            blk.q_a = _eigh_basis(A.pop(blk.name) / w_total)
-            blk.q_s = _eigh_basis(S.pop(blk.name) / w_total)
+            blk.q_a = _eigh_basis(A.pop(blk.name) / w_total).to(dtype)
+            blk.q_s = _eigh_basis(S.pop(blk.name) / w_total).to(dtype)
         if progress:
             print(f"    [ekfac] eigenbases done ({len(traced)} blocks)", flush=True)
 
         # ── pass 2: eigenvalue correction on true per-sample gradients ────────
-        lam = {b.name: torch.zeros(b.out_dim, b.in_dim, dtype=dtype, device=device)
+        lam = {b.name: torch.zeros(b.out_dim, b.in_dim, dtype=acc, device=device)
                for _, b in traced}
         for i, (w, closure) in enumerate(samples):
             run(closure)
+            if not closure_ok():
+                continue                     # deterministically the same skips as pass 1
             for _, blk in traced:
                 assert blk.q_a is not None and blk.q_s is not None
-                G = torch.zeros(blk.out_dim, blk.in_dim, dtype=dtype, device=device)
+                G = torch.zeros(blk.out_dim, blk.in_dim, dtype=acc, device=device)
                 for e in captures[blk.name]:
-                    a = aug(e["a"].to(dtype), blk.has_bias)
-                    G += _delta(e, blk.name).to(dtype).T @ a
-                G_tilde = blk.q_s.T @ G @ blk.q_a
+                    a = aug(e["a"].to(acc), blk.has_bias)
+                    G += _delta(e, blk.name).to(acc).T @ a
+                G_tilde = blk.q_s.to(acc).T @ G @ blk.q_a.to(acc)
                 lam[blk.name] += w * G_tilde.pow(2)
             if progress and (i + 1) % 50 == 0:
                 print(f"    [ekfac] eigenvalue pass {i + 1}/{len(samples)}", flush=True)
         for _, blk in traced:
-            blk.lam = lam[blk.name] / w_total
+            blk.lam = (lam[blk.name] / w_total).to(dtype)
+            assert blk.q_a is not None and blk.q_s is not None
+            if not (torch.isfinite(blk.q_a).all() and torch.isfinite(blk.q_s).all()
+                    and torch.isfinite(blk.lam).all()):
+                raise RuntimeError(
+                    f"fit_ekfac: non-finite factors for block {blk.name!r} despite "
+                    f"fp64 accumulation and sample screening — inspect the Fisher batch.")
     finally:
         for h in handles:
             h.remove()
