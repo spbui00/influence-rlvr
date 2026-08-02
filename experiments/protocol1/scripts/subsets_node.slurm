@@ -34,6 +34,8 @@ REF_STEP="${REF_STEP:-200}"
 RUNS_ROOT="${RUNS_ROOT:?set RUNS_ROOT for the subset_<m> run dirs}"
 CONT_STEPS="${CONT_STEPS:-200}"
 EVAL_AT="${EVAL_AT:-1,50,100,150,200}"
+SUBSET_FILE="${SUBSET_FILE:-}"         # override subsets.npy (e.g. an extremes manifest)
+RUN_PREFIX="${RUN_PREFIX:-subset}"     # run dir prefix: subset_<m> (LDS) or row_<m> (extremes)
 SAVE_STEPS="${SAVE_STEPS:-0}"
 SEED="${SEED:-0}"
 EVAL_SAMPLES="${EVAL_SAMPLES:-16}"
@@ -65,10 +67,12 @@ sys.exit(0 if '$CONT_STEPS' in d.get('horizons', {}) else 1)"
 
 echo "===== P1 NODE GROUP $GROUP @ step $REF_STEP: subsets $BASE..$((BASE + GPUS_PER_NODE - 1)) ====="
 pids=(); labels=()
+SUBSET_FLAG=""
+[ -n "$SUBSET_FILE" ] && SUBSET_FLAG="--subset-file $SUBSET_FILE"
 for i in $(seq 0 $((GPUS_PER_NODE - 1))); do
     M=$((BASE + i))
     [ "$M" -ge "$M_MAX" ] && continue
-    OUT="$RUNS_ROOT/step$REF_STEP/subset_$M"
+    OUT="$RUNS_ROOT/step$REF_STEP/${RUN_PREFIX}_$M"
     if complete "$OUT"; then
         echo "subset $M already measured — skip"
         continue
@@ -88,8 +92,8 @@ for i in $(seq 0 $((GPUS_PER_NODE - 1))); do
     VLLM_CACHE_ROOT="$CACHE/vllm" TORCHINDUCTOR_CACHE_DIR="$CACHE/inductor" \
     TRITON_CACHE_DIR="$CACHE/triton" XDG_CACHE_HOME="$CACHE/xdg" \
     python -m experiments.protocol1.train \
-        --run-name "p1_step${REF_STEP}_subset_$M" --output-dir "$OUT" \
-        --subset-id "$M" --init-adapter "$INIT" \
+        --run-name "p1_step${REF_STEP}_${RUN_PREFIX}_$M" --output-dir "$OUT" \
+        --subset-id "$M" --init-adapter "$INIT" $SUBSET_FLAG \
         --max-steps "$CONT_STEPS" --save-steps "$SAVE_STEPS" --seed "$SEED" \
         --eval-at "$EVAL_AT" --eval-samples "$EVAL_SAMPLES" $EXTRA \
         > "$OUT.log" 2>&1 &
