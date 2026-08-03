@@ -49,7 +49,9 @@ NGPU="${NGPU:-$(nvidia-smi -L 2>/dev/null | wc -l)}"; NGPU="${NGPU:-1}"
 echo "============ P1 SCORE: $IF_GRAD/$IF_METHOD cosine=$COSINE at $REF_DIR (step=${REF_STEP:-latest}, ${NGPU} GPU) ============"
 
 # torchrun shards pool+targets across GPUs (all_reduce assembles); NGPU=1 = plain run.
-torchrun --nproc_per_node="$NGPU" \
+# Job-unique port: shared-node clusters collide on the default 29500 (EADDRINUSE).
+PORT=$((20000 + ${SLURM_JOB_ID:-$$} % 20000))
+torchrun --nproc_per_node="$NGPU" --master-addr 127.0.0.1 --master-port "$PORT" \
     -m experiments.protocol1.score_ref \
     --ref-dir "$REF_DIR" $STEP_FLAG --if-grad "$IF_GRAD" --if-method "$IF_METHOD" \
     --g "$G" --score-batch "$SCORE_BATCH" $COSINE_FLAG $EXTRA
