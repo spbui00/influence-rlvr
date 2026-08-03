@@ -61,6 +61,12 @@ INIT="$REF_DIR/checkpoint-$REF_STEP"
 OUT="$RUNS_ROOT/step$REF_STEP/${RUN_PREFIX}_$M"
 SUBSET_FLAG=""; [ -n "$SUBSET_FILE" ] && SUBSET_FLAG="--subset-file $SUBSET_FILE"
 
+# Job-unique rendezvous port: on shared-node clusters (Nibi H100s pack several
+# users' single-GPU jobs per node) the torch-distributed default 29500 collides
+# across jobs — second-comer dies with EADDRINUSE (killed 4 jobs on 2026-08-03).
+export MASTER_ADDR=127.0.0.1
+export MASTER_PORT=$((20000 + ${SLURM_JOB_ID:-$$} % 20000))
+
 # Done only when the FINAL horizon is measured (partial files come from preempted
 # runs — those restart from the ref checkpoint and overwrite).
 if [ -f "$OUT/target_eval.json" ] && python -c "
