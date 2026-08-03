@@ -106,6 +106,11 @@ def main(argv: list[str] | None = None) -> None:
                     help="override the TARGET-side gradient only: 'gold' + if-grad=rollout "
                          "= gold-NLL g_test with true GRPO g_train (matched to NLL-measured "
                          "outcomes). '' = follow --if-grad")
+    ap.add_argument("--refs", type=Path, default=None,
+                    help="frozen reference file (freeze_refs.py): g_test becomes the mean "
+                         "∇NLL over each target's frozen full-CoT refs (implies gold test "
+                         "side, verbatim encoding); per-target matrix is collapsed back to "
+                         "one row per target")
     ap.add_argument("--cosine", action=argparse.BooleanOptionalAction, default=True,
                     help="rank by cosine (direction) — DEFAULT, applied uniformly to "
                          "all methods (h and g_train unit-normalized); --no-cosine for "
@@ -143,9 +148,12 @@ def main(argv: list[str] | None = None) -> None:
     main_rank = env_is_main()
     log = (lambda *a: print(*a, flush=True)) if main_rank else (lambda *_: None)
 
+    if args.refs is not None and args.if_test_grad != "gold" and args.if_grad != "gold":
+        args.if_test_grad = "gold"          # --refs implies a teacher-forced test side
     step = args.step or latest_step(args.ref_dir)
     variant = (f"{args.if_grad}_{args.if_method}" + ("_cos" if args.cosine else "")
-               + ("_goldtest" if args.if_test_grad == "gold" and args.if_grad != "gold" else ""))
+               + ("_goldtest" if args.if_test_grad == "gold" and args.if_grad != "gold" else "")
+               + ("_refs" if args.refs is not None else ""))
     out_dir = args.out or (args.ref_dir / "influence" / variant)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -153,9 +161,24 @@ def main(argv: list[str] | None = None) -> None:
     if args.limit_pool > 0:
         pool = pool.select(range(min(args.limit_pool, len(pool))))
     target = rows_to_ds(args.target)
+    n_targets_true = len(target)
+    ref_groups = None                       # expanded-row -> true-target index
+    if args.refs is not None:
+        ref_rows = [json.loads(l) for l in args.refs.open() if "_meta" not in l[:20]]
+        by_t = {r["target_index"]: r["refs"] for r in ref_rows}
+        expanded, ref_groups = [], []
+        for t in range(len(target)):
+            for ref in by_t.get(t, []) or [{"prefix": "", "answer_part": f"\\boxed{{{target[t]['gold']}}}"}]:
+                row = dict(target[t])
+                row["solution"] = ref["prefix"] + ref["answer_part"]
+                expanded.append(row)
+                ref_groups.append(t)
+        target = Dataset.from_list(expanded)
+        log(f"refs: {len(target)} (target, ref) rows from {args.refs.name} "
+            f"(verbatim full-CoT encoding)")
     log(f"pi_ref = checkpoint-{step} | pool={len(pool)}"
         f"{' (LIMITED — smoke only)' if args.limit_pool > 0 else ''} "
-        f"targets={len(target)} | {variant}")
+        f"targets={n_targets_true} | {variant}")
 
     cfg = _ScoreConfig(
         run_name="p1_score", regime="baseline", selection="if-guided",
@@ -165,6 +188,7 @@ def main(argv: list[str] | None = None) -> None:
         if_g_train=args.g, if_max_new_tokens=args.max_new_tokens,
         if_score_batch=args.score_batch, if_cosine=args.cosine,
         if_target_matrix_rows=len(target),      # keep EVERY per-target row for the LDS
+        if_gold_box=(args.refs is None),        # frozen refs are full texts — verbatim
         cg_fisher_examples=args.fisher_examples, cg_fisher_g=args.fisher_g,
         cg_fisher_max_tokens=args.fisher_max_tokens,
         if_ekfac_rel_damp=args.ekfac_rel_damp, lambda_damp=args.lambda_damp,
@@ -191,6 +215,25 @@ def main(argv: list[str] | None = None) -> None:
         checkpoint_step=step, save_dir=out_dir,
         reward_builder=make_match_reward_builder(),
     )
+
+    if main_rank and ref_groups is not None:
+        # Collapse the (target, ref)-expanded matrices back to one row per true
+        # target: mean over each target's refs == gradient of its mean-ref NLL.
+        import numpy as np
+        tag = {"dot": "dot", "tracin-adam": "tracin_adam", "ekfac": "ekfac"}.get(args.if_method, "cg")
+        groups = np.asarray(ref_groups)
+        for stem in (f"{tag}_if_target_matrix_step{step}", f"{tag}_if_matrix_step{step}"):
+            p = out_dir / f"{stem}.npy"
+            if not p.exists():
+                continue
+            M = np.load(p)
+            if M.shape[0] == len(groups):
+                np.save(p, np.stack([M[groups == t].mean(0) for t in range(n_targets_true)]))
+        np.save(out_dir / f"{tag}_if_target_rows_step{step}.npy", np.arange(n_targets_true))
+        collapsed = np.load(out_dir / f"{tag}_if_target_matrix_step{step}.npy")
+        np.save(out_dir / f"{tag}_if_scores_step{step}.npy", collapsed.mean(axis=0))
+        scores = collapsed.mean(axis=0)
+        log(f"  [refs] collapsed {len(groups)} (target, ref) rows -> {n_targets_true} targets")
 
     if main_rank:
         (out_dir / "score_meta.json").write_text(json.dumps({

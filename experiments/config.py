@@ -246,6 +246,10 @@ class ExperimentConfig:
     # NLL-measured outcomes: g_test = ∇ gold-NLL (eq 3.16) while g_train stays the
     # actual GRPO training pressure (eq 3.20). "" = follow if_grad (legacy).
     if_test_grad: str = ""
+    # SFT-gradient encoding of `solution`: True wraps it as \boxed{solution} (the
+    # bare-answer legacy). False takes the text VERBATIM — required when `solution`
+    # is a frozen full reference completion (reasoning + boxed answer already).
+    if_gold_box: bool = True
     # tracin-adam only: override Adam's optimization ε (≈1e-8) with a larger floor
     # on the preconditioner denominator 1/(√v̂+ε). 0 = use the optimizer's own ε
     # (faithful). Raise it (e.g. 1e-4) if dormant-coordinate P-spikes make the

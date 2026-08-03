@@ -103,12 +103,14 @@ def _example_grads_batch(model, tokenizer, samples, builder, *, objective_mode, 
 
 
 def _example_sft_grads_batch(model, tokenizer, samples, *, cfg, device):
-    """`if_grad="gold"` minibatch: the SFT gold-answer gradient (no rollouts)."""
+    """`if_grad="gold"` minibatch: the SFT gold-answer gradient (no rollouts).
+    if_gold_box=False takes `solution` verbatim (frozen full-CoT references)."""
     return compute_sft_gradient_batch(
         model, tokenizer,
         [s["prompt"] for s in samples],
         [s.get("solution", "") for s in samples],
         device=device, logps_micro_batch_size=cfg.if_logps_micro_batch,
+        box=getattr(cfg, "if_gold_box", True),
     )
 
 
