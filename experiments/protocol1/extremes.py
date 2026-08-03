@@ -40,11 +40,24 @@ def make(args) -> None:
     pool = [json.loads(l) for l in (args.data_dir / "pool.jsonl").open()]
     n = len(pool)
     variants = find_score_vectors(args.ref_dir, args.step)
-    if not variants:
-        raise SystemExit(f"no *_if_scores_step{args.step}.npy under {args.ref_dir}/influence")
     # difficulty control: base-model pass rate ("top" = easiest first)
     variants["baseline_band_rate"] = np.asarray(
         [r.get("band_pass_rate") or 0.0 for r in pool], dtype=np.float64)
+    if args.only:
+        keep = {v.strip() for v in args.only.split(",") if v.strip()}
+        missing = keep - set(variants)
+        if missing:
+            raise SystemExit(f"--only names not found: {sorted(missing)} "
+                             f"(have: {sorted(variants)})")
+        variants = {k: v for k, v in variants.items() if k in keep}
+    if not variants:
+        raise SystemExit(f"no *_if_scores_step{args.step}.npy under {args.ref_dir}/influence")
+
+    # --tag makes ADD-ON manifests (e.g. raw-dot rows generated after the main batch
+    # already started training) that never renumber earlier rows: separate files,
+    # separate run-dir prefix, and `report` joins across all tags.
+    suffix = f"_{args.tag}" if args.tag else ""
+    run_prefix = f"row_{args.tag}" if args.tag else "row"
 
     rows, meta = [], []
     for name, s in variants.items():
@@ -53,17 +66,17 @@ def make(args) -> None:
         order = np.argsort(-s, kind="stable")     # descending; zeros/ties keep index order
         for tail, idx in (("top", order[:args.k]), ("bottom", order[-args.k:])):
             meta.append({"row": len(rows), "step": args.step, "variant": name,
-                         "tail": tail, "k": args.k,
+                         "tail": tail, "k": args.k, "run_prefix": run_prefix,
                          "score_mean": float(s[idx].mean()),
                          "n_zero_score": int((s[idx] == 0).sum())})
             rows.append(np.sort(idx))
     subs = np.stack(rows).astype(np.int32)
 
-    out_npy = args.data_dir / f"subsets_extremes_step{args.step}.npy"
-    out_meta = args.data_dir / f"extremes_meta_step{args.step}.json"
+    out_npy = args.data_dir / f"subsets_extremes_step{args.step}{suffix}.npy"
+    out_meta = args.data_dir / f"extremes_meta_step{args.step}{suffix}.json"
     np.save(out_npy, subs)
     out_meta.write_text(json.dumps(meta, indent=2) + "\n")
-    print(f"{out_npy.name}: {len(rows)} rows x {args.k}")
+    print(f"{out_npy.name}: {len(rows)} rows x {args.k} (run_prefix={run_prefix})")
     for m in meta:
         print(f"  row {m['row']:>2}  {m['variant']:<28} {m['tail']:<6} "
               f"score_mean={m['score_mean']:+.2e}  zeros={m['n_zero_score']}")
@@ -82,13 +95,15 @@ def collect_random_null(runs_root: Path, step: int) -> dict[int, np.ndarray]:
 def report(args) -> None:
     out_rows = []
     for step in args.steps:
-        meta_p = args.data_dir / f"extremes_meta_step{step}.json"
-        if not meta_p.exists():
+        metas = sorted(args.data_dir.glob(f"extremes_meta_step{step}*.json"))
+        if not metas:
             continue
-        meta = json.loads(meta_p.read_text())
+        meta = [m for p in metas for m in json.loads(p.read_text())]
         null = collect_random_null(args.runs_root, step)
         for m in meta:
-            p = args.runs_root / "extremes" / f"step{step}" / f"row_{m['row']}" / "target_eval.json"
+            prefix = m.get("run_prefix", "row")
+            p = (args.runs_root / "extremes" / f"step{step}" /
+                 f"{prefix}_{m['row']}" / "target_eval.json")
             if not p.exists():
                 continue
             d = json.loads(p.read_text())
@@ -131,6 +146,11 @@ def main(argv: list[str] | None = None) -> None:
     mk.add_argument("--data-dir", type=Path, default=DATA_DIR)
     mk.add_argument("--step", type=int, required=True)
     mk.add_argument("-k", type=int, default=500, help="matches the LDS subset size")
+    mk.add_argument("--only", default="",
+                    help="comma list of variant names to include (default: all found)")
+    mk.add_argument("--tag", default="",
+                    help="ADD-ON manifest: writes subsets_extremes_step<C>_<tag>.npy with "
+                         "run_prefix row_<tag> — never renumbers rows of earlier manifests")
     rp = sub.add_parser("report")
     rp.add_argument("--runs-root", type=Path, required=True)
     rp.add_argument("--data-dir", type=Path, default=DATA_DIR)
