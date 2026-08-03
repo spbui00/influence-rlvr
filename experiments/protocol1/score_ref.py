@@ -102,6 +102,10 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--if-method", default="tracin-adam",
                     choices=("dot", "tracin-adam", "ekfac", "cg"))
     ap.add_argument("--if-grad", default="rollout", choices=("rollout", "gold"))
+    ap.add_argument("--if-test-grad", default="", choices=("", "rollout", "gold"),
+                    help="override the TARGET-side gradient only: 'gold' + if-grad=rollout "
+                         "= gold-NLL g_test with true GRPO g_train (matched to NLL-measured "
+                         "outcomes). '' = follow --if-grad")
     ap.add_argument("--cosine", action=argparse.BooleanOptionalAction, default=True,
                     help="rank by cosine (direction) — DEFAULT, applied uniformly to "
                          "all methods (h and g_train unit-normalized); --no-cosine for "
@@ -140,7 +144,8 @@ def main(argv: list[str] | None = None) -> None:
     log = (lambda *a: print(*a, flush=True)) if main_rank else (lambda *_: None)
 
     step = args.step or latest_step(args.ref_dir)
-    variant = f"{args.if_grad}_{args.if_method}" + ("_cos" if args.cosine else "")
+    variant = (f"{args.if_grad}_{args.if_method}" + ("_cos" if args.cosine else "")
+               + ("_goldtest" if args.if_test_grad == "gold" and args.if_grad != "gold" else ""))
     out_dir = args.out or (args.ref_dir / "influence" / variant)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -156,7 +161,7 @@ def main(argv: list[str] | None = None) -> None:
         run_name="p1_score", regime="baseline", selection="if-guided",
         model_id=args.model_id, lora_r=args.lora_r,
         grpo_beta=0.04, grpo_epsilon=0.2,
-        if_method=args.if_method, if_grad=args.if_grad,
+        if_method=args.if_method, if_grad=args.if_grad, if_test_grad=args.if_test_grad,
         if_g_train=args.g, if_max_new_tokens=args.max_new_tokens,
         if_score_batch=args.score_batch, if_cosine=args.cosine,
         if_target_matrix_rows=len(target),      # keep EVERY per-target row for the LDS

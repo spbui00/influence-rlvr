@@ -281,6 +281,10 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
     # gradient (no rollouts). The OPERATOR above (Fisher/Adam/dot) is unchanged — it's
     # applied to whichever gradients. So tracin-adam + gold = tracin-adam on g_gold.
     is_gold = cfg.if_grad == "gold"
+    # Target side can diverge from the pool side: if_test_grad="gold" pairs the
+    # gold-NLL metric gradient (g_test, eq 3.16) with the true GRPO training
+    # pressure (g_train, eq 3.20) — the matched estimator for NLL-measured LDS.
+    is_gold_test = (getattr(cfg, "if_test_grad", "") or cfg.if_grad) == "gold"
     if use_fisher:
         fvp = make_fvp()
         cg = CGInfluence(fvp_fn=fvp, lambda_damp=cfg.lambda_damp,
@@ -327,7 +331,7 @@ def _run_cg(cfg, model, tokenizer, train_pool, target_set, device, make_fvp, *,
         chunk = [target_set[j] for j in tids]
         grads = (
             _example_sft_grads_batch(model, tokenizer, chunk, cfg=cfg, device=device)
-            if is_gold else _example_grads_batch(
+            if is_gold_test else _example_grads_batch(
                 model, tokenizer, chunk, builder,
                 objective_mode=GradientObjective.EXPECTED_REWARD_PG, cfg=cfg,
                 device=device, backend=backend, vllm_cfg=vllm_cfg,
