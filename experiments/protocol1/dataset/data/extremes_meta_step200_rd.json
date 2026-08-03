@@ -1,0 +1,22 @@
+[
+  {
+    "row": 0,
+    "step": 200,
+    "variant": "rollout_dot",
+    "tail": "top",
+    "k": 500,
+    "run_prefix": "row_rd",
+    "score_mean": 0.4009955031909049,
+    "n_zero_score": 280
+  },
+  {
+    "row": 1,
+    "step": 200,
+    "variant": "rollout_dot",
+    "tail": "bottom",
+    "k": 500,
+    "run_prefix": "row_rd",
+    "score_mean": -0.45607878736034035,
+    "n_zero_score": 288
+  }
+]
