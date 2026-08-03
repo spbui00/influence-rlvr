@@ -170,19 +170,22 @@ def main(argv: list[str] | None = None) -> None:
         for horizon, (y, done) in by_horizon.items():
             sub, y_mean, T = subsets[done], y.mean(axis=1), y.shape[1]
             pooled = spearman(np.array([scores[s].sum() for s in sub]), y_mean)
-            per_t = []
+            per_t, per_t_ids = [], []
             for r, t in enumerate(tr):
                 if t >= T or y[:, t].std() == 0:
                     continue
                 ghat_t = np.array([mat[r, s].sum() for s in sub])
                 if ghat_t.std() > 0:
                     per_t.append(spearman(ghat_t, y[:, t]))
+                    per_t_ids.append(int(t))
             pt = np.asarray(per_t)
             row = {
                 "step": files["step"], "horizon": horizon, "variant": name,
                 "pooled_lds": pooled,
                 "per_target_lds_mean": (float(pt.mean()) if pt.size else None),
                 "per_target_lds_std": (float(pt.std()) if pt.size else None),
+                "per_target_lds": {str(t): round(float(r), 4)
+                                   for t, r in zip(per_t_ids, per_t)},  # target idx -> rho
                 "n_targets_used": int(pt.size), "n_measured": len(done),
                 "matrix": str(files["matrix"]),
             }
