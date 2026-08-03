@@ -46,6 +46,8 @@ CONT_STEPS="${CONT_STEPS:-200}"
 EVAL_AT="${EVAL_AT:-1,50,100,150,200}" # horizons; final step always added. k=1 is a
                                        # null anchor (warmup-damped step -> expect LDS≈0).
                                        # For 300-step runs: CONT_STEPS=300 EVAL_AT=1,50,...,300
+SUBSET_FILE="${SUBSET_FILE:-}"         # override subsets.npy (e.g. an extremes manifest)
+RUN_PREFIX="${RUN_PREFIX:-subset}"     # run dir prefix: subset_<m> (LDS) or row_<m> (extremes)
 SAVE_STEPS="${SAVE_STEPS:-0}"          # 0 = final ckpt only (2-4 h tasks restart cheaply
                                        # under the 12 h cap); set 50 to make individual
                                        # tasks mid-run resumable (costs ~0.5 GB/ckpt/run)
@@ -56,7 +58,8 @@ EXTRA="${EXTRA:-}"
 M="${SLURM_ARRAY_TASK_ID:?run via sbatch --array}"
 INIT="$REF_DIR/checkpoint-$REF_STEP"
 [ -d "$INIT" ] || { echo "ERROR: pi_ref checkpoint $INIT not found"; exit 1; }
-OUT="$RUNS_ROOT/step$REF_STEP/subset_$M"
+OUT="$RUNS_ROOT/step$REF_STEP/${RUN_PREFIX}_$M"
+SUBSET_FLAG=""; [ -n "$SUBSET_FILE" ] && SUBSET_FLAG="--subset-file $SUBSET_FILE"
 
 # Done only when the FINAL horizon is measured (partial files come from preempted
 # runs — those restart from the ref checkpoint and overwrite).
@@ -70,8 +73,8 @@ fi
 
 echo "============ P1 SUBSET $M @ step $REF_STEP: continue $CONT_STEPS steps from $INIT (evals at $EVAL_AT) -> $OUT ============"
 python -m experiments.protocol1.train \
-    --run-name "p1_step${REF_STEP}_subset_$M" --output-dir "$OUT" \
-    --subset-id "$M" --init-adapter "$INIT" \
+    --run-name "p1_step${REF_STEP}_${RUN_PREFIX}_$M" --output-dir "$OUT" \
+    --subset-id "$M" --init-adapter "$INIT" $SUBSET_FLAG \
     --max-steps "$CONT_STEPS" --save-steps "$SAVE_STEPS" --seed "$SEED" \
     --eval-at "$EVAL_AT" --eval-samples "$EVAL_SAMPLES" $EXTRA
 
