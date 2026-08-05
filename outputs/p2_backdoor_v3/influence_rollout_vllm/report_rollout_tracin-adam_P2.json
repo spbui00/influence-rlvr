@@ -1,0 +1,26 @@
+{
+  "checkpoints": [
+    1,
+    26,
+    51,
+    76,
+    101,
+    126,
+    151,
+    176
+  ],
+  "n_checkpoints": 8,
+  "n_pool": 1000,
+  "mode": "rollout/tracin-adam",
+  "n_poison": 200,
+  "n_background": 800,
+  "k": 200,
+  "auc_poison_is_lower": 0.4312,
+  "auc_separation": 0.5688,
+  "poison_more_harmful": false,
+  "precision_at_k_low_tail": 0.265,
+  "precision_at_k_high_tail": 0.37,
+  "precision_at_k": 0.37,
+  "mean_score_poison": 353319.024125,
+  "mean_score_background": -48866.546119
+}

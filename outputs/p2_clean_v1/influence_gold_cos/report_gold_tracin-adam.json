@@ -1,0 +1,51 @@
+{
+  "mode": "gold/tracin-adam",
+  "run_dir": "/iopsstor/scratch/cscs/tbui/p2_runs/p2_clean_v1",
+  "checkpoints": [
+    25,
+    50,
+    75,
+    100,
+    125,
+    150,
+    175,
+    200
+  ],
+  "pool": {
+    "poison": 0,
+    "background": 1000
+  },
+  "per_checkpoint": {
+    "25": {
+      "note": "need both poison and non-poison in the pool"
+    },
+    "50": {
+      "note": "need both poison and non-poison in the pool"
+    },
+    "75": {
+      "note": "need both poison and non-poison in the pool"
+    },
+    "100": {
+      "note": "need both poison and non-poison in the pool"
+    },
+    "125": {
+      "note": "need both poison and non-poison in the pool"
+    },
+    "150": {
+      "note": "need both poison and non-poison in the pool"
+    },
+    "175": {
+      "note": "need both poison and non-poison in the pool"
+    },
+    "200": {
+      "note": "need both poison and non-poison in the pool"
+    }
+  },
+  "protocol1": {
+    "step": 125,
+    "note": "need both poison and non-poison in the pool"
+  },
+  "protocol2_sum": {
+    "note": "need both poison and non-poison in the pool"
+  }
+}
