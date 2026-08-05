@@ -12,19 +12,22 @@
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
 
-STEP="${1:?usage: vast_run_rows.sh STEP ROW_START ROW_END}"
+STEP="${1:?usage: [TAG=rd] vast_run_rows.sh STEP ROW_START ROW_END}"
 START="${2:?}"; END="${3:?}"
 CONT_STEPS="${CONT_STEPS:-200}"
 EVAL_AT="${EVAL_AT:-1,50,100,150,200}"
+TAG="${TAG:-}"                  # e.g. rd -> reads ..._rd.npy, writes row_rd_<R>
 DATA="experiments/protocol1/dataset/data"
 INIT="outputs/p1_ref/checkpoint-$STEP"
-MANIFEST="$DATA/subsets_extremes_step$STEP.npy"
+SUFFIX=""; PREFIX="row"
+[ -n "$TAG" ] && { SUFFIX="_$TAG"; PREFIX="row_$TAG"; }
+MANIFEST="$DATA/subsets_extremes_step${STEP}${SUFFIX}.npy"
 [ -f "$MANIFEST" ] || { echo "missing $MANIFEST"; exit 1; }
 [ -d "$INIT" ] || { echo "missing $INIT"; exit 1; }
 
 fail=0
 for R in $(seq "$START" "$END"); do
-    OUT="outputs/p1_runs/extremes/step$STEP/row_$R"
+    OUT="outputs/p1_runs/extremes/step$STEP/${PREFIX}_$R"
     if [ -f "$OUT/target_eval.json" ] && python -c "
 import json, sys
 d = json.load(open('$OUT/target_eval.json'))
@@ -33,7 +36,7 @@ sys.exit(0 if '$CONT_STEPS' in d.get('horizons', {}) else 1)"; then
     fi
     echo "===== step$STEP row $R ($(date -u +%H:%M)) ====="
     python -m experiments.protocol1.train \
-        --run-name "p1x_step${STEP}_row$R" --output-dir "$OUT" \
+        --run-name "p1x_step${STEP}_${PREFIX}_$R" --output-dir "$OUT" \
         --subset-file "$MANIFEST" --subset-id "$R" --init-adapter "$INIT" \
         --max-steps "$CONT_STEPS" --save-steps 0 --eval-at "$EVAL_AT" \
         || { echo "row $R FAILED"; fail=1; }
