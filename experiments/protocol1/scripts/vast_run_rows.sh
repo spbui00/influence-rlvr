@@ -17,6 +17,9 @@ START="${2:?}"; END="${3:?}"
 CONT_STEPS="${CONT_STEPS:-200}"
 EVAL_AT="${EVAL_AT:-1,50,100,150,200}"
 TAG="${TAG:-}"                  # e.g. rd -> reads ..._rd.npy, writes row_rd_<R>
+# HF generation by default on vast — dodges the vLLM version-matching that broke
+# us repeatedly on the clusters. USE_VLLM=1 to opt back in.
+VLLM_FLAG="--no-use-vllm"; [ "${USE_VLLM:-0}" = "1" ] && VLLM_FLAG=""
 DATA="experiments/protocol1/dataset/data"
 INIT="outputs/p1_ref/checkpoint-$STEP"
 SUFFIX=""; PREFIX="row"
@@ -38,7 +41,7 @@ sys.exit(0 if '$CONT_STEPS' in d.get('horizons', {}) else 1)"; then
     python -m experiments.protocol1.train \
         --run-name "p1x_step${STEP}_${PREFIX}_$R" --output-dir "$OUT" \
         --subset-file "$MANIFEST" --subset-id "$R" --init-adapter "$INIT" \
-        --max-steps "$CONT_STEPS" --save-steps 0 --eval-at "$EVAL_AT" \
+        --max-steps "$CONT_STEPS" --save-steps 0 --eval-at "$EVAL_AT" $VLLM_FLAG \
         || { echo "row $R FAILED"; fail=1; }
 done
 echo "DONE step$STEP rows $START-$END (fail=$fail)"
