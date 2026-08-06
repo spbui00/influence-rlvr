@@ -166,6 +166,61 @@
   },
   {
     "step": 100,
+    "variant": "rollout_ekfac_cos",
+    "tail": "bottom",
+    "horizon": 1,
+    "y": 0.642578125,
+    "random_mean": 0.641484375,
+    "random_sd": 0.01399811650276565,
+    "z": 0.07813551200148312,
+    "percentile": 53.0
+  },
+  {
+    "step": 100,
+    "variant": "rollout_ekfac_cos",
+    "tail": "bottom",
+    "horizon": 50,
+    "y": 0.716796875,
+    "random_mean": 0.71427734375,
+    "random_sd": 0.020611336546033764,
+    "z": 0.12224007134970939,
+    "percentile": 54.0
+  },
+  {
+    "step": 100,
+    "variant": "rollout_ekfac_cos",
+    "tail": "bottom",
+    "horizon": 100,
+    "y": 0.765625,
+    "random_mean": 0.72876953125,
+    "random_sd": 0.018667737430560973,
+    "z": 1.9742868618702492,
+    "percentile": 97.0
+  },
+  {
+    "step": 100,
+    "variant": "rollout_ekfac_cos",
+    "tail": "bottom",
+    "horizon": 150,
+    "y": 0.759765625,
+    "random_mean": 0.7364453125,
+    "random_sd": 0.017233647210947726,
+    "z": 1.3531849767230757,
+    "percentile": 91.0
+  },
+  {
+    "step": 100,
+    "variant": "rollout_ekfac_cos",
+    "tail": "bottom",
+    "horizon": 200,
+    "y": 0.759765625,
+    "random_mean": 0.74501953125,
+    "random_sd": 0.01849058623123682,
+    "z": 0.7974919543161324,
+    "percentile": 79.0
+  },
+  {
+    "step": 100,
     "variant": "rollout_tracin-adam_cos",
     "tail": "top",
     "horizon": 1,
@@ -658,6 +713,116 @@
     "random_sd": 0.01875629573665179,
     "z": -0.7382937678328543,
     "percentile": 22.0
+  },
+  {
+    "step": 200,
+    "variant": "rollout_tracin-adam_cos",
+    "tail": "bottom",
+    "horizon": 1,
+    "y": 0.673828125,
+    "random_mean": 0.6754296875,
+    "random_sd": 0.015803134964526223,
+    "z": -0.10134460685142933,
+    "percentile": 44.0
+  },
+  {
+    "step": 200,
+    "variant": "rollout_tracin-adam_cos",
+    "tail": "bottom",
+    "horizon": 50,
+    "y": 0.7734375,
+    "random_mean": 0.74001953125,
+    "random_sd": 0.017898331360853996,
+    "z": 1.8670996796432944,
+    "percentile": 97.0
+  },
+  {
+    "step": 200,
+    "variant": "rollout_tracin-adam_cos",
+    "tail": "bottom",
+    "horizon": 100,
+    "y": 0.740234375,
+    "random_mean": 0.75478515625,
+    "random_sd": 0.017522426948542037,
+    "z": -0.830409011989671,
+    "percentile": 19.0
+  },
+  {
+    "step": 200,
+    "variant": "rollout_tracin-adam_cos",
+    "tail": "bottom",
+    "horizon": 150,
+    "y": 0.771484375,
+    "random_mean": 0.75734375,
+    "random_sd": 0.017613072898107887,
+    "z": 0.8028482640027622,
+    "percentile": 77.0
+  },
+  {
+    "step": 200,
+    "variant": "rollout_tracin-adam_cos",
+    "tail": "bottom",
+    "horizon": 200,
+    "y": 0.77734375,
+    "random_mean": 0.76384765625,
+    "random_sd": 0.01875629573665179,
+    "z": 0.7195500614562849,
+    "percentile": 77.0
+  },
+  {
+    "step": 200,
+    "variant": "baseline_band_rate",
+    "tail": "top",
+    "horizon": 1,
+    "y": 0.65625,
+    "random_mean": 0.6754296875,
+    "random_sd": 0.015803134964526223,
+    "z": -1.2136634625378582,
+    "percentile": 7.000000000000001
+  },
+  {
+    "step": 200,
+    "variant": "baseline_band_rate",
+    "tail": "top",
+    "horizon": 50,
+    "y": 0.734375,
+    "random_mean": 0.74001953125,
+    "random_sd": 0.017898331360853996,
+    "z": -0.3153663398111684,
+    "percentile": 37.0
+  },
+  {
+    "step": 200,
+    "variant": "baseline_band_rate",
+    "tail": "top",
+    "horizon": 100,
+    "y": 0.75390625,
+    "random_mean": 0.75478515625,
+    "random_sd": 0.017522426948542037,
+    "z": -0.050158933610113164,
+    "percentile": 47.0
+  },
+  {
+    "step": 200,
+    "variant": "baseline_band_rate",
+    "tail": "top",
+    "horizon": 150,
+    "y": 0.763671875,
+    "random_mean": 0.75734375,
+    "random_sd": 0.017613072898107887,
+    "z": 0.35928568720565657,
+    "percentile": 61.0
+  },
+  {
+    "step": 200,
+    "variant": "baseline_band_rate",
+    "tail": "top",
+    "horizon": 200,
+    "y": 0.76171875,
+    "random_mean": 0.76384765625,
+    "random_sd": 0.01875629573665179,
+    "z": -0.11350355528036608,
+    "percentile": 38.0
   },
   {
     "step": 200,
